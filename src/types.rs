@@ -102,7 +102,10 @@ pub enum IndexState {
 #[derive(Clone, Debug)]
 pub enum WalFsyncPolicy {
     Always,
-    GroupCommit { interval_ms: u64, max_batch_bytes: usize },
+    GroupCommit {
+        interval_ms: u64,
+        max_batch_bytes: usize,
+    },
     Never,
 }
 
@@ -145,7 +148,9 @@ pub struct QueryOptions {
 /// Outcome of committing a query session.
 pub enum QueryCommitOutcome {
     NotSubscribed,
-    Subscribed { subscription: crate::subs::Subscription },
+    Subscribed {
+        subscription: crate::subs::Subscription,
+    },
     InvalidatedDuringRun,
 }
 

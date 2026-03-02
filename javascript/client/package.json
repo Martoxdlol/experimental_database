@@ -1,0 +1,20 @@
+{
+  "name": "experimental-db-client",
+  "version": "0.1.0",
+  "description": "TypeScript client for experimental-db — WebSocket JSON document store with OCC transactions and live subscriptions",
+  "module": "index.ts",
+  "type": "module",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "example": "bun run examples/demo.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

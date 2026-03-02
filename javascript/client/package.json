@@ -9,7 +9,8 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "example": "bun run examples/demo.ts"
+    "example": "bun run examples/demo.ts",
+    "demo:ecommerce": "bun run examples/demo_ecommerce.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"

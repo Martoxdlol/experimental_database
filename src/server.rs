@@ -15,12 +15,16 @@
 //! ```json
 //! {"req_id":1, "type":"create_collection", "name":"users"}
 //! {"req_id":2, "type":"delete_collection", "name":"users"}
+//! {"req_id":3, "type":"list_collections"}
+//! // → {"req_id":3, "ok":true, "collections":["users", ...]}
 //! ```
 //!
 //! **Indexes**
 //! ```json
-//! {"req_id":3, "type":"create_index",  "collection":"users", "field":"age", "unique":false}
-//! {"req_id":4, "type":"index_state",   "collection":"users", "index_id":1}
+//! {"req_id":4, "type":"create_index",  "collection":"users", "field":"age", "unique":false}
+//! {"req_id":5, "type":"index_state",   "collection":"users", "index_id":1}
+//! {"req_id":6, "type":"list_indexes",  "collection":"users"}
+//! // → {"req_id":6, "ok":true, "indexes":[{"index_id":1,"field":"age","unique":false,"state":"Ready { ... }"}]}
 //! ```
 //!
 //! **Mutation session** (begin → ops → commit)
@@ -55,10 +59,13 @@
 //! {"req_id":14, "type":"query_find",     "tx":"q:1", "collection":"users", "filter":null}
 //! // → {"req_id":14, "ok":true, "docs":[{...}, ...]}
 //!
-//! {"req_id":15, "type":"query_find_ids", "tx":"q:1", "collection":"users", "filter":null}
+//! {"req_id":15, "type":"query_find_ids",      "tx":"q:1", "collection":"users", "filter":null}
 //! // → {"req_id":15, "ok":true, "doc_ids":["<hex32>", ...]}
 //!
-//! {"req_id":16, "type":"commit_query", "tx":"q:1"}
+//! {"req_id":16, "type":"query_find_with_ids", "tx":"q:1", "collection":"users", "filter":null, "limit":500}
+//! // → {"req_id":16, "ok":true, "results":[{"_id":"<hex32>","doc":{...}}, ...]}
+//!
+//! {"req_id":17, "type":"commit_query", "tx":"q:1"}
 //! // → {"req_id":16, "ok":true, "subscribed":false}
 //! // or {"req_id":16, "ok":true, "subscribed":true, "sub_id":1}
 //! ```
@@ -212,6 +219,10 @@ impl Conn {
                 self.db.delete_collection(name).await?;
                 Ok(json!({}))
             }
+            "list_collections" => {
+                let names = self.db.list_collections();
+                Ok(json!({"collections": names}))
+            }
 
             // ── Indexes ───────────────────────────────────────────────────────
             "create_index" => {
@@ -227,6 +238,15 @@ impl Conn {
                 let index_id = req_u64(cmd, "index_id")?;
                 let state = self.db.index_state(collection, index_id).await?;
                 Ok(json!({"state": format!("{state:?}")}))
+            }
+            "list_indexes" => {
+                let collection = req_str(cmd, "collection")?;
+                let infos = self.db.list_indexes(collection)?;
+                let indexes: Vec<Value> = infos
+                    .iter()
+                    .map(|i| json!({"index_id": i.index_id, "field": i.field, "unique": i.unique, "state": i.state}))
+                    .collect();
+                Ok(json!({"indexes": indexes}))
             }
 
             // ── Mutation session ──────────────────────────────────────────────
@@ -341,6 +361,23 @@ impl Conn {
                 let ids = session.find_ids(col, filter).await?;
                 let hex_ids: Vec<String> = ids.iter().map(encode_doc_id).collect();
                 Ok(json!({"doc_ids": hex_ids}))
+            }
+            "query_find_with_ids" => {
+                let (tx, col) = (req_str(cmd, "tx")?, req_str(cmd, "collection")?);
+                let filter = parse_opt_filter(cmd.get("filter").unwrap_or(&Value::Null))?;
+                let limit = cmd["limit"].as_u64().map(|l| l as usize).unwrap_or(500);
+                let session = self.queries.get_mut(tx)
+                    .ok_or_else(|| anyhow!("no query session '{tx}'"))?;
+                let all_ids = session.find_ids(col, filter).await?;
+                let ids: Vec<_> = all_ids.into_iter().take(limit).collect();
+                let mut results: Vec<Value> = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if let Some(bytes) = session.get(col, id).await? {
+                        let doc: Value = serde_json::from_slice(&bytes)?;
+                        results.push(json!({"_id": encode_doc_id(&id), "doc": doc}));
+                    }
+                }
+                Ok(json!({"results": results}))
             }
             "commit_query" => {
                 let tx = req_str(cmd, "tx")?;

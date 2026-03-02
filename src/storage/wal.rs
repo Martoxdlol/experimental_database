@@ -359,6 +359,9 @@ fn decode_catalog_entry(data: &[u8], pos: &mut usize) -> Result<CatalogWalEntry>
 // ── WalWriter ─────────────────────────────────────────────────────────────────
 
 /// Append-only WAL writer. Uses a tokio task internally for serialized writes.
+///
+/// When a `broadcast_tx` is provided (for primary replication), each written
+/// frame batch is also sent on that channel so replica connections can stream it.
 pub struct WalWriter {
     tx: tokio::sync::mpsc::Sender<WriteRequest>,
 }
@@ -366,10 +369,17 @@ pub struct WalWriter {
 struct WriteRequest {
     data: Vec<u8>,
     reply: tokio::sync::oneshot::Sender<Result<()>>,
+    /// Optional broadcast: if present, the writer task sends `data` here after
+    /// successfully writing to disk.
+    broadcast: Option<tokio::sync::broadcast::Sender<std::sync::Arc<Vec<u8>>>>,
 }
 
 impl WalWriter {
     pub async fn open(path: &Path, fsync_policy: WalFsyncPolicy) -> Result<Self> {
+        Self::open_inner(path, fsync_policy).await
+    }
+
+    async fn open_inner(path: &Path, fsync_policy: WalFsyncPolicy) -> Result<Self> {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -385,11 +395,17 @@ impl WalWriter {
                     file.write_all(&req.data)?;
                     match &fsync_policy {
                         WalFsyncPolicy::Always => file.sync_all()?,
-                        WalFsyncPolicy::GroupCommit { .. } => {} // handled by batching
+                        WalFsyncPolicy::GroupCommit { .. } => {}
                         WalFsyncPolicy::Never => {}
                     }
                     Ok(())
                 })();
+                // Broadcast the raw bytes to replica connections (if any).
+                if result.is_ok() {
+                    if let Some(bcast) = req.broadcast {
+                        let _ = bcast.send(std::sync::Arc::new(req.data));
+                    }
+                }
                 let _ = req.reply.send(result);
             }
         });
@@ -398,23 +414,55 @@ impl WalWriter {
     }
 
     pub async fn append(&self, record: &WalRecord) -> Result<()> {
+        self.append_with_broadcast(record, None).await
+    }
+
+    pub async fn append_broadcast(
+        &self,
+        record: &WalRecord,
+        bcast: tokio::sync::broadcast::Sender<std::sync::Arc<Vec<u8>>>,
+    ) -> Result<()> {
+        self.append_with_broadcast(record, Some(bcast)).await
+    }
+
+    async fn append_with_broadcast(
+        &self,
+        record: &WalRecord,
+        bcast: Option<tokio::sync::broadcast::Sender<std::sync::Arc<Vec<u8>>>>,
+    ) -> Result<()> {
         let data = record.encode();
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(WriteRequest { data, reply: reply_tx })
+            .send(WriteRequest { data, reply: reply_tx, broadcast: bcast })
             .await
             .map_err(|_| anyhow!("WAL writer task died"))?;
         reply_rx.await.map_err(|_| anyhow!("WAL writer reply channel closed"))?
     }
 
     pub async fn append_batch(&self, records: &[WalRecord]) -> Result<()> {
+        self.append_batch_with_broadcast(records, None).await
+    }
+
+    pub async fn append_batch_broadcast(
+        &self,
+        records: &[WalRecord],
+        bcast: tokio::sync::broadcast::Sender<std::sync::Arc<Vec<u8>>>,
+    ) -> Result<()> {
+        self.append_batch_with_broadcast(records, Some(bcast)).await
+    }
+
+    async fn append_batch_with_broadcast(
+        &self,
+        records: &[WalRecord],
+        bcast: Option<tokio::sync::broadcast::Sender<std::sync::Arc<Vec<u8>>>>,
+    ) -> Result<()> {
         let mut data = Vec::new();
         for r in records {
             data.extend_from_slice(&r.encode());
         }
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(WriteRequest { data, reply: reply_tx })
+            .send(WriteRequest { data, reply: reply_tx, broadcast: bcast })
             .await
             .map_err(|_| anyhow!("WAL writer task died"))?;
         reply_rx.await.map_err(|_| anyhow!("WAL writer reply channel closed"))?

@@ -21,6 +21,16 @@ use crate::types::{
     PatchOp, QueryCommitOutcome, QueryOptions, QueryType, ReplicationConfig, Ts, TxId,
 };
 
+// ── IndexInfo ─────────────────────────────────────────────────────────────────
+
+/// Describes a secondary index on a collection.
+pub struct IndexInfo {
+    pub index_id: u64,
+    pub field: String,
+    pub unique: bool,
+    pub state: String,
+}
+
 // ── DbConfig ──────────────────────────────────────────────────────────────────
 
 pub struct DbConfig {
@@ -47,6 +57,11 @@ impl DbConfig {
         self.wal_fsync = policy;
         self
     }
+
+    pub fn with_replication(mut self, cfg: ReplicationConfig) -> Self {
+        self.replication = cfg;
+        self
+    }
 }
 
 // ── Inner database state ──────────────────────────────────────────────────────
@@ -60,6 +75,10 @@ struct Inner {
     commit_log: CommitLog,
     subscription_registry: SubscriptionRegistry,
     wal: Arc<WalWriter>,
+    /// Highest commit_ts applied from the WAL stream (used by replicas).
+    applied_ts: AtomicU64,
+    /// Optional broadcast channel for replication; set on primary databases.
+    repl_broadcast: Option<tokio::sync::broadcast::Sender<std::sync::Arc<Vec<u8>>>>,
 }
 
 impl Inner {
@@ -139,6 +158,15 @@ impl Database {
         // Open WAL writer
         let wal = WalWriter::open(&wal_path, cfg.wal_fsync).await?;
 
+        // Set up replication broadcast channel for primary role.
+        let repl_broadcast = match cfg.replication.role {
+            crate::types::ReplicationRole::Primary => {
+                let (tx, _) = tokio::sync::broadcast::channel(1024);
+                Some(tx)
+            }
+            _ => None,
+        };
+
         let inner = Arc::new(Inner {
             ts_alloc: TsAllocator::new(max_ts + 1),
             next_tx_id: AtomicU64::new(1),
@@ -148,6 +176,8 @@ impl Database {
             commit_log: CommitLog::new(),
             subscription_registry: SubscriptionRegistry::new(),
             wal: Arc::new(wal),
+            applied_ts: AtomicU64::new(max_ts),
+            repl_broadcast,
         });
 
         Ok(Database { inner })
@@ -155,8 +185,71 @@ impl Database {
 
     /// Shut down the database. (Currently a no-op; future: flush WAL, join tasks.)
     pub async fn shutdown(self) -> Result<()> {
-        // Future: signal background tasks to stop, flush pages, etc.
         Ok(())
+    }
+
+    /// Current applied_ts (highest commit_ts applied on this node).
+    pub fn applied_ts(&self) -> Ts {
+        self.inner.applied_ts.load(Ordering::Acquire)
+    }
+
+    /// Subscribe to raw WAL frame bytes streamed from the primary.
+    /// Returns `None` if this database is not configured as a primary.
+    pub fn replication_subscribe(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Receiver<std::sync::Arc<Vec<u8>>>> {
+        self.inner.repl_broadcast.as_ref().map(|tx| tx.subscribe())
+    }
+
+    /// Apply a single WAL record received from the primary (used by replicas).
+    pub fn apply_wal_record(&self, record: &WalRecord, commit_ts: Ts) -> Result<()> {
+        match record {
+            WalRecord::PutDoc { collection_id, doc_id, json, .. } => {
+                self.inner.engine.apply_put(*collection_id, doc_id, commit_ts, json.clone());
+            }
+            WalRecord::DeleteDoc { collection_id, doc_id, .. } => {
+                self.inner.engine.apply_delete(*collection_id, doc_id, commit_ts);
+            }
+            WalRecord::CatalogUpdate(entry) => {
+                apply_catalog_update(&self.inner.catalog, &self.inner.engine, entry)?;
+            }
+            WalRecord::Commit { commit_ts: ts, .. } => {
+                // Advance applied_ts to the committed timestamp.
+                let mut current = self.inner.applied_ts.load(Ordering::Acquire);
+                while *ts > current {
+                    match self.inner.applied_ts.compare_exchange(
+                        current,
+                        *ts,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => break,
+                        Err(v) => current = v,
+                    }
+                }
+                // Also advance the timestamp allocator so queries use fresh snapshots.
+                self.inner.ts_alloc.advance_to_at_least(*ts);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Get the replication broadcast sender (primary only). Used to forward WAL
+    /// frames to the WalWriter which then broadcasts them after disk write.
+    pub fn replication_broadcast_tx(
+        &self,
+    ) -> Option<tokio::sync::broadcast::Sender<std::sync::Arc<Vec<u8>>>> {
+        self.inner.repl_broadcast.clone()
+    }
+
+    /// Append one WAL record, broadcasting to replicas if this is a primary.
+    async fn wal_append(&self, record: &WalRecord) -> Result<()> {
+        if let Some(bcast) = self.inner.repl_broadcast.clone() {
+            self.inner.wal.append_broadcast(record, bcast).await
+        } else {
+            self.inner.wal.append(record).await
+        }
     }
 
     // ── Collection management ─────────────────────────────────────────────────
@@ -166,13 +259,11 @@ impl Database {
         self.inner.engine.create_collection(id);
 
         // Write to WAL
-        self.inner
-            .wal
-            .append(&WalRecord::CatalogUpdate(CatalogWalEntry::CreateCollection {
-                id,
-                name: name.to_string(),
-            }))
-            .await?;
+        self.wal_append(&WalRecord::CatalogUpdate(CatalogWalEntry::CreateCollection {
+            id,
+            name: name.to_string(),
+        }))
+        .await?;
 
         Ok(())
     }
@@ -181,12 +272,34 @@ impl Database {
         let id = self.inner.catalog.delete_collection_by_name(name)?;
         self.inner.engine.drop_collection(id);
 
-        self.inner
-            .wal
-            .append(&WalRecord::CatalogUpdate(CatalogWalEntry::DeleteCollection { id }))
+        self.wal_append(&WalRecord::CatalogUpdate(CatalogWalEntry::DeleteCollection { id }))
             .await?;
 
         Ok(())
+    }
+
+    /// Return an alphabetically sorted list of all collection names.
+    pub fn list_collections(&self) -> Vec<String> {
+        let mut names = self.inner.catalog.collection_names();
+        names.sort();
+        names
+    }
+
+    /// Return metadata for all secondary indexes on `collection`.
+    pub fn list_indexes(&self, collection: &str) -> Result<Vec<IndexInfo>> {
+        let meta = self.inner.catalog.get_collection_by_name(collection)?;
+        let mut infos: Vec<IndexInfo> = meta
+            .indexes
+            .values()
+            .map(|idx| IndexInfo {
+                index_id: idx.index_id,
+                field: idx.spec.field.0.join("."),
+                unique: idx.spec.unique,
+                state: format!("{:?}", idx.state),
+            })
+            .collect();
+        infos.sort_by_key(|i| i.index_id);
+        Ok(infos)
     }
 
     // ── Index management ──────────────────────────────────────────────────────
@@ -203,17 +316,15 @@ impl Database {
         }
 
         // Write catalog update to WAL
-        self.inner
-            .wal
-            .append(&WalRecord::CatalogUpdate(CatalogWalEntry::CreateIndex {
-                collection_id: collection_meta.id,
-                index_id,
-                field_path: spec.field.0,
-                unique: spec.unique,
-                state_tag: 0, // Building
-                state_ts: start_ts,
-            }))
-            .await?;
+        self.wal_append(&WalRecord::CatalogUpdate(CatalogWalEntry::CreateIndex {
+            collection_id: collection_meta.id,
+            index_id,
+            field_path: spec.field.0,
+            unique: spec.unique,
+            state_tag: 0, // Building
+            state_ts: start_ts,
+        }))
+        .await?;
 
         // Spawn background index build task
         let db = self.clone();
@@ -272,14 +383,12 @@ impl Database {
         let ready_ts = self.inner.ts_alloc.current_ts();
         self.inner.catalog.set_index_ready(collection_id, index_id, ready_ts)?;
 
-        self.inner
-            .wal
-            .append(&WalRecord::CatalogUpdate(CatalogWalEntry::SetIndexReady {
-                collection_id,
-                index_id,
-                ready_at_ts: ready_ts,
-            }))
-            .await?;
+        self.wal_append(&WalRecord::CatalogUpdate(CatalogWalEntry::SetIndexReady {
+            collection_id,
+            index_id,
+            ready_at_ts: ready_ts,
+        }))
+        .await?;
 
         tracing::info!("index {index_id} on collection '{collection}' is ready at ts={ready_ts}");
         Ok(())
@@ -631,8 +740,12 @@ impl MutationSession {
         }
         wal_records.push(WalRecord::Commit { tx_id, commit_ts });
 
-        // Append to WAL (durable first)
-        db.inner.wal.append_batch(&wal_records).await?;
+        // Append to WAL (durable first), and broadcast to replicas if primary.
+        if let Some(bcast) = db.inner.repl_broadcast.clone() {
+            db.inner.wal.append_batch_broadcast(&wal_records, bcast).await?;
+        } else {
+            db.inner.wal.append_batch(&wal_records).await?;
+        }
 
         // Apply to in-memory engine and update secondary indexes
         for ((col_id, doc_id), write) in write_set.iter_writes() {

@@ -1095,27 +1095,153 @@ When document versions are vacuumed (section 2.11), their secondary index entrie
 
 ## 4. Query Engine
 
-### 4.1 Access Patterns
+### 4.1 Query Pipeline
 
-- **Primary get**: point lookup by document ID via the primary B-tree.
-- **Index scan**: range scan on a secondary index with optional filter and limit.
-- **Table scan**: full collection scan with optional filter and limit.
+Every query follows a three-stage pipeline:
 
-### 4.2 Operators
+```
+Source  →  Post-Filter  →  Terminal
+```
 
-`eq`, `lt`, `gt`, `gte`, `lte`, `ne`, `AND`, `OR`, `IN`, `NOT`.
+1. **Source**: produces a stream of documents in index key order. One of:
+   - **Primary get**: point lookup by document ID.
+   - **Index scan**: range scan on a named index using index range expressions.
+   - **Table scan**: full collection scan via the `_created_at` index (equivalent to an index scan with unbounded range).
 
-### 4.3 Query Tagging
+2. **Post-filter** (optional): arbitrary filter expression evaluated against each document from the source. Documents that don't match are skipped. The post-filter does **not** narrow the index scan interval — it only reduces the result set.
 
-Every read operation within a transaction is assigned an incremental **query ID** (`u32`, starting at 0). This ID is stored in the read set entry and serves two purposes:
+3. **Terminal**: controls how many documents to return.
+   - **collect**: return all matching documents.
+   - **first**: return the first matching document (equivalent to `limit: 1`).
+   - **limit(N)**: return at most N matching documents.
+
+The source determines the read set interval. The post-filter and terminal affect which documents are returned, but the **scanned range** (not the returned documents) defines the conflict surface for OCC and subscriptions.
+
+### 4.2 Query Sources
+
+#### 4.2.1 Primary Get
+
+Point lookup by document ID. Traverses the primary B-tree to `doc_id || inv_ts` and returns the first version visible at `read_ts`.
+
+**Read set**: records a **point interval** on the primary index covering all versions of that document: `[doc_id || 0x00...00, doc_id+1 || 0x00...00)`.
+
+**Cost**: O(log N) — one B-tree traversal.
+
+#### 4.2.2 Index Scan
+
+Range scan on a named secondary index (or a built-in index: `_id`, `_created_at`). The client specifies the index and provides **index range expressions** (section 4.3) that define the scan interval.
+
+**Procedure**:
+
+1. Encode the range expressions into a contiguous byte interval `[lower_bound, upper_bound)` on the encoded index key space (section 3.4).
+2. Seek to `lower_bound` in the secondary index B-tree.
+3. Scan forward (or backward for `order: "desc"`) along the leaf page chain.
+4. For each entry: perform MVCC version resolution (section 3.5). Skip stale entries.
+5. For each visible document: if a post-filter is present, fetch the document body from the primary B-tree and evaluate the filter. Skip non-matching documents.
+6. Yield matching documents until the terminal condition (limit reached or scan exhausted).
+7. Record the **scanned interval** in the read set (see 5.6).
+
+**Read set**: records the byte interval `[lower_bound, upper_bound)` on the specified index. If a limit was applied and exactly N results were returned, the upper bound tightens to the key of the last returned document (see 5.6.3 for details).
+
+**Cost**: O(log N + K) where K is the number of index entries scanned (including those filtered out by post-filter or MVCC resolution).
+
+#### 4.2.3 Table Scan
+
+Full collection scan. Equivalent to an index scan on the `_created_at` index with an unbounded range. Used when the client explicitly scans the entire collection.
+
+**Read set**: records the **full interval** `[MIN, MAX)` on the `_created_at` index. This means any write to the collection will conflict — table scans have the widest conflict surface.
+
+### 4.3 Index Range Expressions
+
+Index range expressions specify a contiguous interval on a compound index's key space. They follow a strict rule: **zero or more equality prefixes in index field order, then optionally one range bound (lower, upper, or both) on the next field**.
+
+For a compound index on fields `[A, B, C]`:
+
+| Expression | Valid | Interval |
+|------------|-------|----------|
+| `eq(A, 1)` | yes | All entries where A=1 |
+| `eq(A, 1), eq(B, "x")` | yes | All entries where A=1 and B="x" |
+| `eq(A, 1), eq(B, "x"), gt(C, 100)` | yes | A=1, B="x", C>100 |
+| `eq(A, 1), gte(B, "m"), lt(B, "z")` | yes | A=1, "m"≤B<"z" |
+| `gt(A, 5)` | yes | A>5 (no equality prefix, range on first field) |
+| `gt(B, "m")` | no | Skips A — cannot produce contiguous interval |
+| `eq(A, 1), gt(B, "m"), eq(C, 5)` | no | Equality after range — not contiguous |
+
+**Why this constraint**: each valid range expression maps to exactly one contiguous byte interval on the encoded key space. The order-preserving key encoding (section 3.4) means `eq(A, 1)` fixes a prefix, and subsequent bounds narrow within that prefix. Skipping a field or placing equality after a range would create disjoint intervals, breaking the single-interval guarantee.
+
+**Available operators**:
+
+| Operator | Meaning | Position |
+|----------|---------|----------|
+| `eq(field, value)` | Equality | Zero or more, in index field order |
+| `gt(field, value)` | Exclusive lower bound | After all `eq`s, on the next field |
+| `gte(field, value)` | Inclusive lower bound | After all `eq`s, on the next field |
+| `lt(field, value)` | Exclusive upper bound | After all `eq`s, on the next field |
+| `lte(field, value)` | Inclusive upper bound | After all `eq`s, on the next field |
+
+A range field can have both a lower and upper bound: `gte(B, 10), lt(B, 20)`.
+
+**Special case**: no range expressions at all (empty or omitted) scans the entire index — equivalent to a table scan on that index.
+
+**Encoding to byte interval**:
+
+Given index `[A, B]` and range `eq(A, 1), gte(B, "hello")`:
+
+```
+lower_bound = encode(type_tag(int64), 1) || encode(type_tag(string), "hello")
+upper_bound = encode(type_tag(int64), 1) || successor_prefix
+```
+
+Where `successor_prefix` is one byte past the end of the `A=1` prefix, covering all possible B values within A=1. The `doc_id || inv_ts` suffix in every index key is handled by MVCC resolution, not by the range bounds.
+
+### 4.4 Post-Filters
+
+Post-filters are arbitrary filter expressions evaluated against each document after it is read from the source. They support all comparison and logical operators:
+
+**Comparison operators**:
+
+| Operator | Description |
+|----------|-------------|
+| `eq(field, value)` | Equal |
+| `ne(field, value)` | Not equal |
+| `gt(field, value)` | Greater than |
+| `gte(field, value)` | Greater than or equal |
+| `lt(field, value)` | Less than |
+| `lte(field, value)` | Less than or equal |
+| `in(field, [values])` | Value is in the set |
+
+**Logical operators**:
+
+| Operator | Description |
+|----------|-------------|
+| `and([filters])` | All must match |
+| `or([filters])` | At least one must match |
+| `not(filter)` | Negation |
+
+**Interaction with read sets**: post-filters do **not** narrow the read set interval. The full scanned byte range from the source is recorded regardless of how many documents the post-filter rejects. This is by design — a future write that matches the post-filter could enter the scanned range, and the read set must capture this phantom possibility.
+
+**Performance implication**: post-filters cause more documents to be scanned (and more I/O) than equivalent index range expressions. A query with `eq("status", "active")` as a post-filter on a `_created_at` table scan reads every document in the collection. The same predicate as an index range expression on a `[status]` index reads only the "active" entries. The read set is also wider: the table scan conflicts with any write to the collection, while the index scan only conflicts with writes that affect the `status = "active"` key range.
+
+### 4.5 Query Execution
+
+Given a `query` message with `index`, `range`, optional `filter`, `order`, and `limit`:
+
+1. **Resolve index**: look up the named index in the catalog. Verify it exists and is `Ready` (section 3.7). If `Building`, return error `index_not_ready`.
+2. **Encode range**: translate index range expressions into a byte interval `[lower_bound, upper_bound)` using the order-preserving key encoding (section 3.4). Validate that predicates follow the index field order rule (section 4.3).
+3. **Choose scan direction**: `order: "asc"` scans forward from `lower_bound`; `order: "desc"` scans backward from `upper_bound`.
+4. **Execute scan**: traverse the index B-tree (section 4.2.2). For each visible document:
+   a. If the source is a secondary index, fetch the document body from the primary B-tree (needed for post-filter evaluation and to return the document).
+   b. Evaluate post-filter. Skip if no match.
+   c. Add to result set. Check limit.
+5. **Record read set**: compute the scanned interval and record it (section 5.6). Apply limit-aware tightening if applicable (section 5.6.3).
+6. **Return**: results in index key order, with server-assigned `query_id`.
+
+### 4.6 Query Tagging
+
+Every read operation within a transaction is assigned an incremental **query ID** (`u32`, starting at 0). This ID is stored alongside the read set interval entry and serves two purposes:
 
 - **Subscription granularity**: when a subscription is invalidated, the notification includes the specific query IDs affected, so the client knows which queries to re-execute.
 - **Cache keying**: query results can be cached and invalidated at the individual query level.
-
-### 4.4 Constraints
-
-- `limit` supported on all query types.
-- Limit interacts with read sets and conflict detection (see 5.7).
 
 ---
 
@@ -1158,7 +1284,7 @@ All mutations within a transaction share the same `commit_ts`. The transaction i
 **Read-only (query)**:
 
 1. `begin(readonly: true)` → acquire `read_ts` = latest committed timestamp.
-2. Execute reads. Each read is assigned an incremental `query_id` (see 4.3). All reads see the consistent snapshot at `read_ts`.
+2. Execute reads. Each read is assigned an incremental `query_id` (see 4.6). All reads see the consistent snapshot at `read_ts`.
 3. `commit()` → if `subscribe` or `notify`: register read set in subscription registry. Release resources.
 
 **Read-write (mutation)**:
@@ -1229,44 +1355,138 @@ MutationEntry {
 
 Patch operations are resolved eagerly: the write set always contains the final document body, never a delta. The WAL also stores resolved bodies (see 2.8).
 
+#### 5.5.1 Index Delta Computation
+
+At commit time, the write set is transformed into **index deltas** for each mutation. These deltas are stored in the commit log (section 5.7) and used for conflict detection against concurrent read sets and active subscriptions.
+
+For each `(collection_id, doc_id)` in the write set:
+
+1. **Old document**: if `previous_ts` is set, read the previous document version at that timestamp. For every index on the collection, extract the indexed field values and encode into an index key → `old_key`. For array-indexed fields, one key per array element.
+2. **New document**: if the operation is not a delete, extract indexed field values from the new body and encode → `new_key`.
+3. **Delta**: for each index, emit an `IndexDelta`:
+
+```
+IndexDelta {
+    index_id: IndexId
+    old_key:  Option<EncodedKey>    // None for inserts (no previous entry)
+    new_key:  Option<EncodedKey>    // None for deletes (entry removed)
+}
+```
+
+When the indexed field value did not change (`old_key == new_key`), the delta is still recorded — it is needed for conflict detection (a concurrent read set interval may cover this key). The delta is omitted only when neither the old nor the new document has a value for the indexed field (both would encode as the `undefined` type tag).
+
+For **array-indexed fields**, a single document may produce multiple old keys and multiple new keys. Each combination is a separate delta entry.
+
 ### 5.6 Read Set
 
-The read set records every read performed during a transaction. Used for OCC validation at commit time and as the foundation for subscription invalidation.
+The read set records which portions of the index key space a transaction has observed. It is used for OCC validation at commit time (section 5.7) and as the watch predicate for subscription invalidation (section 5.8).
+
+#### 5.6.1 Structure
 
 ```
 ReadSet {
-    entries: Vec<ReadSetEntry>
+    intervals: BTreeMap<(CollectionId, IndexId), Vec<ReadInterval>>
 }
 
-ReadSetEntry:
+ReadInterval {
+    query_id:  u32                  // which query produced this interval (see 4.6)
+    lower:     EncodedKey           // inclusive lower bound (byte string)
+    upper:     Bound<EncodedKey>    // Excluded(key) or Unbounded
+}
 
-    Get {
-        query_id:      u32              // incremental per transaction (see 4.3)
-        collection_id: CollectionId
-        doc_id:        DocId
-    }
-
-    IndexScan {
-        query_id:       u32
-        collection_id:  CollectionId
-        index_id:       IndexId
-        lower_bound:    Option<EncodedKey>
-        upper_bound:    Option<EncodedKey>
-        filter:         Option<Filter>
-        limit:          Option<u64>
-        result_doc_ids: Vec<DocId>
-    }
-
-    TableScan {
-        query_id:       u32
-        collection_id:  CollectionId
-        filter:         Option<Filter>
-        limit:          Option<u64>
-        result_doc_ids: Vec<DocId>
-    }
+Bound<T>:
+    Excluded(T)
+    Unbounded
 ```
 
-Every query operation appends an entry with a unique `query_id`. This captures the **query parameters** (what was asked), the **result set** (what was returned), and the **query identity** (which query to re-execute on invalidation). Query parameters define the conflict range; result set enables precise invalidation; query ID enables granular subscription notifications.
+The read set is a collection of byte-range intervals, grouped by `(collection, index)`. Each interval represents a contiguous range of encoded index keys that was scanned during query execution. The `query_id` links the interval back to the specific query operation for subscription notifications.
+
+**Invariant**: intervals within the same `(collection, index)` group are sorted by `lower` bound. Overlapping or adjacent intervals are merged. This keeps the interval count bounded and makes conflict checking efficient.
+
+#### 5.6.2 How Queries Produce Intervals
+
+Each query type records a specific interval pattern:
+
+**Primary get** (`get` by document ID):
+
+Records a point interval on the **primary index** covering all versions of the document:
+
+```
+lower = doc_id || 0x00..00    (16 bytes doc_id + 8 zero bytes)
+upper = Excluded(successor(doc_id) || 0x00..00)
+```
+
+Where `successor(doc_id)` is the next 16-byte value after `doc_id`. This captures any change to the document — insert, replace, patch, or delete — because all versions of a document share the same `doc_id` prefix in the primary B-tree.
+
+**Index scan** (with range expressions):
+
+Records the byte interval derived from the index range expressions (section 4.3).
+
+For range `eq(A, 1), gte(B, "hello")` on index `[A, B]`:
+
+```
+lower = encode(int64, 1) || encode(string, "hello")
+upper = Excluded(encode(int64, 1) || successor_prefix)
+```
+
+Where `successor_prefix` is one past the end of the `A=1` prefix, covering all B values within A=1.
+
+For range `eq(A, 1), gte(B, "hello"), lt(B, "world")`:
+
+```
+lower = encode(int64, 1) || encode(string, "hello")
+upper = Excluded(encode(int64, 1) || encode(string, "world"))
+```
+
+**Table scan** (unbounded scan on `_created_at` index):
+
+Records the full interval:
+
+```
+lower = 0x00  (minimum possible key)
+upper = Unbounded
+```
+
+This is the widest possible interval — any write to the collection will overlap with it.
+
+#### 5.6.3 Limit-Aware Interval Tightening
+
+When a query has a `limit`, the scanned interval may be tighter than the range expressions suggest:
+
+- **Returned fewer than `limit` results**: the scan exhausted the entire range. The interval is the full range from the range expressions — no tightening.
+- **Returned exactly `limit` results**: the scan stopped at the last returned document's index key. The interval tightens:
+  - For `order: "asc"`: the `upper` bound tightens to `Excluded(last_key + 1)`. The scan never looked beyond the last result.
+  - For `order: "desc"`: the `lower` bound tightens to the key of the last result.
+
+**Example**: index scan on `[status]` with `eq("status", "active"), limit: 10, order: "asc"`.
+
+- The range expression produces interval `[encode("active"), Excluded(successor("active")))`.
+- 10 results returned, last one at key `encode("active") || doc_id_10 || inv_ts_10`:
+  - Tightened interval: `[encode("active"), Excluded(encode("active") || doc_id_10 || inv_ts_10 + 1))`.
+  - A new document inserted into the `active` range **after** `doc_id_10` does NOT conflict — it would appear after the limit cutoff.
+  - A new document **before** `doc_id_10` DOES conflict — it could displace a result.
+
+This tightening is critical for high-throughput workloads: a paginated query reading the first 50 results of a large range only conflicts with writes to the first 50 entries' key range, not the entire range.
+
+#### 5.6.4 Post-Filters and Read Set Precision
+
+Post-filters do **not** narrow the read set interval. The full scanned range from the source is recorded, regardless of how many documents the post-filter rejects.
+
+**Why**: a post-filter like `ne("deleted", true)` rejects some documents within the scanned range. But a future write could change a document's `deleted` field from `true` to `false`, causing it to enter the result set. If the read set only covered the returned documents, this phantom would go undetected.
+
+The correct way to narrow the read set is to use index range expressions, not post-filters. For the example above: create an index on `[deleted, ...]` and use `eq("deleted", false)` as a range expression.
+
+#### 5.6.5 Read Set Size Limits
+
+To prevent unbounded read set growth in long-running transactions:
+
+| Limit | Default | Description |
+|-------|---------|-------------|
+| `max_intervals` | 4,096 | Maximum number of intervals across all indexes |
+| `max_scanned_bytes` | 64 MB | Maximum total bytes read from index + primary B-trees |
+| `max_scanned_docs` | 100,000 | Maximum documents scanned (including those filtered out) |
+
+Exceeding any limit aborts the transaction with error code `read_limit_exceeded`.
 
 ### 5.7 OCC Validation (Conflict Detection)
 
@@ -1280,37 +1500,45 @@ CommitLog {
 }
 
 CommitLogEntry {
-    commit_ts: u64
-    writes:    Vec<WriteRecord>
+    commit_ts:    u64
+    index_writes: BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>>
 }
 
-WriteRecord {
-    collection_id: CollectionId
-    doc_id:        DocId
-    index_deltas:  Vec<IndexDelta>
-}
-
-IndexDelta {
-    index_id: IndexId
-    old_key:  Option<EncodedKey>    // None for inserts
-    new_key:  Option<EncodedKey>    // None for deletes
+IndexKeyWrite {
+    doc_id:  DocId
+    old_key: Option<EncodedKey>    // None for inserts
+    new_key: Option<EncodedKey>    // None for deletes
 }
 ```
 
-The `index_deltas` capture the old and new index key values for each write. This enables precise phantom detection without re-reading documents.
+The commit log indexes writes by `(collection, index)` for direct lookup against the read set. Each entry stores the old and new encoded index keys for every affected index (computed per section 5.5.1).
 
-**Validation rules** — for each `ReadSetEntry`, check all `CommitLogEntry` in `(begin_ts, commit_ts)`:
+**Validation algorithm**:
 
-| Read Set Entry | Conflict Condition |
-|----------------|-------------------|
-| `Get(col, doc_id)` | Any concurrent write to the same `(col, doc_id)`. |
-| `IndexScan(col, idx, bounds, ...)` | Any concurrent write where: **(a)** `doc_id` is in `result_doc_ids` (direct hit), OR **(b)** an `IndexDelta` for this `index_id` has `old_key` or `new_key` within `[lower_bound, upper_bound]` (phantom — a document entered or left the scan range). |
-| `TableScan(col, filter, ...)` | Any concurrent write to the same `collection_id`. **Optimization**: if a `filter` is present, only conflict if the written document (before or after the write) satisfies the filter. |
+For each `(collection_id, index_id)` group in the read set:
 
-**Limit-aware phantom detection**:
+1. Gather all `IndexKeyWrite` entries from commits in `(begin_ts, commit_ts)` for this `(collection, index)`.
+2. For each `IndexKeyWrite`:
+   - If `old_key` is `Some(k)` and `k` falls within any `ReadInterval` in this group → **conflict**. A document that was in the scan range has been modified or deleted.
+   - If `new_key` is `Some(k)` and `k` falls within any `ReadInterval` in this group → **conflict** (phantom). A document has entered the scan range via insert or update.
+3. If no key overlaps are found across all groups → validation passes.
 
-- A query with `limit: N` that returned **fewer** than N results scanned the entire matching range — the effective bounds are the full scan range.
-- A query with `limit: N` that returned **exactly** N results: the effective upper bound tightens to the index key of the Nth (last) result. Any insert/update within `[lower_bound, key_of_Nth_result]` is a phantom conflict, since it could displace a result.
+**Key overlap check**: a key `k` falls within `ReadInterval { lower, upper }` if:
+
+```
+k >= lower AND (upper == Unbounded OR k < excluded_upper)
+```
+
+This is a byte comparison on encoded keys (memcmp). Since intervals within a group are sorted and non-overlapping, the check uses binary search — O(log I) per key, where I is the number of intervals in the group.
+
+**Why both old and new keys matter**:
+
+- **`old_key` overlap**: a document that was _inside_ the scan range has been modified or deleted. The transaction may have read it, and the result is now stale.
+- **`new_key` overlap**: a document has _entered_ the scan range (phantom). The transaction didn't see it, but if re-executed, the query would return a different result set.
+
+Checking both keys is essential. A document updated from `status="active"` to `status="archived"` produces `old_key` in the `active` range and `new_key` in the `archived` range. Both a reader of "active" documents and a reader of "archived" documents are affected.
+
+**Total validation cost**: O(W × log I) where W is the total number of index key writes across concurrent commits and I is the maximum number of intervals per group. In practice, both are small — a typical transaction has a few dozen intervals and concurrent commits touch a few dozen keys.
 
 **Commit log pruning**: entries with `commit_ts ≤ oldest_active_begin_ts` can be removed — no active transaction will validate against them.
 
@@ -1318,9 +1546,9 @@ The `index_deltas` capture the old and new index key values for each write. This
 
 Subscriptions operate at the **transaction level**: a subscription watches the entire read set of a committed transaction, not an individual query.
 
-**Registration**: when a transaction with `subscribe: true` or `notify: true` commits, its full read set (with `query_id`s) is stored in the subscription registry.
+**Registration**: when a transaction with `subscribe: true` or `notify: true` commits, its full read set (the `BTreeMap<(CollectionId, IndexId), Vec<ReadInterval>>` from section 5.6) is stored in the subscription registry.
 
-**Invalidation**: on every new commit, check all active subscriptions against the committed write set using the conflict detection rules from 5.7. For each affected subscription, collect the `query_id`s of conflicting read set entries.
+**Invalidation**: on every new commit, check all active subscriptions against the committed index key writes using the same overlap algorithm as OCC validation (section 5.7). For each affected subscription, collect the `query_id`s of overlapping intervals.
 
 | Subscription Mode | On Invalidation |
 |-------------------|----------------|
@@ -1331,22 +1559,30 @@ Subscriptions operate at the **transaction level**: a subscription watches the e
 
 ```
 SubscriptionRegistry {
-    // O(1) lookup for point watches
-    point_index: HashMap<(CollectionId, DocId), Vec<(SubscriptionId, QueryId)>>
-
     // Grouped by (collection, index) for range overlap checks
-    scan_index:  HashMap<(CollectionId, Option<IndexId>), Vec<(SubscriptionId, QueryId)>>
+    index: HashMap<(CollectionId, IndexId), Vec<SubscriptionInterval>>
+}
+
+SubscriptionInterval {
+    subscription_id: SubscriptionId
+    query_id:        QueryId
+    lower:           EncodedKey
+    upper:           Bound<EncodedKey>
 }
 ```
 
-**Invalidation walk** — when a commit writes to `(collection, doc_id)`:
+The registry uses the same `(collection, index)` grouping as the read set and commit log. This enables direct key overlap checks without type-switching.
 
-1. Check `point_index[(collection, doc_id)]` → collect `(subscription_id, query_id)` pairs.
-2. For each scan subscription on this collection: check if the write's `IndexDelta` key falls within the subscription's bounds, or if `doc_id` is in the subscription's `result_doc_ids` → collect affected `(subscription_id, query_id)` pairs.
-3. Group by `subscription_id`.
-4. For each affected subscription: fire notification with the set of invalidated `query_id`s. For `subscribe` mode: begin a new transaction and include its `tx_id` in the notification.
+**Invalidation walk** — when a new commit produces `IndexKeyWrite` entries (section 5.7):
 
-**Subscription update on chain commit**: when a chain transaction (the new transaction from step 4) commits, its read set replaces the subscription's previous read set. The registry indexes are updated accordingly.
+1. For each `(collection_id, index_id)` group in the commit's index writes:
+   a. Look up `SubscriptionInterval` entries for the same `(collection, index)`.
+   b. For each `IndexKeyWrite`: check if `old_key` or `new_key` falls within any subscription interval (same overlap check as OCC — binary search on sorted intervals).
+   c. Collect affected `(subscription_id, query_id)` pairs.
+2. Group by `subscription_id`.
+3. For each affected subscription: fire notification with the set of invalidated `query_id`s. For `subscribe` mode: begin a new transaction and include its `tx_id` in the notification.
+
+**Subscription update on chain commit**: when a chain transaction (the new transaction from step 3) commits, its read set replaces the subscription's previous read set in the registry. Old intervals are removed, new intervals are inserted.
 
 ### 5.9 Query Result Caching
 
@@ -1533,9 +1769,863 @@ These bounds prevent a disconnected replica from causing unbounded WAL growth on
 
 ## 7. API Definition
 
-- **Collection Management**: `create_collection(name)`, `delete_collection(name)`, `create_index(field)`.
-- **Query Interface**: `start_query(query_type, query_id, subscribe: bool)`, `read_data()`, `commit_query()`.
-- **Mutation Interface**: `start_mutation()`, `read_data()`, `write_data()`, `commit_mutation()`. Automated rollback requires explicit user retry.
+The API is message-based. Clients connect over a transport, exchange messages with the server, and can pipeline freely — the client never needs to wait for a response before sending the next message.
+
+### 7.1 Transport Layers
+
+All transports carry the same frame format and message semantics. The choice of transport affects only connection establishment and encryption.
+
+| Transport | Encryption | Notes |
+|-----------|-----------|-------|
+| TCP | None | Development and trusted networks |
+| TLS | TLS 1.3 (over TCP) | Production default |
+| QUIC | TLS 1.3 (built-in) | Lower latency, connection migration, native multiplexing |
+| WebSocket | Optional (ws:// or wss://) | Browser clients, HTTP infrastructure compatibility |
+
+### 7.2 Frame Format
+
+The protocol supports two framing modes, **auto-detected per message** by inspecting the first byte on the wire.
+
+#### 7.2.1 First-Byte Detection (Stream Transports)
+
+On stream transports (TCP, TLS, QUIC), the server reads the first byte of each message:
+
+- **`0x7B`** (`{`): **JSON text mode** — read until `\n` (ignoring `\r` before `\n`), parse the entire line as a JSON object.
+- **Any other value**: **Binary frame mode** — interpret as the first byte of a 12-byte binary header, then read `length` bytes of payload.
+
+This works because the binary frame's first byte is a protocol version (starting at `0x01`), which will never be `0x7B` (that would require 123 protocol revisions).
+
+Clients can freely mix modes on the same connection, per-message.
+
+**Server encoding selection**:
+
+- **Responses**: the server mirrors the framing mode and encoding of the request. A JSON text request gets a JSON text response. A binary BSON request gets a binary BSON response.
+- **Server-initiated messages** (invalidation): the connection tracks a **current encoding**, initialized to JSON text mode and updated every time the client sends a message. The server uses whatever mode and encoding the client last used. A client that speaks binary BSON gets BSON invalidations; a client that telnets in with JSON gets JSON invalidations.
+
+#### 7.2.2 JSON Text Mode
+
+A single JSON object terminated by `\n`. All message metadata — including message ID and type — are JSON fields:
+
+```json
+{"id":1,"type":"authenticate","token":"eyJhbGciOiJIUzI1NiJ9..."}\n
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | integer | Client-assigned message ID (incremental, starting at 1) |
+| `type` | string | Message type name (see 7.5) |
+| ... | | Additional fields per message type |
+
+Maximum line length: **16 MB** (configurable). This is the "zero-dependency" mode — usable with `telnet`, `netcat`, or any language with JSON support and no additional libraries.
+
+#### 7.2.3 Binary Frame Mode
+
+```
+┌──────────────────────────────────────┐
+│ version:   u8                        │  Protocol version (0x01)
+│ flags:     u8                        │  Bit flags
+│ encoding:  u8                        │  Payload encoding
+│ msg_type:  u8                        │  Message type (see 7.5)
+│ msg_id:    u32 LE                    │  Message ID
+│ length:    u32 LE                    │  Payload length in bytes
+├──────────────────────────────────────┤
+│ payload:   [u8; length]              │
+└──────────────────────────────────────┘
+```
+
+12-byte fixed header + variable-length payload.
+
+**`version`** (u8): protocol version. Starts at `0x01`. The server rejects frames with an unsupported version.
+
+**`flags`** (u8):
+
+| Bit | Meaning |
+|-----|---------|
+| 0 | Payload is LZ4-compressed |
+| 1–7 | Reserved (must be 0) |
+
+**`encoding`** (u8) — how the payload is serialized:
+
+| Value | Encoding | Notes |
+|-------|----------|-------|
+| 0x01 | JSON | JSON inside binary framing (structured header without BSON/Protobuf dependency) |
+| 0x02 | BSON | Native type discrimination (int64 vs float64, binary, datetime). No `_meta.types` needed. |
+| 0x03 | Protobuf | Compact, schema-driven. Requires shared `.proto` definitions. |
+
+The `encoding` byte is per-frame. A client using BSON can send an individual message as JSON (encoding `0x01`) without any negotiation. The server responds using the same encoding as the request.
+
+**`msg_type`** (u8): determines the payload schema. Values listed in section 7.5.
+
+**`msg_id`** (u32 LE): client-assigned incremental message ID. Server responses echo this value for correlation.
+
+**`length`** (u32 LE): payload size in bytes. Maximum: **16 MB** (configurable).
+
+#### 7.2.4 WebSocket Adaptation
+
+WebSocket provides its own message framing, so the protocol adapts:
+
+- **Text WebSocket message**: JSON text mode. No newline needed — the WebSocket message boundary serves as the delimiter.
+- **Binary WebSocket message**: binary frame (same 12-byte header + payload). The `length` field is present for header uniformity but the WebSocket frame boundary is authoritative.
+
+### 7.3 Connection Lifecycle
+
+#### 7.3.1 Server Hello
+
+Immediately after connection establishment, the server sends a **hello** message in JSON text mode:
+
+```json
+{"type":"hello","version":"1.0.0","encodings":["json","bson","protobuf"],"auth_required":true,"node_role":"primary","max_message_size":16777216}\n
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | Always `"hello"` |
+| `version` | string | Server version (semver) |
+| `encodings` | string[] | Supported payload encodings for binary frames |
+| `auth_required` | bool | Whether authentication is required before other operations |
+| `node_role` | string | `"primary"` or `"replica"` |
+| `max_message_size` | integer | Maximum accepted message size in bytes |
+
+The hello is always JSON text mode — even clients using binary frames can parse one JSON line.
+
+#### 7.3.2 Authentication
+
+If `auth_required` is `true`, the client **must** send an `authenticate` message before any other operation. Messages received before successful authentication (other than `authenticate`) are rejected with error code `auth_required`.
+
+See section 7.8 for authentication details.
+
+#### 7.3.3 Graceful Disconnect
+
+Either side may close the connection at any time:
+
+- **TCP/TLS**: close the socket.
+- **QUIC**: send a CONNECTION_CLOSE frame.
+- **WebSocket**: send a close frame.
+
+On disconnect: open transactions are rolled back, active subscriptions are removed, server-side resources for the connection are freed.
+
+### 7.4 Message Processing Model
+
+#### 7.4.1 Message IDs and Deduplication
+
+Every client → server message carries a message ID (`msg_id` in binary, `"id"` in JSON):
+
+- Client-assigned, incrementing integer, starting at 1, scoped to the connection.
+- The server **ignores** messages with a `msg_id` it has already seen on this connection (deduplication for retry safety).
+
+Server → client responses echo the client's message ID for correlation. Server-initiated messages (hello, invalidation) use `msg_id = 0` (binary) or omit the `"id"` field (JSON).
+
+#### 7.4.2 Ordering and Concurrency
+
+The client can send messages without waiting for responses. The server processes them according to their category:
+
+**Connection-level messages** (`authenticate`): processed strictly in order. **Block** processing of all subsequent messages until complete. Incoming messages during processing are queued internally.
+
+**Transaction messages** (`begin`, `commit`, `rollback`, `insert`, `get`, `replace`, `patch`, `delete`, `query`): messages targeting the **same transaction** are processed in the order received. Messages targeting **different transactions** may execute concurrently — no ordering guarantee across transactions.
+
+**Management messages** (`create_database`, `create_collection`, etc.): processed asynchronously. No ordering guarantee relative to other messages.
+
+**Pipelining example**:
+
+```
+→ {"id":1,"type":"authenticate","token":"..."}       ← blocks
+→ {"id":2,"type":"begin","database":"myapp"}          ← queued until auth completes
+→ {"id":3,"type":"insert","tx":1,"collection":"users","body":{"name":"Alice"}}
+→ {"id":4,"type":"insert","tx":1,"collection":"users","body":{"name":"Bob"}}
+→ {"id":5,"type":"commit","tx":1}
+← {"id":1,"type":"ok"}                               ← auth succeeded
+← {"id":2,"type":"ok","tx":1}                        ← transaction started
+← {"id":3,"type":"ok","doc_id":"01j..."}              ← insert 1 done
+← {"id":4,"type":"ok","doc_id":"01j..."}              ← insert 2 done
+← {"id":5,"type":"ok","commit_ts":42}                 ← committed
+```
+
+Messages 2–5 are queued while authentication completes. After auth succeeds, `begin` executes, then messages 3–5 execute in order (same transaction). If auth fails, messages 2–5 are rejected with `auth_required`.
+
+### 7.5 Message Types
+
+#### 7.5.1 Client → Server
+
+Ranges: `0x01–0x0F` connection, `0x10–0x1F` transaction control, `0x20–0x2F` data operations, `0x30–0x3F` management.
+
+| Byte | JSON `type` | Category | Description |
+|------|-------------|----------|-------------|
+| `0x01` | `"authenticate"` | Connection | Authenticate with JWT |
+| `0x02` | `"ping"` | Connection | Keepalive ping |
+| `0x10` | `"begin"` | Transaction | Start a transaction |
+| `0x11` | `"commit"` | Transaction | Commit a transaction |
+| `0x12` | `"rollback"` | Transaction | Abort a transaction |
+| `0x20` | `"insert"` | Data | Insert a new document |
+| `0x21` | `"get"` | Data | Get document by ID |
+| `0x22` | `"replace"` | Data | Full document replacement |
+| `0x23` | `"patch"` | Data | Partial update (RFC 7396 merge-patch) |
+| `0x24` | `"delete"` | Data | Delete a document |
+| `0x25` | `"query"` | Data | Query with filter |
+| `0x30` | `"create_database"` | Management | Create a database |
+| `0x31` | `"drop_database"` | Management | Drop a database |
+| `0x32` | `"list_databases"` | Management | List all databases |
+| `0x33` | `"create_collection"` | Management | Create a collection |
+| `0x34` | `"drop_collection"` | Management | Drop a collection |
+| `0x35` | `"list_collections"` | Management | List collections in a database |
+| `0x36` | `"create_index"` | Management | Create a secondary index |
+| `0x37` | `"drop_index"` | Management | Drop a secondary index |
+| `0x38` | `"list_indexes"` | Management | List indexes in a collection |
+
+#### 7.5.2 Server → Client
+
+Range: `0x80–0xFF`.
+
+| Byte | JSON `type` | Description |
+|------|-------------|-------------|
+| `0x80` | `"hello"` | Connection greeting (first message, always JSON text mode) |
+| `0x81` | `"ok"` | Success response. Payload varies per request type. |
+| `0x82` | `"error"` | Error response. Always contains `code` and `message`. |
+| `0x83` | `"invalidation"` | Subscription notification (server-initiated, `msg_id = 0`) |
+| `0x84` | `"pong"` | Keepalive response to `ping` |
+
+### 7.6 Message Payloads
+
+All payloads are shown in JSON. Binary encodings (BSON, Protobuf) carry equivalent fields.
+
+#### 7.6.1 Connection Messages
+
+**`authenticate`** — authenticate with the server.
+
+```json
+{"id":1, "type":"authenticate", "token":"eyJhbGciOiJIUzI1NiJ9..."}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `token` | string | yes | JWT token |
+
+Response: `ok` on success, `error` with code `auth_failed` on failure.
+
+---
+
+**`ping`** — keepalive. No payload fields.
+
+```json
+{"id":2, "type":"ping"}
+```
+
+Response: `pong`.
+
+#### 7.6.2 Transaction Control
+
+**`begin`** — start a new transaction.
+
+```json
+{"id":3, "type":"begin", "database":"myapp", "readonly":false, "subscribe":false, "notify":false}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `database` | string | yes | | Target database name |
+| `readonly` | bool | no | `false` | Read-only transaction (no OCC validation at commit) |
+| `subscribe` | bool | no | `false` | Persistent subscription: on invalidation, send affected query IDs + auto-begin new transaction (see 5.8) |
+| `notify` | bool | no | `false` | One-shot notification on invalidation. Mutually exclusive with `subscribe`. |
+
+Response: `ok` with `tx` field.
+
+```json
+{"id":3, "type":"ok", "tx":1}
+```
+
+`tx` is the server-assigned transaction ID (u64), used in all subsequent messages targeting this transaction. Transaction IDs are scoped to the connection.
+
+---
+
+**`commit`** — commit a transaction.
+
+```json
+{"id":10, "type":"commit", "tx":1}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tx` | integer | yes | Transaction ID from `begin` response |
+
+Response: `ok` with `commit_ts` on success, `error` with code `conflict` on OCC failure.
+
+```json
+{"id":10, "type":"ok", "commit_ts":42}
+```
+
+On OCC conflict with `subscribe: true`: the server automatically begins a new write transaction and responds with:
+
+```json
+{"id":10, "type":"error", "code":"conflict", "message":"OCC conflict", "new_tx":2, "new_ts":43}
+```
+
+---
+
+**`rollback`** — abort a transaction. Discards the write set and read set.
+
+```json
+{"id":11, "type":"rollback", "tx":1}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tx` | integer | yes | Transaction ID |
+
+Response: `ok`.
+
+#### 7.6.3 Data Operations
+
+All data operations require an active transaction (`tx` field). The collection is specified per-message. The database is implied by the transaction.
+
+**`insert`** — insert a new document. The server generates a ULID.
+
+```json
+{"id":4, "type":"insert", "tx":1, "collection":"users", "body":{"name":"Alice","email":"a@b.com"}}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tx` | integer | yes | Transaction ID |
+| `collection` | string | yes | Collection name |
+| `body` | object | yes | Document body. May include `_meta` (see 1.12). |
+
+Response: `ok` with generated document ID.
+
+```json
+{"id":4, "type":"ok", "doc_id":"01h5kz3x7d8c9v2npqrstuvwxy"}
+```
+
+---
+
+**`get`** — retrieve a document by ID.
+
+```json
+{"id":5, "type":"get", "tx":1, "collection":"users", "doc_id":"01h5kz3x7d8c9v2npqrstuvwxy"}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tx` | integer | yes | Transaction ID |
+| `collection` | string | yes | Collection name |
+| `doc_id` | string | yes | Document ID (ULID) |
+
+Response: `ok` with document (or `null` if not found). Includes the server-assigned `query_id` for subscription tracking (see 4.6).
+
+```json
+{"id":5, "type":"ok", "query_id":0, "doc":{"_id":"01h5kz3x7d...","_created_at":40,"name":"Alice"}}
+```
+
+```json
+{"id":5, "type":"ok", "query_id":0, "doc":null}
+```
+
+---
+
+**`replace`** — full document replacement. `_id` and `_created_at` are preserved.
+
+```json
+{"id":6, "type":"replace", "tx":1, "collection":"users", "doc_id":"01h5kz3x7d...", "body":{"name":"Alice Smith","email":"alice@new.com"}}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tx` | integer | yes | Transaction ID |
+| `collection` | string | yes | Collection name |
+| `doc_id` | string | yes | Document ID |
+| `body` | object | yes | Full new document body |
+
+Response: `ok`.
+
+---
+
+**`patch`** — partial update with shallow merge (RFC 7396). Only top-level fields in `body` are replaced; omitted fields are unchanged. Use `_meta.unset` to remove fields (see 1.12.1).
+
+```json
+{"id":7, "type":"patch", "tx":1, "collection":"users", "doc_id":"01h5kz3x7d...", "body":{"email":"new@email.com","_meta":{"unset":["old_field"]}}}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tx` | integer | yes | Transaction ID |
+| `collection` | string | yes | Collection name |
+| `doc_id` | string | yes | Document ID |
+| `body` | object | yes | Fields to merge. `_meta.unset` for removals. |
+
+Response: `ok`.
+
+---
+
+**`delete`** — delete a document (creates a tombstone version).
+
+```json
+{"id":8, "type":"delete", "tx":1, "collection":"users", "doc_id":"01h5kz3x7d..."}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `tx` | integer | yes | Transaction ID |
+| `collection` | string | yes | Collection name |
+| `doc_id` | string | yes | Document ID |
+
+Response: `ok`.
+
+---
+
+**`query`** — query documents using an index scan with optional post-filter.
+
+```json
+{"id":9, "type":"query", "tx":1, "collection":"users", "index":"by_status", "range":[{"eq":["status","active"]}], "filter":{"gte":["age",18]}, "order":"asc", "limit":10}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `tx` | integer | yes | | Transaction ID |
+| `collection` | string | yes | | Collection name |
+| `index` | string | yes | | Index name. Use `"_id"` for primary key order, `"_created_at"` for creation-time order. |
+| `range` | array | no | (unbounded) | Index range expressions (see 7.7.1). Array of predicates defining the scan interval. |
+| `filter` | object | no | (match all) | Post-filter expression (see 7.7.2). Applied after index scan; does not narrow the read set. |
+| `order` | string | no | `"asc"` | `"asc"` or `"desc"`. Scan direction along the index key order. |
+| `limit` | integer | no | (no limit) | Maximum number of documents to return |
+
+The `index` field is always required — the client explicitly selects which index to scan (see 4.3). To scan the full collection, use `"index": "_created_at"` with no `range`.
+
+Results are returned in index key order (ascending or descending per `order`). There is no arbitrary sort — to sort by a different field, create an index on that field.
+
+Response: `ok` with array of matching documents and server-assigned `query_id`.
+
+```json
+{"id":9, "type":"ok", "query_id":1, "docs":[{"_id":"01h5...","name":"Alice"},{"_id":"01h6...","name":"Bob"}]}
+```
+
+**Examples**:
+
+```json
+// All active users, newest first, page of 20
+{"id":9, "type":"query", "tx":1, "collection":"users",
+ "index":"by_status_created_at",
+ "range":[{"eq":["status","active"]}],
+ "order":"desc", "limit":20}
+
+// Orders in a price range, with post-filter on region
+{"id":10, "type":"query", "tx":1, "collection":"orders",
+ "index":"by_total",
+ "range":[{"gte":["total",100]}, {"lt":["total",500]}],
+ "filter":{"eq":["region","eu"]},
+ "order":"asc"}
+
+// Full collection scan (all documents by creation time)
+{"id":11, "type":"query", "tx":1, "collection":"logs",
+ "index":"_created_at", "order":"desc", "limit":100}
+```
+
+#### 7.6.4 Database Management
+
+These operations are **not** scoped to a transaction. They execute as atomic operations against the system catalog.
+
+**`create_database`**:
+
+```json
+{"id":20, "type":"create_database", "name":"analytics", "config":{"page_size":8192,"memory_budget":268435456}}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | yes | Database name (used as directory name) |
+| `config` | object | no | `DatabaseConfig` overrides (page_size, memory_budget, max_doc_size, resource limits) |
+
+Response: `ok`. Error `database_exists` if name is taken.
+
+---
+
+**`drop_database`**:
+
+```json
+{"id":21, "type":"drop_database", "name":"analytics"}
+```
+
+Response: `ok`. Error `unknown_database` if not found.
+
+---
+
+**`list_databases`**:
+
+```json
+{"id":22, "type":"list_databases"}
+```
+
+Response: `ok` with array of database metadata.
+
+```json
+{"id":22, "type":"ok", "databases":[{"name":"myapp","state":"active","created_at":100},{"name":"analytics","state":"active","created_at":200}]}
+```
+
+#### 7.6.5 Collection Management
+
+**`create_collection`**:
+
+```json
+{"id":30, "type":"create_collection", "database":"myapp", "name":"users"}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `database` | string | yes | Target database |
+| `name` | string | yes | Collection name (unique within database) |
+
+Response: `ok`. Error `collection_exists` if name is taken.
+
+---
+
+**`drop_collection`**:
+
+```json
+{"id":31, "type":"drop_collection", "database":"myapp", "name":"users"}
+```
+
+Response: `ok`. Error `unknown_collection` if not found.
+
+---
+
+**`list_collections`**:
+
+```json
+{"id":32, "type":"list_collections", "database":"myapp"}
+```
+
+Response: `ok` with array of collection metadata.
+
+```json
+{"id":32, "type":"ok", "collections":[{"name":"users","doc_count":1500},{"name":"orders","doc_count":42000}]}
+```
+
+#### 7.6.6 Index Management
+
+**`create_index`**:
+
+```json
+{"id":40, "type":"create_index", "database":"myapp", "collection":"users", "fields":["email"], "unique":true, "name":"idx_email"}
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `database` | string | yes | | Target database |
+| `collection` | string | yes | | Target collection |
+| `fields` | array | yes | | Field paths to index. Single field: `["email"]`. Compound: `["status", ["address","city"]]`. |
+| `unique` | bool | no | `false` | Enforce uniqueness |
+| `name` | string | no | auto-generated | Index name |
+
+Response: `ok` with `index_id`. The index is created in `Building` state (see 3.7) and becomes available for queries once background build completes.
+
+```json
+{"id":40, "type":"ok", "index_id":5}
+```
+
+---
+
+**`drop_index`**:
+
+```json
+{"id":41, "type":"drop_index", "database":"myapp", "collection":"users", "name":"idx_email"}
+```
+
+Response: `ok`. Error `unknown_index` if not found.
+
+---
+
+**`list_indexes`**:
+
+```json
+{"id":42, "type":"list_indexes", "database":"myapp", "collection":"users"}
+```
+
+Response: `ok` with array of index metadata.
+
+```json
+{"id":42, "type":"ok", "indexes":[{"name":"_id","fields":["_id"],"state":"ready","unique":true},{"name":"_created_at","fields":["_created_at"],"state":"ready","unique":false},{"name":"idx_email","fields":["email"],"state":"building","unique":true}]}
+```
+
+#### 7.6.7 Server Responses
+
+All server responses use one of two types:
+
+**`ok`** — success. The payload includes additional fields depending on the request:
+
+| Request | Additional `ok` fields |
+|---------|----------------------|
+| `authenticate` | (none) |
+| `begin` | `tx` |
+| `commit` | `commit_ts` |
+| `rollback` | (none) |
+| `insert` | `doc_id` |
+| `get` | `query_id`, `doc` (object or null) |
+| `replace`, `patch`, `delete` | (none) |
+| `query` | `query_id`, `docs` (array) |
+| `create_database` | (none) |
+| `drop_database` | (none) |
+| `list_databases` | `databases` (array) |
+| `create_collection` | (none) |
+| `drop_collection` | (none) |
+| `list_collections` | `collections` (array) |
+| `create_index` | `index_id` |
+| `drop_index` | (none) |
+| `list_indexes` | `indexes` (array) |
+
+**`error`** — failure:
+
+```json
+{"id":5, "type":"error", "code":"unknown_collection", "message":"collection 'users' does not exist in database 'myapp'"}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `code` | string | Machine-readable error code (see 7.9) |
+| `message` | string | Human-readable description |
+
+On OCC conflict with `subscribe: true`, the error includes additional fields:
+
+```json
+{"id":10, "type":"error", "code":"conflict", "message":"OCC conflict", "new_tx":2, "new_ts":43}
+```
+
+#### 7.6.8 Server Notifications
+
+**`invalidation`** — pushed to the client when a subscription's read set is invalidated by a new commit. Server-initiated (`msg_id = 0`, no `"id"` in JSON).
+
+```json
+{"type":"invalidation", "tx":1, "queries":[0,2], "commit_ts":50}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tx` | integer | The transaction whose read set was invalidated |
+| `queries` | integer[] | Array of `query_id`s of the invalidated reads |
+| `commit_ts` | integer | Timestamp of the commit that caused invalidation |
+
+For `subscribe` mode, the notification also includes a new transaction:
+
+```json
+{"type":"invalidation", "tx":1, "queries":[0,2], "commit_ts":50, "new_tx":3, "new_ts":50}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `new_tx` | integer | New transaction ID (already started at `new_ts`) |
+| `new_ts` | integer | Timestamp of the new transaction |
+
+The client re-executes the affected queries within the new transaction, then commits to continue the subscription chain (see 5.8).
+
+For `notify` mode, the notification has no `new_tx`/`new_ts` — it is a one-shot notification and the subscription is removed.
+
+### 7.7 Filter Expressions
+
+The query message uses two distinct filter syntaxes: **index range expressions** (the `range` field) and **post-filter expressions** (the `filter` field). Both use JSON objects with field paths in the standard notation (string for top-level, array of strings for nested).
+
+#### 7.7.1 Index Range Expressions
+
+Index range expressions define the scan interval on an index's key space (section 4.3). They are provided as the `range` array in a `query` message. Each element is a single predicate object.
+
+**Available operators**:
+
+```json
+{"eq":  ["field_path", value]}
+{"gt":  ["field_path", value]}
+{"gte": ["field_path", value]}
+{"lt":  ["field_path", value]}
+{"lte": ["field_path", value]}
+```
+
+**Rules** (enforced by the server — violation returns `invalid_range`):
+
+1. Predicates must reference index fields **in order**. For index `[A, B, C]`, the `range` array must address A first, then B, then C.
+2. Zero or more `eq` predicates on leading fields (equality prefix).
+3. At most one lower bound (`gt` or `gte`) and one upper bound (`lt` or `lte`) on the next field after the equality prefix.
+4. No predicates after a range bound — fields after the range field are unconstrained.
+5. `ne`, `in`, `and`, `or`, `not` are **not** available as range operators — they cannot produce contiguous intervals. Use them as post-filters instead.
+
+**Examples**:
+
+```json
+// Compound index on [status, created_at]
+// Equality prefix on status, range on created_at
+[{"eq": ["status", "active"]}, {"gte": ["_created_at", 1000]}, {"lt": ["_created_at", 2000]}]
+
+// Single equality — scans all entries where status = "active"
+[{"eq": ["status", "active"]}]
+
+// Range on first field — no equality prefix
+[{"gt": ["price", 100]}]
+
+// Nested field path
+[{"eq": [["address", "country"], "DE"]}]
+
+// Empty array or omitted — unbounded scan (full index)
+[]
+```
+
+#### 7.7.2 Post-Filter Expressions
+
+Post-filter expressions are arbitrary predicates evaluated against each document after it is read from the index scan. They are provided as the `filter` object in a `query` message. Post-filters support all comparison and logical operators but do **not** narrow the read set interval (section 5.6.4).
+
+**Comparison operators** — compare a field against a value:
+
+```json
+{"eq":  ["field_path", value]}
+{"ne":  ["field_path", value]}
+{"gt":  ["field_path", value]}
+{"gte": ["field_path", value]}
+{"lt":  ["field_path", value]}
+{"lte": ["field_path", value]}
+{"in":  ["field_path", [value1, value2, ...]]}
+```
+
+Nested field example: `{"eq": [["address","city"], "Berlin"]}`.
+
+**Logical operators** — combine filters:
+
+```json
+{"and": [filter, filter, ...]}
+{"or":  [filter, filter, ...]}
+{"not": filter}
+```
+
+**Examples**:
+
+```json
+// Simple equality
+{"eq": ["status", "active"]}
+
+// Conjunction
+{"and": [
+  {"gte": ["age", 18]},
+  {"ne": ["deleted", true]}
+]}
+
+// Disjunction with nesting
+{"or": [
+  {"eq": ["role", "admin"]},
+  {"and": [
+    {"eq": ["role", "editor"]},
+    {"in": ["department", ["engineering", "design"]]}
+  ]}
+]}
+
+// Negation
+{"not": {"eq": ["archived", true]}}
+```
+
+#### 7.7.3 Type Matching
+
+Type matching follows section 1.6: comparisons are type-strict. An `int64` value of `5` does not match a `float64` value of `5.0`. When using JSON text mode, `_meta.types` (section 1.12.2) can disambiguate numeric types in filter values.
+
+This applies to both index range expressions and post-filter expressions.
+
+### 7.8 Authentication
+
+Authentication uses **JWT** (JSON Web Tokens). The server validates tokens using parameters from the server configuration file.
+
+**Authentication flow**:
+
+1. Client connects. Server sends `hello` with `auth_required: true`.
+2. Client sends `authenticate` with the JWT token.
+3. Server validates: signature, expiration (`exp`), not-before (`nbf`), issuer (`iss`) if configured.
+4. On success: `ok`. The connection is authenticated for the lifetime of the connection.
+5. On failure: `error` with code `auth_failed`. The client may retry with a different token.
+
+**JWT claims used by the server**:
+
+| Claim | Required | Description |
+|-------|----------|-------------|
+| `exp` | yes | Expiration time. Connection is terminated when the token expires. |
+| `sub` | no | Subject (user/service identifier). Logged for auditing. |
+| `iss` | no | Issuer. Validated against configured `jwt_issuer` if set. |
+| `databases` | no | Array of database names the token grants access to. If absent, access to all databases. |
+| `role` | no | `"admin"` or `"user"`. Admins can create/drop databases. Default: `"user"`. |
+
+### 7.9 Error Codes
+
+| Code | Description |
+|------|-------------|
+| `auth_required` | Authentication needed but not provided |
+| `auth_failed` | Invalid or expired credentials |
+| `auth_expired` | Token expired during an active connection |
+| `forbidden` | Authenticated but not authorized for this operation |
+| `unknown_database` | Database does not exist |
+| `unknown_collection` | Collection does not exist |
+| `unknown_index` | Index does not exist |
+| `unknown_transaction` | Transaction ID not found or already completed |
+| `database_exists` | Database name already taken |
+| `collection_exists` | Collection name already taken |
+| `database_corrupt` | Database is in corrupt state (see 2.13.2) |
+| `doc_not_found` | Document ID not found at the transaction's read timestamp |
+| `conflict` | OCC validation failed at commit (see 5.7) |
+| `readonly_tx` | Write operation attempted on a read-only transaction |
+| `readonly_node` | Write operation on a replica (transaction promotion failed) |
+| `invalid_message` | Malformed, unparseable, or unknown message type |
+| `message_too_large` | Message exceeds `max_message_size` |
+| `invalid_filter` | Post-filter expression is syntactically invalid |
+| `invalid_range` | Index range expression violates ordering rules (section 4.3) |
+| `index_not_ready` | Index is in `Building` state and not yet available for queries |
+| `read_limit_exceeded` | Transaction exceeded read set size limits (section 5.6.5) |
+| `internal` | Unexpected server error |
+
+### 7.10 Server Configuration
+
+The server reads a JSON configuration file on startup. All fields are optional with sensible defaults.
+
+```json
+{
+  "listen": {
+    "tcp":       "0.0.0.0:5200",
+    "tls":       "0.0.0.0:5201",
+    "quic":      "0.0.0.0:5201",
+    "websocket": "0.0.0.0:5202"
+  },
+  "tls": {
+    "cert_file": "/path/to/cert.pem",
+    "key_file":  "/path/to/key.pem"
+  },
+  "auth": {
+    "enabled": true,
+    "jwt_algorithm": "HS256",
+    "jwt_secret": "base64-encoded-secret",
+    "jwt_public_key_file": "/path/to/key.pem",
+    "jwt_issuer": "my-auth-server"
+  },
+  "data_root": "/var/lib/exdb/data",
+  "max_message_size": 16777216,
+  "default_database_config": {
+    "page_size": 8192,
+    "memory_budget": 268435456,
+    "max_doc_size": 16777216
+  },
+  "replication": {
+    "mode": "strict",
+    "wal_retention_max_size": 1073741824,
+    "wal_retention_max_age": "24h"
+  }
+}
+```
+
+| Section | Key | Type | Default | Description |
+|---------|-----|------|---------|-------------|
+| `listen` | `tcp` | string | `"0.0.0.0:5200"` | TCP listen address |
+| `listen` | `tls` | string | (disabled) | TLS listen address |
+| `listen` | `quic` | string | (disabled) | QUIC listen address (shares TLS config) |
+| `listen` | `websocket` | string | (disabled) | WebSocket listen address |
+| `tls` | `cert_file` | string | | TLS certificate (PEM). Required if TLS or QUIC enabled. |
+| `tls` | `key_file` | string | | TLS private key (PEM). |
+| `auth` | `enabled` | bool | `false` | Require authentication |
+| `auth` | `jwt_algorithm` | string | `"HS256"` | JWT algorithm: `HS256`, `HS384`, `HS512`, `RS256`, `RS384`, `RS512`, `ES256`, `ES384` |
+| `auth` | `jwt_secret` | string | | Shared secret for HMAC algorithms (base64-encoded) |
+| `auth` | `jwt_public_key_file` | string | | Public key file for RSA/EC algorithms (PEM) |
+| `auth` | `jwt_issuer` | string | (no check) | Expected `iss` claim. Reject tokens with different issuer. |
+| `data_root` | | string | `"./data"` | Root directory for all database storage |
+| `max_message_size` | | integer | `16777216` | Maximum message size in bytes (16 MB) |
+| `default_database_config` | | object | | Defaults for new databases (see `DatabaseConfig` in 2.12.1) |
+| `replication` | `mode` | string | `"strict"` | `"strict"` (all replicas) or `"primary_plus_one"` |
+| `replication` | `wal_retention_max_size` | integer | `1073741824` | Max WAL retention for replication (1 GB) |
+| `replication` | `wal_retention_max_age` | string | `"24h"` | Max age of retained WAL segments |
+
+**Symmetric (HMAC) vs asymmetric (RSA/EC) JWT**: for single-server deployments, HMAC (`HS256`) with a shared secret is simplest. For multi-service architectures where an external auth server issues tokens, asymmetric algorithms (`RS256`, `ES256`) allow the database server to verify tokens without knowing the signing key.
 
 ---
 

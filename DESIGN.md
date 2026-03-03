@@ -267,7 +267,7 @@ All pages use a **slotted page** layout. Fixed page size (default **8 KB**, conf
 - **Slot directory** grows downward from the header. Each slot is 4 bytes (offset + length).
 - **Cell data** grows upward from the end of the page.
 - Page is full when `free_space_start ≥ free_space_end`.
-- **LSN** (Log Sequence Number): WAL position of the last modification to this page. Used during crash recovery to determine which WAL records still need to be replayed.
+- **LSN** (Log Sequence Number): global byte offset in the WAL stream (see 2.8.1) of the last modification to this page. Used during crash recovery to determine which WAL records still need to be replayed.
 - **right_sibling**: used in B-tree leaf pages to form a linked list for efficient range scans.
 
 ### 2.4 Primary Store (Clustered B-Tree)
@@ -400,51 +400,366 @@ The buffer pool manages a fixed pool of in-memory page frames, providing the int
 
 ### 2.8 Write-Ahead Log (WAL)
 
-The WAL guarantees durability. Every committed transaction is recorded in the WAL before its effects become visible in the page store.
+The WAL guarantees durability. Every committed transaction is recorded in the WAL before its effects become visible in the page store. The WAL is the source of truth — all state can be reconstructed by replaying it from the last checkpoint.
 
-**Record format**:
+#### 2.8.1 Log Sequence Number (LSN)
+
+An **LSN** is a `u64` representing a byte offset in the logical WAL stream.
+
+- LSNs are monotonically increasing and never reused.
+- The first record in a new database starts at LSN `0`.
+- Every WAL record is uniquely identified by its LSN.
+- Given a record at LSN `L` with total size `S` bytes: the next record's LSN is `L + S`.
+
+LSNs appear in:
+
+| Location | Purpose |
+|----------|---------|
+| Page header `lsn` field (2.3) | LSN of the WAL record that last modified this page |
+| `Checkpoint` record and `meta.json` | LSN up to which all data is materialized in the page store |
+| Replication protocol (6.2) | Replicas track `applied_lsn` for incremental catch-up |
+| Buffer pool dirty tracking (2.7) | Write-ahead guarantee: page flush requires WAL flush up to page LSN |
+
+**Mapping LSN to physical location**: given a set of WAL segments ordered by `base_lsn`, find the segment with the largest `base_lsn ≤ L`. The record is at file offset `32 + (L - base_lsn)` within that segment file.
+
+#### 2.8.2 Segment File Format
+
+WAL data is split into **segment files** in the database's `wal/` directory.
+
+**Naming**: `segment-{N:06}.wal` where `N` is a 1-based sequential number, zero-padded to 6 digits.
+
+**Segment header** (32 bytes, at file offset 0):
 
 ```
-┌──────────────────────────────────────┐
-│ length:      u32  (little-endian)    │
-│ crc32:       u32                     │
-│ record_type: u8                      │
-│ payload:     [u8; length]            │
-└──────────────────────────────────────┘
+┌──────────────────────────────────────────┐
+│ magic:          u32  (0x57414C00)        │  "WAL\0"
+│ version:        u16  (1)                 │  format version
+│ _reserved:      u16                      │
+│ segment_id:     u32                      │  matches filename number
+│ base_lsn:       u64                      │  LSN of first record in this segment
+│ created_at_ms:  u64                      │  wall-clock ms since Unix epoch
+└──────────────────────────────────────────┘
 ```
 
-**Record types**:
-
-| Type | Payload |
-|------|---------|
-| `TxCommit` | `tx_id: u64`, `commit_ts: u64`, `mutations: Vec<Mutation>` |
-| `Checkpoint` | `checkpoint_lsn: u64` |
-| `CreateCollection` | `collection_id: u64`, `name: String` |
-| `DropCollection` | `collection_id: u64` |
-| `CreateIndex` | `index_id: u64`, `collection_id: u64`, `field_paths: Vec<FieldPath>` |
-| `DropIndex` | `index_id: u64` |
-
-**Mutation** (within a TxCommit record):
+**Physical layout**:
 
 ```
-collection_id: u64
-doc_id:        u128  (ULID)
-op_type:       u8    (Insert | Replace | Delete)
-body:          Option<Vec<u8>>  (BSON; absent for Delete)
+[Segment Header: 32 bytes]
+[WAL Record 0]
+[WAL Record 1]
+...
+[WAL Record N]
 ```
 
-Patch operations are resolved to full document bodies before writing to the WAL. The WAL stores the final document state, not the delta. This simplifies replay.
+Records are packed contiguously after the header with no padding between records.
 
-**Write protocol**:
+**LSN ↔ file offset**: a record at LSN `L` in a segment with `base_lsn = B` is at file offset `32 + (L - B)`.
 
-1. Serialize the WAL record.
-2. Append to the current WAL segment.
-3. **fsync** to guarantee durability.
-4. Return the LSN (byte offset in the WAL stream).
+**Pre-allocation**: segment files may be pre-allocated to the target size (~64 MB) on creation to reduce filesystem fragmentation. Unused space at the tail is zero-filled and ignored by readers (a `payload_len` of `0` signals end-of-data).
 
-**Group commit**: multiple concurrent transactions batch their WAL records into a single fsync call, amortizing the disk flush cost. A brief batching window (~1 ms) collects pending commits and flushes them together.
+#### 2.8.3 Record Format
 
-**Segment rollover**: when a segment reaches ~64 MB, close it and start a new one. Old segments are retained until a checkpoint covers them.
+Every WAL record has a fixed 9-byte frame header followed by a variable-length payload:
+
+```
+┌──────────────────────────────────────────┐
+│ payload_len:  u32 LE                     │  byte length of payload
+│ crc32c:       u32 LE                     │  CRC-32C(record_type || payload)
+│ record_type:  u8                         │
+│ payload:      [u8; payload_len]          │
+└──────────────────────────────────────────┘
+
+Total record size = 9 + payload_len
+```
+
+- **payload_len**: byte count of `payload` only (excludes the 9-byte frame header and `record_type`).
+- **crc32c**: CRC-32C computed over `record_type` (1 byte) concatenated with `payload` (`payload_len` bytes). Hardware-accelerated via SSE 4.2 / ARM CRC instructions.
+- **record_type**: identifies the record kind (see 2.8.5).
+
+**LSN assignment**: the LSN of a record is the byte offset of its `payload_len` field in the logical WAL stream. The next record's LSN is `current_lsn + 9 + payload_len`.
+
+**Verification on read**: read `payload_len` and `crc32c`, then read `record_type || payload`, compute CRC-32C, compare. Mismatch → corrupt record; terminate replay at this point (section 2.13.1).
+
+**End-of-data detection**: a `payload_len` of `0` signals end-of-data in the segment (from pre-allocation zero-fill or clean shutdown). Readers stop scanning the current segment and advance to the next if it exists.
+
+#### 2.8.4 Encoding Conventions
+
+All WAL record payloads use a compact binary encoding. Multi-byte integers are **little-endian**.
+
+**Fixed-width types**:
+
+| Notation | Encoding | Size |
+|----------|----------|------|
+| `u8` | 1 byte | 1 |
+| `u16` | 2 bytes LE | 2 |
+| `u32` | 4 bytes LE | 4 |
+| `u64` | 8 bytes LE | 8 |
+| `u128` | 16 bytes LE | 16 |
+| `bool` | `u8`: `0x00` = false, `0x01` = true | 1 |
+
+**Variable-length types**:
+
+| Notation | Encoding | Overhead |
+|----------|----------|----------|
+| `str` | `u16 len` + `[u8; len]` (UTF-8, not null-terminated) | 2 + len |
+| `blob` | `u32 len` + `[u8; len]` | 4 + len |
+| `key` | `u16 len` + `[u8; len]` (encoded index key) | 2 + len |
+
+**Composite types** used in record payloads:
+
+| Type | Encoding |
+|------|----------|
+| `FieldPath` | `u8 segment_count` + `segment_count × str` |
+| `Option<T>` | `u8 tag` (`0` = None, `1` = Some) + `T` if tag = 1 |
+| `Array<T>` | `u32 count` + `count × T` |
+
+#### 2.8.5 Record Types
+
+| Code | Name | Scope | Description |
+|------|------|-------|-------------|
+| `0x01` | `TxCommit` | per-database | Transaction commit with mutations and index deltas |
+| `0x02` | `Checkpoint` | per-database | Marks a successful checkpoint |
+| `0x03` | `CreateCollection` | per-database | New collection created |
+| `0x04` | `DropCollection` | per-database | Collection dropped |
+| `0x05` | `CreateIndex` | per-database | New secondary index created |
+| `0x06` | `DropIndex` | per-database | Index dropped |
+| `0x07` | `IndexReady` | per-database | Index build completed (`Building` → `Ready`) |
+| `0x08` | `Vacuum` | per-database | Old document versions removed |
+| `0x10` | `CreateDatabase` | system | New database created (`_system` WAL only) |
+| `0x11` | `DropDatabase` | system | Database dropped (`_system` WAL only) |
+
+Types `0x10`–`0x11` are only written to the `_system` database WAL. Types `0x01`–`0x08` are written to per-database WALs. Codes `0x09`–`0x0F` and `0x12`–`0xFF` are reserved for future use.
+
+---
+
+**`TxCommit` (0x01)**
+
+```
+tx_id:                u64
+commit_ts:            u64
+mutation_count:       u32
+mutations:            Mutation[mutation_count]
+index_delta_count:    u32
+index_deltas:         IndexDelta[index_delta_count]
+```
+
+**Mutation**:
+
+```
+collection_id:  u64
+doc_id:         u128    (ULID)
+op_type:        u8      (0x01 = Insert, 0x02 = Replace, 0x03 = Delete)
+body_len:       u32     (0 for Delete)
+body:           [u8; body_len]   (BSON-encoded document; empty for Delete)
+```
+
+Patch operations are resolved to full document bodies before writing. The WAL stores the final document state, never the delta. This simplifies replay — each mutation is self-contained.
+
+**IndexDelta**:
+
+```
+index_id:       u64
+collection_id:  u64
+doc_id:         u128
+has_old_key:    u8      (0 = no, 1 = yes)
+[if has_old_key = 1]:
+  old_key_len:  u16
+  old_key:      [u8; old_key_len]
+has_new_key:    u8      (0 = no, 1 = yes)
+[if has_new_key = 1]:
+  new_key_len:  u16
+  new_key:      [u8; new_key_len]
+```
+
+- **Insert**: `has_old_key = 0`, `has_new_key = 1`.
+- **Delete**: `has_old_key = 1`, `has_new_key = 0`.
+- **Update** (value changed): both present.
+- **Update** (indexed value unchanged): both present, keys are identical. Emitted for correctness; can be deduplicated by the reader.
+
+Array-indexed fields produce one `IndexDelta` per array element affected. A single mutation on a document with a 5-element array index produces up to 10 deltas (5 old + 5 new).
+
+Index deltas are computed at commit time from the write set (see 5.5.1) and stored in the WAL to enable:
+- **Fast replay**: page store and secondary indexes can be updated directly from the deltas without recomputing keys from document bodies.
+- **Replication**: replicas apply index updates without needing to resolve index definitions.
+- **Subscription invalidation**: replicas use the encoded keys for interval overlap checks (see 5.8).
+
+---
+
+**`Checkpoint` (0x02)**
+
+```
+checkpoint_lsn:  u64
+```
+
+Marks that all WAL records with `LSN < checkpoint_lsn` have been fully materialized in the page store and fsynced. WAL segments fully before this LSN become eligible for reclamation (see 2.8.8, 2.9).
+
+---
+
+**`CreateCollection` (0x03)**
+
+```
+collection_id:  u64
+name_len:       u16
+name:           [u8; name_len]   (UTF-8)
+```
+
+---
+
+**`DropCollection` (0x04)**
+
+```
+collection_id:  u64
+```
+
+---
+
+**`CreateIndex` (0x05)**
+
+```
+index_id:         u64
+collection_id:    u64
+name_len:         u16
+name:             [u8; name_len]   (UTF-8)
+unique:           u8   (0 = non-unique, 1 = unique)
+field_count:      u8
+field_paths:      FieldPath[field_count]
+```
+
+Where each `FieldPath`:
+
+```
+segment_count:  u8
+segments:       (u16 len + [u8; len])[segment_count]
+```
+
+Example: field path `["user", "email"]` → `segment_count = 2`, segments = `[{4, "user"}, {5, "email"}]`.
+
+---
+
+**`DropIndex` (0x06)**
+
+```
+index_id:  u64
+```
+
+---
+
+**`IndexReady` (0x07)**
+
+```
+index_id:  u64
+```
+
+Written when background index building (section 3.7) completes successfully. On WAL replay, transitions the index state from `Building` to `Ready` in the catalog.
+
+---
+
+**`Vacuum` (0x08)**
+
+```
+collection_id:    u64
+entry_count:      u32
+entries:          VacuumEntry[entry_count]
+```
+
+**VacuumEntry**:
+
+```
+doc_id:             u128
+removed_ts:         u64     (timestamp of the version being removed)
+index_key_count:    u16
+index_keys:         VacuumIndexKey[index_key_count]
+```
+
+**VacuumIndexKey**:
+
+```
+index_id:   u64
+key_len:    u16
+key:        [u8; key_len]
+```
+
+On replay: for each entry, remove the primary B-tree cell keyed by `doc_id || inv_ts(removed_ts)` and all listed secondary index key entries. The operation is idempotent — if a cell or key is already absent, it is a no-op.
+
+---
+
+**`CreateDatabase` (0x10)** — system WAL only
+
+```
+database_id:      u64
+name_len:         u16
+name:             [u8; name_len]   (UTF-8)
+path_len:         u16
+path:             [u8; path_len]   (UTF-8, relative from data root)
+config_len:       u32
+config:           [u8; config_len] (BSON-encoded DatabaseConfig)
+```
+
+---
+
+**`DropDatabase` (0x11)** — system WAL only
+
+```
+database_id:  u64
+```
+
+---
+
+#### 2.8.6 Write Protocol and Group Commit
+
+WAL writes are serialized through a **single-writer committer** (see 5.10). This is the serialization point for all writes in the database.
+
+**Single transaction commit**:
+
+1. Serialize the `TxCommit` WAL record into a byte buffer (frame header + payload).
+2. Enqueue the buffer into the WAL writer's **write queue** (bounded mpsc channel).
+3. Block on a per-transaction **oneshot channel** for the LSN assignment.
+
+**Group commit** — the WAL writer task amortizes fsync cost across concurrent transactions:
+
+1. **Drain**: the WAL writer blocks until at least one record is available, then greedily drains all pending records from the queue.
+2. **Write**: all collected records are appended to the current segment file in a single `writev()` or sequential write. Each record's LSN is assigned as the current write position in the logical stream.
+3. **Flush**: a single **fsync** covers the entire batch.
+4. **Notify**: the writer sends each transaction its assigned LSN via the per-transaction oneshot channel.
+
+**Batching behavior**: the writer drains the queue greedily with no artificial delay. If multiple records are already queued when the writer wakes, they are all flushed together. Under high concurrency, batches naturally form. Under low concurrency, single-record batches are common (one fsync per transaction).
+
+**Throughput**: group commit transforms O(N) fsyncs into O(1) per batch. On NVMe storage with concurrent load, typical batches contain 10–100+ transactions per fsync.
+
+**Non-transaction records** (`CreateCollection`, `CreateIndex`, etc.) follow the same write path. They are enqueued, batched, and fsynced identically to `TxCommit` records.
+
+#### 2.8.7 Segment Rollover
+
+When a segment file exceeds the target size (~64 MB) after completing a record write:
+
+1. The current segment is sealed (no more appends).
+2. A new segment file is created: `segment_id` incremented, `base_lsn = previous_base_lsn + (previous_file_size - 32)`.
+3. The 32-byte segment header is written and fsynced.
+4. Subsequent records are appended to the new segment.
+
+A record is never split across segments. If a record would cross the boundary, it is written entirely to the current segment, which may slightly exceed 64 MB. The rollover check happens after each write (or batch write).
+
+**Active segment**: at most one segment is active (being appended to) at any time. Previous segments are sealed and immutable. The active segment is the only file with an open write file descriptor.
+
+#### 2.8.8 Segment Reclamation
+
+WAL segments are reclaimed after checkpoints (see 2.9) and subject to replication retention (see 6.8).
+
+A segment is reclaimable when:
+- Its highest LSN is below the `checkpoint_lsn` (all records materialized in the page store).
+- Its highest LSN is below the `retention_lsn` (all replicas have applied the records, or retention bounds are exceeded).
+
+The active segment is never reclaimed. See section 2.13.3 for the full segment lifecycle.
+
+#### 2.8.9 WAL and Replication
+
+WAL records are the unit of replication. The primary streams raw WAL record bytes (9-byte frame header + payload, exactly as stored on disk) to replicas over TCP (see 6.2). This means:
+
+- The WAL record format **is** the replication wire format — no re-serialization or transcoding.
+- Replicas verify CRC-32C on received records before applying them.
+- The `TxCommit` record's embedded `IndexDelta` entries allow replicas to update secondary indexes directly, without recomputing keys from document bodies or resolving index definitions.
+- Replicas write received records to their local WAL via the same write path (2.8.6) before applying to the page store, preserving local durability.
+- Replicas track their position as `applied_lsn` — the LSN after the last fully applied record.
 
 ### 2.9 Checkpoint
 
@@ -472,10 +787,15 @@ On startup after a crash:
 
 1. Read `meta.json` → last `checkpoint_lsn`.
 2. Open `data.db` — all pages are at least as recent as the checkpoint.
-3. Open WAL, scan forward from `checkpoint_lsn`.
-4. For each committed `TxCommit` record: **redo** the mutations — insert document versions into the primary B-tree and update secondary indexes via the buffer pool.
-5. Skip uncommitted transactions (they were never applied to the page store).
-6. Optionally checkpoint immediately to shrink the recovery window.
+3. Open WAL, locate the segment containing `checkpoint_lsn` (see 2.8.1), scan forward.
+4. For each WAL record (verified by CRC-32C per 2.8.3), replay by type:
+   - `TxCommit`: redo mutations — insert document versions into the primary B-tree; apply `IndexDelta` entries to secondary indexes via the buffer pool.
+   - `CreateCollection` / `DropCollection`: update the catalog B-tree and in-memory cache.
+   - `CreateIndex` / `DropIndex`: update the catalog B-tree and in-memory cache.
+   - `IndexReady`: transition index state from `Building` to `Ready` in the catalog.
+   - `Vacuum`: remove listed document versions and index keys (idempotent).
+   - `Checkpoint`: no-op during replay (informational only).
+5. Optionally checkpoint immediately to shrink the recovery window.
 
 **No undo phase needed**: mutations are buffered in the in-memory write set and only applied to the page store after WAL commit. The buffer pool never contains dirty pages from uncommitted transactions (no-steal policy). Only redo of committed transactions is required.
 
@@ -493,7 +813,7 @@ Old document versions are retained for MVCC readers but eventually need cleanup.
 4. Remove reclaimable cells from primary B-tree leaf pages.
 5. Remove corresponding entries from all secondary indexes.
 6. Reclaim overflow pages.
-7. Record vacuum operations as WAL records for crash recovery.
+7. Write `Vacuum` WAL records (2.8.5) for crash recovery. Each record includes the removed document versions and their secondary index keys for idempotent replay.
 
 **Scheduling**: background tokio task, runs periodically or when space pressure is detected. Yields to active transactions to avoid contention.
 
@@ -533,12 +853,12 @@ Where `entity_type = 0x01` (Database) and `entity_id` is the `database_id` as bi
 
 **Name lookup**: a secondary structure (in-memory `HashMap<String, u64>` mapping name → database_id) provides O(1) name-based lookup. Populated from the catalog B-tree on startup.
 
-**WAL record types** (system catalog):
+**WAL record types** (system catalog — see section 2.8.5 for full binary layouts):
 
-| Type | Payload |
-|------|---------|
-| `CreateDatabase` | `database_id: u64`, `name: String`, `path: String`, `config: DatabaseConfig` |
-| `DropDatabase` | `database_id: u64` |
+| Type | Code | Key Payload Fields |
+|------|------|--------------------|
+| `CreateDatabase` | `0x10` | `database_id`, `name`, `path`, `config` (BSON) |
+| `DropDatabase` | `0x11` | `database_id` |
 
 **Lifecycle**:
 
@@ -605,20 +925,21 @@ Where `entity_id` is `collection_id` or `index_id` as big-endian u64.
 | `state` | `u8` | `Building` (0x01), `Ready` (0x02), `Dropping` (0x03) |
 | `unique` | `bool` | Whether the index enforces uniqueness |
 
-**WAL record types** (per-database catalog — these already exist in section 2.8):
+**WAL record types** (per-database catalog — see section 2.8.5 for full binary layouts):
 
-| Type | Payload |
-|------|---------|
-| `CreateCollection` | `collection_id: u64`, `name: String` |
-| `DropCollection` | `collection_id: u64` |
-| `CreateIndex` | `index_id: u64`, `collection_id: u64`, `field_paths: Vec<FieldPath>` |
-| `DropIndex` | `index_id: u64` |
+| Type | Code | Key Payload Fields |
+|------|------|--------------------|
+| `CreateCollection` | `0x03` | `collection_id`, `name` |
+| `DropCollection` | `0x04` | `collection_id` |
+| `CreateIndex` | `0x05` | `index_id`, `collection_id`, `name`, `unique`, `field_paths` |
+| `DropIndex` | `0x06` | `index_id` |
+| `IndexReady` | `0x07` | `index_id` |
 
 **Lifecycle** (create collection):
 
 1. Assign `collection_id` (monotonic within database).
 2. Allocate two new pages: one for the primary B-tree root (empty leaf), one for the `_created_at` index root (empty leaf).
-3. Write `CreateCollection` WAL record.
+3. Write `CreateCollection` WAL record (2.8.5).
 4. Insert collection entry into the catalog B-tree via the buffer pool.
 5. Update in-memory cache.
 
@@ -626,11 +947,11 @@ Where `entity_id` is `collection_id` or `index_id` as big-endian u64.
 
 1. Assign `index_id` (monotonic within database).
 2. Allocate a new page for the secondary index B-tree root (empty leaf).
-3. Write `CreateIndex` WAL record.
+3. Write `CreateIndex` WAL record (2.8.5).
 4. Insert index entry into the catalog B-tree with `state = Building`.
 5. Update in-memory cache.
 6. Begin background index build (see section 3.7).
-7. On completion: update catalog entry to `state = Ready`.
+7. On completion: write `IndexReady` WAL record (2.8.5), update catalog entry to `state = Ready`.
 
 **Lifecycle** (drop collection):
 
@@ -738,7 +1059,7 @@ Cost: ~1% CPU overhead (CRC-32C is hardware-accelerated). This is the right trad
 
 **Checksum computation**: computed and written whenever a page is flushed to disk (buffer pool `flush_page()` and checkpoint). The checksum is the last field written to the page buffer before the disk write.
 
-**WAL record checksums**: the existing CRC-32 per WAL record (section 2.8) is verified on every read during:
+**WAL record checksums**: the CRC-32C per WAL record (section 2.8.3) is verified on every read during:
 
 - Crash recovery (WAL replay from checkpoint).
 - Replication (replica applying received WAL records).
@@ -1353,7 +1674,7 @@ MutationEntry {
 - **Patch**: read current document (from write set or snapshot), apply shallow merge, store resolved body.
 - **Delete**: store tombstone marker. Record `previous_ts` for conflict detection.
 
-Patch operations are resolved eagerly: the write set always contains the final document body, never a delta. The WAL also stores resolved bodies (see 2.8).
+Patch operations are resolved eagerly: the write set always contains the final document body, never a delta. The WAL also stores resolved bodies (see 2.8.5, `TxCommit` Mutation format).
 
 #### 5.5.1 Index Delta Computation
 
@@ -1750,10 +2071,10 @@ This ensures **monotonic reads**: a query at timestamp T always sees a complete,
 
 The primary must retain WAL segments long enough for replicas to catch up. Without this, a slow replica forces Tier 3 reconstruction even for brief outages.
 
-**Retention policy**: the primary retains WAL segments beyond the checkpoint horizon if any replica's `applied_ts` falls within those segments.
+**Retention policy**: the primary retains WAL segments beyond the checkpoint horizon if any replica's `applied_lsn` (see 2.8.1) falls within those segments. Each replica tracks both `applied_lsn` (WAL byte offset, for replication catch-up and segment retention) and `applied_ts` (committed timestamp, for read visibility — see 6.6).
 
 ```
-retention_lsn = min(checkpoint_lsn, min(replica.applied_ts for all replicas))
+retention_lsn = min(checkpoint_lsn, min(replica.applied_lsn for all replicas))
 ```
 
 WAL segments are only deleted when `segment.max_lsn < retention_lsn`.

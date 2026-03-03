@@ -383,28 +383,60 @@ Maximum document size (16 MB) requires at most ~2,000 overflow pages at 8 KB pag
 
 B-tree pages do not need a free space map — their space is managed by B-tree insert/split mechanics.
 
+**Concurrency**: both the free page list and the heap free space map are accessed exclusively by the single writer (section 5.10). No concurrent access control is needed — the writer serializes all page allocations, deallocations, and heap inserts. Checkpoint reads the free list head from the file header but does not modify it. The heap free space map is rebuilt on startup and updated only during write operations.
+
 ### 2.7 Buffer Pool
 
 The buffer pool manages a fixed pool of in-memory page frames, providing the interface between B-trees and disk I/O.
 
 **Structure**:
 
-- `page_table: HashMap<PageId, FrameId>` — maps on-disk page IDs to in-memory frames.
-- `frames: Vec<Frame>` — fixed-size array of page-sized buffers.
-- Each frame: `{ data: [u8; PAGE_SIZE], pin_count: u32, dirty: bool, ref_bit: bool }`.
+- `page_table: RwLock<HashMap<PageId, FrameId>>` — maps on-disk page IDs to in-memory frames. `RwLock` allows concurrent lookups (shared) with exclusive access only for inserting/removing mappings.
+- `frames: Vec<FrameSlot>` — fixed-size array of page-sized buffers, allocated once at startup.
+- Each `FrameSlot` contains a `RwLock` protecting: `{ data: [u8; PAGE_SIZE], page_id: Option<PageId>, pin_count: u32, dirty: bool, ref_bit: bool }`.
+- `clock_hand: AtomicU32` — position of the clock eviction pointer, advanced with `fetch_add`.
 
 **Operations**:
 
-- `fetch_page(page_id) → PinnedPage`: if cached, pin and return. Otherwise, evict a frame, read page from disk, pin, return.
-- `new_page() → PinnedPage`: allocate a page (free list or file extension), pin a frame, return.
-- `unpin(page_id, dirty: bool)`: decrement pin count. Set dirty flag if modified.
-- `flush_page(page_id)`: write dirty page to disk, clear dirty flag.
+- `fetch_page_shared(page_id) → SharedPageGuard`: if cached, acquire the frame's `RwLock` in shared mode, increment `pin_count`, return. Otherwise, evict a clean frame, read page from disk via positional I/O, acquire shared, return. Multiple readers can hold shared guards on the same frame simultaneously.
+- `fetch_page_exclusive(page_id) → ExclusivePageGuard`: same lookup, but acquire the frame's `RwLock` in exclusive mode. Only one exclusive guard can exist per frame. Marks the frame dirty on drop if modified.
+- `new_page() → ExclusivePageGuard`: allocate a page (free list or file extension), pin a frame exclusively, return.
+- `flush_page(page_id)`: acquire frame exclusively, write to disk via positional I/O, clear dirty flag, release.
+
+**Pin types**: the two guard types enforce at the type level that only exclusive access can modify page data:
+
+| Guard | Frame lock | `data()` | `data_mut()` | Concurrent access |
+|-------|-----------|----------|--------------|-------------------|
+| `SharedPageGuard` | Shared (read) | Yes | No | Multiple readers per frame |
+| `ExclusivePageGuard` | Exclusive (write) | Yes | Yes (marks dirty) | One writer, no readers |
+
+Both guard types auto-unpin (decrement `pin_count` and release the `RwLock`) on drop via RAII.
 
 **Eviction policy**: **Clock algorithm** (approximation of LRU with lower overhead). Only unpinned, **clean** frames are evictable. Dirty frames are never evicted — they remain in the buffer pool until the next checkpoint flushes them through the double-write buffer (section 2.9.1). If the buffer pool has no clean frames available for eviction, an early checkpoint is triggered to flush and clean dirty frames.
 
 **Memory budget**: configurable per database. Frame count = `memory_budget / page_size`. Default: 256 MB → 32,768 frames at 8 KB pages.
 
 **Pin contract**: callers must pin pages for the duration of access and unpin promptly. A page cannot be evicted while pinned.
+
+#### 2.7.1 Buffer Pool Concurrency
+
+The buffer pool is the central concurrent data structure. Its design enables **concurrent readers with a single writer** (see 5.10).
+
+**Per-frame `RwLock`**: each frame has its own `RwLock`, allowing fine-grained concurrency. Multiple readers traversing different B-tree pages acquire shared locks on different frames simultaneously without contention. The single writer acquires exclusive locks only on the specific pages being modified. A reader and the writer operating on different pages never contend.
+
+**Data file I/O**: the data file (`data.db`) is accessed via **positional I/O** (`pread`/`pwrite` semantics). Positional reads and writes specify the file offset as a parameter and do not modify the file descriptor's seek position, so multiple concurrent operations can use the same file descriptor without a mutex. This eliminates the data file as a concurrency bottleneck:
+
+- Multiple `fetch_page_shared` calls hitting cold pages read from disk concurrently.
+- The single writer's page flushes do not block concurrent reads.
+- Checkpoint scatter-writes proceed without blocking reader I/O.
+
+**Page table access pattern**: the page table `RwLock` is held only briefly — just long enough to look up or insert a mapping. It is never held while performing disk I/O or while a page guard is live. Under the single-writer model, only the writer inserts/removes mappings (exclusive lock); readers only look up (shared lock).
+
+**Clock eviction**: the `clock_hand` is an `AtomicU32` advanced with `fetch_add` (no lock needed). During victim selection, frames are inspected by attempting to acquire their `RwLock` — frames that are locked (in use) are skipped, not waited on.
+
+**Latch ordering** (deadlock prevention): page latches are always acquired in ascending `page_id` order when multiple pages must be held simultaneously (e.g., during B-tree splits). The page table lock is never held while acquiring a frame lock. See section 5.10 for the complete latch hierarchy.
+
+**No latches across await points**: frame `RwLock`s are **synchronous** (`parking_lot::RwLock`, not `tokio::sync::RwLock`). They are acquired and released within synchronous code blocks. This prevents async deadlocks where a task holding a latch is descheduled indefinitely. Disk I/O (which requires `.await`) is always performed outside of any frame latch — data is read into a temporary buffer, then copied into the frame under the latch.
 
 ### 2.8 Write-Ahead Log (WAL)
 
@@ -791,6 +823,17 @@ Checkpointing flushes dirty buffer pool pages to the data file, allowing old WAL
 9. Compute `reclaim_lsn = min(checkpoint_lsn, min(replica.applied_lsn for all replicas))` (see 6.8). Delete WAL segments whose highest LSN is below `reclaim_lsn`. This ensures segments needed by lagging replicas are retained even after a checkpoint.
 
 If the system crashes during step 4 (some `data.db` writes torn), `data.dwb` still contains the correct page images (fsynced in step 3). On recovery, these are restored before WAL replay (see 2.10).
+
+**Checkpoint concurrency**: the checkpoint runs on its own background task but must coordinate with the single writer (section 5.10) and concurrent readers:
+
+- **Steps 1–2** (record LSN, collect dirty frames): the checkpoint acquires the **writer lock** to prevent new commits from starting. While holding the lock, it records `checkpoint_lsn` and snapshots the list of dirty frames along with their page data (copied from frame buffers). The writer lock is then released. This critical section is brief — it copies dirty page contents but does no disk I/O.
+- **Steps 3–5** (DWB write, scatter-write, fsync): executed **without the writer lock**. New commits can proceed concurrently, dirtying frames. The DWB is written from the snapshot taken in step 2, so concurrent modifications do not affect it. Scatter-writes use positional I/O (section 2.7.1) and do not block concurrent page reads.
+- **Step 4 (mark clean)**: after scatter-writing a page, the checkpoint acquires the frame's `RwLock` exclusively and marks it clean **only if the frame's LSN has not changed** since the snapshot. If the writer has since modified the page (LSN advanced), the frame remains dirty and will be flushed by the next checkpoint.
+- **Steps 6–9** (truncate DWB, WAL record, meta.json, reclaim): no writer lock needed. The Checkpoint WAL record goes through the normal WAL write path.
+
+Concurrent **readers** are never blocked by checkpoint — they acquire shared frame locks, which are compatible with the checkpoint's exclusive lock acquisition on different frames. A reader and checkpoint only contend if they access the same frame, and only during the brief mark-clean window.
+
+**Correctness argument**: any page dirtied by a commit after `checkpoint_lsn` will have an LSN greater than `checkpoint_lsn`. If the system crashes, WAL replay from `checkpoint_lsn` will redo those mutations. Pages flushed by the checkpoint are at least as recent as `checkpoint_lsn`. Therefore, no committed data is lost regardless of interleaving between checkpoint and writer.
 
 **Trigger conditions** (whichever comes first):
 
@@ -1996,11 +2039,86 @@ The subscription mechanism naturally enables **query result caching**: the serve
 
 ### 5.10 Concurrency Model
 
-- **Async runtime**: all I/O and computation runs on the tokio async runtime.
-- **Buffer pool locking**: page-level read/write latches (short-lived, never held across await points).
-- **Write serialization**: WAL append + `commit_ts` assignment is a critical section, serialized via a single-writer committer (mutex or channel). This is the serialization point for all writes.
-- **Read concurrency**: fully concurrent. Multiple readers at different `read_ts` values traverse B-trees simultaneously without coordination.
-- **OCC advantage**: readers never block writers, writers never block readers. Conflicts are detected only at commit time.
+The system uses a **single-writer, concurrent-reader** model. One writer processes commits sequentially; multiple readers execute queries concurrently with each other and with the writer.
+
+#### 5.10.1 Async Runtime
+
+All I/O and computation runs on the tokio async runtime. CPU-bound work (page operations, B-tree traversals) runs on the runtime's thread pool. Blocking synchronous locks (`parking_lot::RwLock` on buffer pool frames) are held only for microsecond-scale operations and are never held across `.await` points to prevent async deadlocks.
+
+#### 5.10.2 Single Writer
+
+A single **writer task** serializes all operations that modify the page store. The writer processes one commit at a time, executing steps 1–6 of the commit protocol (section 5.11) sequentially:
+
+1. OCC validation against the commit log.
+2. Assign `commit_ts` (atomic increment).
+3. Write WAL record + fsync (via the WAL writer's group commit channel — see 2.8.6).
+4. Apply mutations to the page store: acquire exclusive page guards (section 2.7), modify B-tree pages, mark dirty.
+5. Update the commit log.
+6. Invalidate local subscriptions and caches.
+
+The writer is the **only** code path that acquires `ExclusivePageGuard`s on buffer pool frames (outside of recovery and checkpoint mark-clean). This means:
+
+- **B-tree pages need no additional concurrency control**: the writer is the only mutator, so B-tree splits, merges, and cell modifications are naturally serialized. No latch coupling protocol is needed.
+- **Free list and heap**: accessed exclusively by the writer (section 2.6). No locks required.
+- **Catalog mutations** (create/drop collection/index): also serialized through the writer.
+
+The writer is implemented as a dedicated tokio task that receives commit requests via a bounded async channel. Callers submit `(read_set, write_set)` and await a oneshot response with the result (success + `commit_ts`, or conflict error).
+
+**Throughput**: the single writer is the serialization bottleneck. Under high write load, throughput is bounded by the speed of one commit pipeline iteration. The WAL group commit (section 2.8.6) amortizes fsync cost. Page mutations are in-memory (buffer pool), so step 4 is fast. The practical bottleneck is WAL fsync latency, which group commit mitigates.
+
+#### 5.10.3 Concurrent Readers
+
+Read-only queries run on any tokio task, concurrently with each other and with the writer:
+
+- **B-tree traversal**: readers acquire `SharedPageGuard`s (section 2.7) as they descend the B-tree. Multiple readers can hold shared guards on the same page simultaneously.
+- **MVCC isolation**: readers at `read_ts` skip versions with `ts > read_ts`, so they are unaffected by the writer inserting new versions concurrently. A reader never sees a partially-applied transaction — the writer updates the commit log (step 5) and advances `latest_committed_ts` (step 9 in 5.11) only after all page mutations are complete.
+- **No read locks**: readers do not acquire any logical locks. OCC detects conflicts at commit time, not during reads.
+- **Cache misses**: when a reader hits a cold page, it reads from disk via positional I/O (section 2.7.1) without blocking other readers or the writer.
+
+**Reader–writer interaction on the same page**: if a reader holds a `SharedPageGuard` on a page that the writer wants to modify, the writer's `ExclusivePageGuard` acquisition blocks until the reader releases. Frame `RwLock` contention is the only point of interaction between readers and the writer. In practice, contention is rare — the writer modifies a small number of pages per commit, and readers traverse a much larger set.
+
+#### 5.10.4 Background Tasks
+
+Several background tasks run concurrently with the writer and readers:
+
+| Task | Writes pages? | Coordinates with writer via |
+|------|--------------|----------------------------|
+| **Checkpoint** | Yes (DWB + scatter-write) | Writer lock for snapshot (brief), frame `RwLock` for mark-clean. See section 2.9. |
+| **Vacuum** | Yes (removes old versions) | Submits mutations through the writer channel, same as a regular commit. |
+| **Index build** | Yes (inserts index entries) | Submits mutations through the writer channel. Concurrent commits also insert into the Building index via the writer. |
+
+All page-modifying background tasks funnel through the writer — they do not bypass it. This preserves the single-writer invariant.
+
+The checkpoint is the one exception: it writes to `data.dwb` and scatter-writes to `data.db` outside the writer. This is safe because checkpoint writes are to pages whose contents were snapshotted while the writer lock was held (section 2.9), and the mark-clean step checks LSNs to avoid clobbering concurrent modifications.
+
+#### 5.10.5 Latch Hierarchy
+
+To prevent deadlocks, locks are always acquired in this order:
+
+```
+1. Writer lock (top-level — serializes commits and checkpoint snapshot)
+2. Page table RwLock (brief — lookup/insert page mapping)
+3. Frame RwLock (per-frame — hold for page access duration)
+```
+
+**Rules**:
+
+- Never acquire a higher-numbered lock while holding a lower-numbered lock in reverse order.
+- When multiple frame locks are needed (e.g., B-tree split touching parent + child), acquire in **ascending `page_id` order**.
+- The page table lock is never held while acquiring a frame lock or performing I/O.
+- Frame locks are synchronous (`parking_lot::RwLock`) and never held across `.await` points. All async I/O is performed outside the latch — read into a temp buffer, then copy under latch.
+- The writer lock is an async mutex (`tokio::sync::Mutex`) since the writer performs async I/O (WAL fsync) while holding it. This is safe because the writer lock is always the outermost lock — no synchronous latch is held while awaiting it.
+
+#### 5.10.6 Concurrency Summary
+
+| Operation | Runs on | Page access | Serialized? |
+|-----------|---------|-------------|-------------|
+| Read query | Any tokio task | `SharedPageGuard` | No — fully concurrent |
+| Transaction commit (steps 1–6) | Writer task | `ExclusivePageGuard` | Yes — single writer |
+| WAL fsync | WAL writer task | None | Yes — group commit batches |
+| Checkpoint (DWB + scatter) | Checkpoint task | Positional I/O + mark-clean | Concurrent with reads; brief writer lock for snapshot |
+| Vacuum | Writer task (submitted) | `ExclusivePageGuard` | Yes — through writer |
+| Index build | Writer task (submitted) | `ExclusivePageGuard` | Yes — through writer |
 
 ### 5.11 Commit Protocol and Ordering Guarantees
 

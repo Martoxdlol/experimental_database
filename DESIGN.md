@@ -50,7 +50,7 @@ Documents are schema-less but the system recognizes the following value types:
 - Internal storage and wire protocol use **BSON** (Binary JSON) for binary encoding.
   - BSON natively discriminates int32/int64 vs double (float64).
   - BSON has native binary data subtype support (no base64 overhead).
-  - BSON has a native datetime type (used for `_created_at` and timestamps).
+  - BSON has a native datetime type (used for `_created_at` — see 1.11).
   - Rust: `bson` crate. JavaScript: `bson` (official MongoDB package).
 - JSON is supported as an alternative wire format for debugging and human-readable tooling, with the caveat that bytes must be base64-encoded and int64/float64 distinction relies on the presence of a decimal point.
 - Maximum document size: **16 MB** binary-encoded (configurable per database).
@@ -87,9 +87,9 @@ undefined (no value)
 ### 1.8 Operations
 
 - **Insert**: create a new document with an auto-generated ULID.
-- **Replace**: full document replacement (entire document body is overwritten).
-- **Patch**: partial update with shallow merge semantics. Only top-level fields present in the request are replaced; omitted fields are left unchanged. Setting a field to null stores an explicit null. To remove a field entirely, list it in `_meta.unset` (see 1.12).
-- **Delete**: logical deletion via a tombstone version.
+- **Replace**: full document replacement (entire document body is overwritten). Returns error `doc_not_found` if the document does not exist or is deleted at the transaction's read timestamp.
+- **Patch**: partial update with shallow merge semantics. Only top-level fields present in the request are replaced; omitted fields are left unchanged. Setting a field to null stores an explicit null. To remove a field entirely, list it in `_meta.unset` (see 1.12). Returns error `doc_not_found` if the document does not exist or is deleted at the transaction's read timestamp.
+- **Delete**: logical deletion via a tombstone version. Returns error `doc_not_found` if the document does not exist or is already deleted at the transaction's read timestamp.
 - **Get**: retrieve a document by ID.
 
 ### 1.9 Multi-Versioning (MVCC)
@@ -108,7 +108,7 @@ undefined (no value)
 
 - `_id` and `_created_at` are stored as regular top-level fields on every document (not inside `_meta`).
 - `_id`: the document's ULID. Set on insert, immutable. Automatically indexed on every collection (primary index).
-- `_created_at`: automatically set on document creation (timestamp). Automatically indexed on every collection.
+- `_created_at`: millisecond-precision Unix timestamp (`int64`, milliseconds since 1970-01-01 UTC). Set to the wall-clock time at the start of the committing transaction, rounded to the nearest millisecond. Immutable after insert. Automatically indexed on every collection. In BSON, stored as the native `datetime` type; in JSON, an integer.
 - No automatic `_updated_at` field.
 - These two default indexes (`_id`, `_created_at`) are always present and cannot be dropped.
 
@@ -226,11 +226,13 @@ The data root contains a **system database** (`_system/`) and one directory per 
     segment-000002.wal
     ...
   data.db                 # Page store (catalog B-tree + primary B-trees + secondary index B-trees)
+  data.dwb                # Double-write buffer (torn write protection for checkpoints)
   meta.json               # Database config, checkpoint LSN, page size
 ```
 
 - **WAL segments**: fixed-size append-only files. New segment on rollover. Old segments reclaimed after checkpoint.
 - **data.db**: the page store. Array of fixed-size pages. Page 0 is the file header (see 2.12.3). The catalog B-tree stores collection and index metadata. Each collection has its own primary B-tree and secondary index B-trees.
+- **data.dwb**: the double-write buffer. Staging file for checkpoint page writes (see 2.9.1). Protects against torn writes to `data.db`.
 - **meta.json**: database-level metadata. Written atomically (write to temp, fsync, rename).
 
 **Isolation**: each database has its own WAL, page store, buffer pool, and checkpoint cycle. Databases are fully independent — creating, dropping, backing up, or restoring one database does not affect any other. Per-database resource limits (disk, memory) are enforced at the directory level.
@@ -250,7 +252,8 @@ All pages use a **slotted page** layout. Fixed page size (default **8 KB**, conf
 │   num_slots:        u16                  │
 │   free_space_start: u16                  │
 │   free_space_end:   u16                  │
-│   right_sibling:    u32  (leaf chains)   │
+│   prev_or_ptr:      u32  (see below)    │
+│   _reserved:        u32                  │
 │   checksum:         u32                  │
 │   lsn:              u64  (last WAL LSN)  │
 ├──────────────────────────────────────────┤
@@ -268,7 +271,10 @@ All pages use a **slotted page** layout. Fixed page size (default **8 KB**, conf
 - **Cell data** grows upward from the end of the page.
 - Page is full when `free_space_start ≥ free_space_end`.
 - **LSN** (Log Sequence Number): global byte offset in the WAL stream (see 2.8.1) of the last modification to this page. Used during crash recovery to determine which WAL records still need to be replayed.
-- **right_sibling**: used in B-tree leaf pages to form a linked list for efficient range scans.
+- **`prev_or_ptr`** (u32): overloaded field, interpretation depends on `page_type`:
+  - `BTreeLeaf`: **right sibling** page ID (forms a linked list for efficient range scans). `0` = no right sibling.
+  - `BTreeInternal`: **leftmost child** page ID. Internal node cells store `[key, child_page_id]` pairs where `child_page_id` is the subtree with keys `≥ key`. The leftmost child (subtree with keys `< key₁`) is stored here instead of in a cell, giving N+1 children for N keys.
+  - `Heap` / `Overflow` / `Free`: context-specific (next free page, next overflow page, etc.).
 
 ### 2.4 Primary Store (Clustered B-Tree)
 
@@ -323,6 +329,8 @@ Document versions are stored directly in the leaf pages of the **primary B-tree*
 │ child_page_id: u32                 │  4 bytes
 └────────────────────────────────────┘
 ```
+
+Each cell's `child_page_id` points to the subtree with keys `≥ key`. The leftmost child (subtree with keys `< key₁`) is stored in the page header's `prev_or_ptr` field (section 2.3). An internal node with N cells has N+1 children.
 
 **Benefits of clustered storage**:
 
@@ -392,7 +400,7 @@ The buffer pool manages a fixed pool of in-memory page frames, providing the int
 - `unpin(page_id, dirty: bool)`: decrement pin count. Set dirty flag if modified.
 - `flush_page(page_id)`: write dirty page to disk, clear dirty flag.
 
-**Eviction policy**: **Clock algorithm** (approximation of LRU with lower overhead). Only unpinned frames are evictable. Dirty pages are flushed to disk before eviction.
+**Eviction policy**: **Clock algorithm** (approximation of LRU with lower overhead). Only unpinned, **clean** frames are evictable. Dirty frames are never evicted — they remain in the buffer pool until the next checkpoint flushes them through the double-write buffer (section 2.9.1). If the buffer pool has no clean frames available for eviction, an early checkpoint is triggered to flush and clean dirty frames.
 
 **Memory budget**: configurable per database. Frame count = `memory_budget / page_size`. Default: 256 MB → 32,768 frames at 8 KB pages.
 
@@ -553,7 +561,13 @@ body_len:       u32     (0 for Delete)
 body:           [u8; body_len]   (BSON-encoded document; empty for Delete)
 ```
 
-Patch operations are resolved to full document bodies before writing. The WAL stores the final document state, never the delta. This simplifies replay — each mutation is self-contained.
+**`op_type` semantics**:
+
+- **Insert (0x01)**: new document. `body` contains the complete BSON document including `_id` and `_created_at` (set by the server at commit time).
+- **Replace (0x02)**: update to an existing document. `body` contains the complete resolved BSON document **excluding** `_id` and `_created_at` — these are immutable system fields preserved from the original version on replay. Patch operations (section 1.8) are resolved to their final merged state and stored as Replace.
+- **Delete (0x03)**: tombstone. `body_len = 0`, no body.
+
+The WAL stores the final document state, never the delta. This simplifies replay — each mutation is self-contained. Patches never appear in the WAL; they are always resolved to a Replace with the fully merged body.
 
 **IndexDelta**:
 
@@ -620,7 +634,6 @@ index_id:         u64
 collection_id:    u64
 name_len:         u16
 name:             [u8; name_len]   (UTF-8)
-unique:           u8   (0 = non-unique, 1 = unique)
 field_count:      u8
 field_paths:      FieldPath[field_count]
 ```
@@ -763,17 +776,21 @@ WAL records are the unit of replication. The primary streams raw WAL record byte
 
 ### 2.9 Checkpoint
 
-Checkpointing flushes dirty buffer pool pages to the data file, allowing old WAL segments to be reclaimed.
+Checkpointing flushes dirty buffer pool pages to the data file, allowing old WAL segments to be reclaimed. All page writes go through the **double-write buffer** (section 2.9.1) to protect against torn writes.
 
 **Fuzzy checkpoint** (non-blocking):
 
 1. Record `checkpoint_lsn` = current WAL position.
-2. Iterate all dirty frames in the buffer pool.
-3. Write each dirty page to the data file. Clear dirty flag.
-4. fsync the data file.
-5. Write a `Checkpoint` WAL record.
-6. Update `meta.json` with the new checkpoint LSN.
-7. Delete WAL segments fully before `checkpoint_lsn`.
+2. Collect all dirty frames in the buffer pool.
+3. **Double-write stage**: write dirty pages sequentially to `data.dwb` (see 2.9.1). fsync `data.dwb`.
+4. **Scatter-write stage**: write each page from the double-write buffer to its target position in `data.db`. Clear dirty flag per frame.
+5. fsync `data.db`.
+6. Truncate `data.dwb` to zero length. fsync.
+7. Write a `Checkpoint` WAL record.
+8. Update `meta.json` with the new checkpoint LSN.
+9. Compute `reclaim_lsn = min(checkpoint_lsn, min(replica.applied_lsn for all replicas))` (see 6.8). Delete WAL segments whose highest LSN is below `reclaim_lsn`. This ensures segments needed by lagging replicas are retained even after a checkpoint.
+
+If the system crashes during step 4 (some `data.db` writes torn), `data.dwb` still contains the correct page images (fsynced in step 3). On recovery, these are restored before WAL replay (see 2.10).
 
 **Trigger conditions** (whichever comes first):
 
@@ -781,21 +798,65 @@ Checkpointing flushes dirty buffer pool pages to the data file, allowing old WAL
 - Time since last checkpoint exceeds threshold (default: 5 minutes).
 - Graceful shutdown.
 
+#### 2.9.1 Double-Write Buffer
+
+The double-write buffer (`data.dwb`) is a staging file that protects `data.db` against torn page writes during checkpoint. Every dirty page is written to `data.dwb` and fsynced **before** being written to its final position in `data.db`. If a crash interrupts the `data.db` writes, the intact copy in `data.dwb` is used to restore any torn pages on recovery.
+
+**File format**:
+
+```
+┌──────────────────────────────────────────┐
+│ DWB Header (16 bytes)                    │
+│   magic:       u32  (0x44574200)         │  "DWB\0"
+│   version:     u16  (1)                  │
+│   page_size:   u16                       │  must match data.db
+│   page_count:  u32                       │  number of page entries
+│   checksum:    u32                       │  CRC-32C of header fields
+├──────────────────────────────────────────┤
+│ Entry[0]: page_id (u32) + page data      │
+│ Entry[1]: page_id (u32) + page data      │
+│ ...                                      │
+│ Entry[N-1]: page_id (u32) + page data    │
+└──────────────────────────────────────────┘
+```
+
+Each entry is `4 + page_size` bytes: a `u32` page ID followed by the full page contents (including the page's own checksum in its header). Entries are packed contiguously after the DWB header.
+
+**Total file size** during a checkpoint: `16 + page_count × (4 + page_size)`. With 8 KB pages and 1,000 dirty pages: ~8 MB. The file is truncated to zero after a successful checkpoint.
+
+**Recovery protocol** (executed at the start of section 2.10, before WAL replay):
+
+1. If `data.dwb` does not exist or is empty (zero length): no recovery needed — the last checkpoint completed cleanly.
+2. Read and verify the DWB header (magic, version, page_size, checksum).
+3. For each entry in `data.dwb`:
+   a. Read the `page_id` and page data.
+   b. Verify the page's internal checksum (in its page header).
+   c. Read the corresponding page from `data.db` and verify its checksum.
+   d. If the `data.db` page's checksum is invalid (torn write): overwrite it with the page from `data.dwb`.
+   e. If the `data.db` page's checksum is valid: skip — the write completed successfully before the crash.
+4. fsync `data.db`.
+5. Truncate `data.dwb` to zero length. fsync.
+
+**Invariant**: `data.dwb` is always fsynced before any `data.db` write begins. A crash can only corrupt `data.db` pages, never `data.dwb` pages (because `data.dwb` is sequential and fsynced as a unit before the scatter-writes to `data.db` start).
+
+**Buffer pool eviction**: dirty pages are **not** flushed to `data.db` during normal buffer pool eviction between checkpoints. If the buffer pool is full, an early checkpoint is triggered instead. This ensures all page writes to `data.db` go through the double-write buffer — no unprotected writes.
+
 ### 2.10 Crash Recovery
 
 On startup after a crash:
 
 1. Read `meta.json` → last `checkpoint_lsn`.
-2. Open `data.db` — all pages are at least as recent as the checkpoint.
-3. Open WAL, locate the segment containing `checkpoint_lsn` (see 2.8.1), scan forward.
-4. For each WAL record (verified by CRC-32C per 2.8.3), replay by type:
+2. **Double-write buffer recovery**: if `data.dwb` exists and is non-empty, execute the DWB recovery protocol (section 2.9.1) to restore any torn pages in `data.db`.
+3. Open `data.db` — all pages are now at least as recent as the checkpoint (torn pages repaired by step 2).
+4. Open WAL, locate the segment containing `checkpoint_lsn` (see 2.8.1), scan forward.
+5. For each WAL record (verified by CRC-32C per 2.8.3), replay by type:
    - `TxCommit`: redo mutations — insert document versions into the primary B-tree; apply `IndexDelta` entries to secondary indexes via the buffer pool.
    - `CreateCollection` / `DropCollection`: update the catalog B-tree and in-memory cache.
    - `CreateIndex` / `DropIndex`: update the catalog B-tree and in-memory cache.
    - `IndexReady`: transition index state from `Building` to `Ready` in the catalog.
    - `Vacuum`: remove listed document versions and index keys (idempotent).
    - `Checkpoint`: no-op during replay (informational only).
-5. Optionally checkpoint immediately to shrink the recovery window.
+6. Optionally checkpoint immediately to shrink the recovery window.
 
 **No undo phase needed**: mutations are buffered in the in-memory write set and only applied to the page store after WAL commit. The buffer pool never contains dirty pages from uncommitted transactions (no-steal policy). Only redo of committed transactions is required.
 
@@ -923,7 +984,6 @@ Where `entity_id` is `collection_id` or `index_id` as big-endian u64.
 | `field_paths` | `Vec<FieldPath>` | Indexed field paths (single or compound) |
 | `root_page` | `u32` | Root page of the secondary index B-tree |
 | `state` | `u8` | `Building` (0x01), `Ready` (0x02), `Dropping` (0x03) |
-| `unique` | `bool` | Whether the index enforces uniqueness |
 
 **WAL record types** (per-database catalog — see section 2.8.5 for full binary layouts):
 
@@ -931,7 +991,7 @@ Where `entity_id` is `collection_id` or `index_id` as big-endian u64.
 |------|------|--------------------|
 | `CreateCollection` | `0x03` | `collection_id`, `name` |
 | `DropCollection` | `0x04` | `collection_id` |
-| `CreateIndex` | `0x05` | `index_id`, `collection_id`, `name`, `unique`, `field_paths` |
+| `CreateIndex` | `0x05` | `index_id`, `collection_id`, `name`, `field_paths` |
 | `DropIndex` | `0x06` | `index_id` |
 | `IndexReady` | `0x07` | `index_id` |
 
@@ -1069,30 +1129,37 @@ A CRC mismatch in a WAL record during replay terminates replay at that point —
 
 **File header checksums**: page 0 (file header, section 2.12.3) includes its own CRC-32C covering all header fields. Verified on database open.
 
-#### 2.13.2 Torn Write Protection
+#### 2.13.2 Torn Write Protection (Double-Write Buffer)
 
-A power failure or crash during a page write to `data.db` can leave a page half-written (torn). The storage engine handles this without a double-write buffer:
+A power failure or crash during a page write to `data.db` can leave a page half-written (torn). The storage engine uses a **double-write buffer** (`data.dwb`) to guarantee recovery from torn writes.
 
-**Principle**: the page store is a materialized acceleration structure derived from the WAL. A torn page is simply a page that missed its latest update — the correct state is recoverable from the WAL.
+**Design**: all page writes to `data.db` go through the double-write buffer (section 2.9.1). During checkpoint:
 
-**Detection**: on startup, every page read from disk during recovery is checksum-verified. A torn page will fail its checksum.
+1. Dirty pages are written sequentially to `data.dwb`. **fsync**.
+2. Pages are then scattered to their target positions in `data.db`. **fsync**.
+3. `data.dwb` is truncated.
 
-**Recovery**: when a checksum failure is detected during normal crash recovery (section 2.10):
+If a crash occurs during step 2, some `data.db` pages may be torn. On recovery (section 2.10 step 2), the intact copies in `data.dwb` are used to restore any torn pages before WAL replay begins.
 
-1. The page is known to be corrupt.
-2. WAL replay will overwrite it with the correct state (since the WAL record for that page's latest modification is still available — it hasn't been checkpointed yet, or the checkpoint itself was interrupted).
-3. After recovery, the page is correct in the buffer pool and will be flushed cleanly on the next checkpoint.
+**No-eviction policy**: dirty pages are never flushed to `data.db` outside of a checkpoint. Buffer pool eviction of dirty frames triggers an early checkpoint instead. This ensures every `data.db` write is protected by the double-write buffer — no unprotected writes.
 
-**Why this works**: the checkpoint protocol (section 2.9) only deletes WAL segments **after** all dirty pages have been successfully flushed and fsynced. Sequence:
+**Detection**: on recovery, each `data.dwb` entry's corresponding `data.db` page is checksum-verified. A failed checksum indicates a torn write; the page is restored from `data.dwb`.
 
-1. Flush all dirty pages → fsync `data.db`.
-2. Write `Checkpoint` WAL record with `checkpoint_lsn`.
-3. Update `meta.json` with `checkpoint_lsn`.
-4. **Only then**: delete WAL segments before `checkpoint_lsn`.
+**Safety chain**:
 
-If a crash occurs during step 1 (some pages torn), the WAL segments are still intact. On recovery, the torn pages are detected by checksum and repaired by WAL redo. If a crash occurs during step 4 (WAL deletion), extra WAL segments remain — harmless, they'll be cleaned up next checkpoint.
+```
+Dirty page in buffer pool
+  → written to data.dwb (sequential, fsynced as a unit)
+  → written to data.db (may be torn if crash)
+  → on recovery: data.dwb restores any torn data.db pages
+  → WAL replay from checkpoint_lsn brings pages to current state
+```
 
-**Critical invariant**: a WAL segment is never deleted until every page modification it contains has been durably flushed to `data.db` and verified. This is the torn write safety guarantee.
+**Critical invariants**:
+
+- `data.dwb` is always fsynced before any `data.db` write begins. A crash can only corrupt `data.db` pages, never `data.dwb` pages.
+- WAL segments are never deleted until all page modifications they contain have been durably flushed to `data.db` and verified (section 2.9 step 9).
+- A clean `data.dwb` (empty or absent) means the last checkpoint completed fully — all `data.db` pages are consistent.
 
 #### 2.13.3 WAL Segment Lifecycle and Reclamation
 
@@ -1109,19 +1176,20 @@ Reclaimable     → Deleted (reclaimed during checkpoint cleanup)
 
 **Reclamation rules**:
 
-- A segment is reclaimable only if its **highest LSN < checkpoint_lsn** — meaning every record in it has been fully materialized in `data.db` and fsynced.
+- A segment is reclaimable only if its **highest LSN < `reclaim_lsn`**, where `reclaim_lsn = min(checkpoint_lsn, min(replica.applied_lsn for all replicas))` (see 2.9 step 7, 6.8). This guarantees both: (a) the page store has materialized all records in the segment, and (b) all replicas have applied them.
 - Reclamation happens at the end of the checkpoint protocol (step 7 in section 2.9), after `meta.json` is updated.
 - The active segment (currently being appended to) is never reclaimed.
+- Configurable retention bounds (`wal_retention_max_size`, `wal_retention_max_age` — see 6.8) cap how much WAL is retained for slow replicas. Beyond these bounds, segments are reclaimed even if a replica still needs them — that replica must use Tier 3 reconstruction (6.7).
 
 **What the WAL retains at any given time**:
 
-- All records from the last checkpoint onward (guaranteed).
+- All records from the last checkpoint onward (guaranteed for local recovery).
+- All records from the slowest replica's `applied_lsn` onward (for replication catch-up, subject to retention bounds).
 - The active segment and any sealed-but-not-yet-checkpointed segments.
-- After a long-running database with regular checkpoints: typically 1–2 segments (~64–128 MB).
 
 **What the WAL does NOT retain**:
 
-- Records from before the last successful checkpoint. These are gone — the page store is the only copy.
+- Records fully materialized in the page store AND applied by all replicas (or beyond retention bounds). These are gone — the page store is the only local copy.
 - A full history of all transactions since database creation. The WAL is not an event log; it's a recovery mechanism.
 
 **Implication for repair**: if both a page in `data.db` AND the corresponding WAL records have been lost (e.g., page corrupted after its WAL segment was reclaimed), the data on that page is **unrecoverable from local state alone**. This is where the file header shadow copy (2.13.4) and replica reconstruction (2.13.6) come in.
@@ -1353,11 +1421,13 @@ Since `int64` and `float64` are distinct types with no cross-type comparison, ea
 | undefined | type tag only | 1 byte |
 | null | type tag only | 1 byte |
 | int64 | Big-endian 8 bytes with sign bit flipped (XOR high byte with `0x80`) | 9 bytes |
-| float64 | IEEE 754 big-endian; positive: flip sign bit; negative: flip all bits | 9 bytes |
+| float64 | Canonicalize NaN first (see below). IEEE 754 big-endian; positive: flip sign bit; negative: flip all bits | 9 bytes |
 | boolean | `0x00` = false, `0x01` = true | 2 bytes |
 | string | UTF-8 bytes, `0x00` escaped as `0x00 0xFF`, terminated by `0x00 0x00` | variable |
 | bytes | Raw bytes, `0x00` escaped as `0x00 0xFF`, terminated by `0x00 0x00` | variable |
 | array | Element-wise: each element as `type_tag \|\| encoded_value`, terminated by `0x00 0x00` | variable |
+
+**float64 NaN canonicalization**: all NaN bit patterns (positive NaN, negative NaN, signaling NaN, quiet NaN) are mapped to a single canonical value `0x7FF8000000000000` (quiet NaN, positive) **before** applying the sign-bit flip. After the flip, this becomes `0xFFF8000000000000`, which sorts after all non-NaN float64 values. This guarantees NaN sorts last within the float64 type (section 1.6) regardless of the original NaN representation.
 
 The encoding is **self-delimiting**: a decoder can determine where one encoded value ends and the next begins. This is essential for compound keys where multiple encoded values are concatenated.
 
@@ -1596,7 +1666,7 @@ A **monotonic timestamp allocator** (`AtomicU64`) assigns all timestamps.
 |-----------|---------|
 | `begin_ts` | Latest committed timestamp when the transaction starts. Defines the read snapshot. |
 | `commit_ts` | Assigned at commit time. All mutations in the transaction are tagged with this value. |
-| `_created_at` | Set to `commit_ts` on document insert. Immutable on subsequent replace/patch/delete. |
+| `_created_at` | Millisecond-precision Unix timestamp (ms since epoch) captured at `begin_ts` time. Set on insert, immutable on subsequent replace/patch/delete. See 1.11. |
 
 All mutations within a transaction share the same `commit_ts`. The transaction is atomic — it appears to occur at a single logical instant.
 
@@ -1808,6 +1878,17 @@ To prevent unbounded read set growth in long-running transactions:
 | `max_scanned_docs` | 100,000 | Maximum documents scanned (including those filtered out) |
 
 Exceeding any limit aborts the transaction with error code `read_limit_exceeded`.
+
+#### 5.6.6 Transaction Timeout
+
+Transactions that remain open too long prevent vacuuming (section 2.11) and cause commit log growth (section 5.7). The server enforces a configurable idle timeout:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `tx_idle_timeout` | 30 s | Maximum time a transaction can remain open without any client activity (no messages referencing this `tx`). |
+| `tx_max_lifetime` | 5 min | Maximum total time a transaction can remain open, regardless of activity. |
+
+When a timeout fires, the server aborts the transaction (equivalent to `rollback`) and sends an `error` response with code `tx_timeout` for the next message that references the expired `tx`. Subscription chain transactions (section 5.8) reset the `tx_max_lifetime` on each chain link — only the current link's lifetime is limited, not the total chain duration.
 
 ### 5.7 OCC Validation (Conflict Detection)
 
@@ -2111,7 +2192,7 @@ The protocol supports two framing modes, **auto-detected per message** by inspec
 
 On stream transports (TCP, TLS, QUIC), the server reads the first byte of each message:
 
-- **`0x7B`** (`{`): **JSON text mode** — read until `\n` (ignoring `\r` before `\n`), parse the entire line as a JSON object.
+- **`0x7B`** (`{`): **JSON text mode** — read until `\n` (ignoring `\r` before `\n`), parse the entire line as a JSON object. **JSON messages must be a single line** — embedded newlines (e.g., pretty-printed JSON) are not supported and will break framing.
 - **Any other value**: **Binary frame mode** — interpret as the first byte of a 12-byte binary header, then read `length` bytes of payload.
 
 This works because the binary frame's first byte is a protocol version (starting at `0x01`), which will never be `0x7B` (that would require 123 protocol revisions).
@@ -2303,6 +2384,7 @@ Range: `0x80–0xFF`.
 | `0x82` | `"error"` | Error response. Always contains `code` and `message`. |
 | `0x83` | `"invalidation"` | Subscription notification (server-initiated, `msg_id = 0`) |
 | `0x84` | `"pong"` | Keepalive response to `ping` |
+| `0x85` | `"index_ready"` | Index build completed (server-initiated, `msg_id = 0`) |
 
 ### 7.6 Message Payloads
 
@@ -2623,7 +2705,7 @@ Response: `ok` with array of collection metadata.
 **`create_index`**:
 
 ```json
-{"id":40, "type":"create_index", "database":"myapp", "collection":"users", "fields":["email"], "unique":true, "name":"idx_email"}
+{"id":40, "type":"create_index", "database":"myapp", "collection":"users", "fields":["email"], "name":"idx_email"}
 ```
 
 | Field | Type | Required | Default | Description |
@@ -2631,7 +2713,6 @@ Response: `ok` with array of collection metadata.
 | `database` | string | yes | | Target database |
 | `collection` | string | yes | | Target collection |
 | `fields` | array | yes | | Field paths to index. Single field: `["email"]`. Compound: `["status", ["address","city"]]`. |
-| `unique` | bool | no | `false` | Enforce uniqueness |
 | `name` | string | no | auto-generated | Index name |
 
 Response: `ok` with `index_id`. The index is created in `Building` state (see 3.7) and becomes available for queries once background build completes.
@@ -2661,7 +2742,7 @@ Response: `ok`. Error `unknown_index` if not found.
 Response: `ok` with array of index metadata.
 
 ```json
-{"id":42, "type":"ok", "indexes":[{"name":"_id","fields":["_id"],"state":"ready","unique":true},{"name":"_created_at","fields":["_created_at"],"state":"ready","unique":false},{"name":"idx_email","fields":["email"],"state":"building","unique":true}]}
+{"id":42, "type":"ok", "indexes":[{"name":"_id","fields":["_id"],"state":"ready"},{"name":"_created_at","fields":["_created_at"],"state":"ready"},{"name":"idx_email","fields":["email"],"state":"building"}]}
 ```
 
 #### 7.6.7 Server Responses
@@ -2678,7 +2759,7 @@ All server responses use one of two types:
 | `rollback` | (none) |
 | `insert` | `doc_id` |
 | `get` | `query_id`, `doc` (object or null) |
-| `replace`, `patch`, `delete` | (none) |
+| `replace`, `patch`, `delete` | (none). Error `doc_not_found` if the document does not exist or is deleted. |
 | `query` | `query_id`, `docs` (array) |
 | `create_database` | (none) |
 | `drop_database` | (none) |
@@ -2735,6 +2816,23 @@ For `subscribe` mode, the notification also includes a new transaction:
 The client re-executes the affected queries within the new transaction, then commits to continue the subscription chain (see 5.8).
 
 For `notify` mode, the notification has no `new_tx`/`new_ts` — it is a one-shot notification and the subscription is removed.
+
+---
+
+**`index_ready`** — pushed to all connections on the database when a background index build (section 3.7) completes and the index transitions from `Building` to `Ready`. Server-initiated (`msg_id = 0`).
+
+```json
+{"type":"index_ready", "database":"myapp", "collection":"users", "index":"idx_email", "index_id":5}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `database` | string | Database containing the index |
+| `collection` | string | Collection containing the index |
+| `index` | string | Index name |
+| `index_id` | integer | Index ID |
+
+This notification is broadcast to all connections authenticated for the database. Clients that issued `create_index` can use this to know when the index is available for queries.
 
 ### 7.7 Filter Expressions
 
@@ -2886,6 +2984,7 @@ Authentication uses **JWT** (JSON Web Tokens). The server validates tokens using
 | `invalid_range` | Index range expression violates ordering rules (section 4.3) |
 | `index_not_ready` | Index is in `Building` state and not yet available for queries |
 | `read_limit_exceeded` | Transaction exceeded read set size limits (section 5.6.5) |
+| `tx_timeout` | Transaction timed out (idle or max lifetime exceeded — see 5.6.6) |
 | `internal` | Unexpected server error |
 
 ### 7.10 Server Configuration
@@ -2945,6 +3044,8 @@ The server reads a JSON configuration file on startup. All fields are optional w
 | `replication` | `mode` | string | `"strict"` | `"strict"` (all replicas) or `"primary_plus_one"` |
 | `replication` | `wal_retention_max_size` | integer | `1073741824` | Max WAL retention for replication (1 GB) |
 | `replication` | `wal_retention_max_age` | string | `"24h"` | Max age of retained WAL segments |
+| `transactions` | `idle_timeout` | string | `"30s"` | Max time a transaction can be open without client activity (see 5.6.6) |
+| `transactions` | `max_lifetime` | string | `"5m"` | Max total time a transaction can remain open (see 5.6.6) |
 
 **Symmetric (HMAC) vs asymmetric (RSA/EC) JWT**: for single-server deployments, HMAC (`HS256`) with a shared secret is simplest. For multi-service architectures where an external auth server issues tokens, asymmetric algorithms (`RS256`, `ES256`) allow the database server to verify tokens without knowing the signing key.
 

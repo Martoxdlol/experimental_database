@@ -195,7 +195,29 @@ The storage engine follows a **WAL-first, clustered B-tree** architecture:
 
 ### 2.2 File Layout
 
-A database is stored as a directory:
+The data root contains a **system database** (`_system/`) and one directory per user database. Every database — including `_system` — uses the same internal layout (WAL + page store + metadata).
+
+```
+<data_root>/
+  _system/                        # System database (database registry)
+    wal/
+      segment-000001.wal
+    data.db                       # Catalog B-tree: database registry entries
+    meta.json
+  myapp/                          # User database "myapp"
+    wal/
+      segment-000001.wal
+      segment-000002.wal
+    data.db                       # Catalog B-tree + collection B-trees + index B-trees
+    meta.json
+  analytics/                      # User database "analytics"
+    wal/
+      segment-000001.wal
+    data.db
+    meta.json
+```
+
+**Per-database directory layout**:
 
 ```
 <database_dir>/
@@ -203,13 +225,15 @@ A database is stored as a directory:
     segment-000001.wal    # WAL segments (~64 MB each)
     segment-000002.wal
     ...
-  data.db                 # Page store (primary B-trees + secondary index B-trees)
+  data.db                 # Page store (catalog B-tree + primary B-trees + secondary index B-trees)
   meta.json               # Database config, checkpoint LSN, page size
 ```
 
 - **WAL segments**: fixed-size append-only files. New segment on rollover. Old segments reclaimed after checkpoint.
-- **data.db**: the page store. Array of fixed-size pages. Page 0 is reserved for the file header (page count, free list head, root page IDs for each B-tree).
+- **data.db**: the page store. Array of fixed-size pages. Page 0 is the file header (see 2.12.3). The catalog B-tree stores collection and index metadata. Each collection has its own primary B-tree and secondary index B-trees.
 - **meta.json**: database-level metadata. Written atomically (write to temp, fsync, rename).
+
+**Isolation**: each database has its own WAL, page store, buffer pool, and checkpoint cycle. Databases are fully independent — creating, dropping, backing up, or restoring one database does not affect any other. Per-database resource limits (disk, memory) are enforced at the directory level.
 
 ### 2.3 Page Format (Slotted Pages)
 
@@ -472,6 +496,229 @@ Old document versions are retained for MVCC readers but eventually need cleanup.
 7. Record vacuum operations as WAL records for crash recovery.
 
 **Scheduling**: background tokio task, runs periodically or when space pressure is detected. Yields to active transactions to avoid contention.
+
+### 2.12 Catalog
+
+The catalog tracks all metadata about databases, collections, and indexes. It is organized in two layers:
+
+- **System catalog** (database registry): lives in the `_system/` database. Tracks which user databases exist, their paths, and configuration.
+- **Per-database catalog**: lives inside each database's `data.db` as a **catalog B-tree**. Tracks collections and indexes within that database.
+
+Both layers use the same B-tree and page store implementation as data storage — the catalog is not a special case. At runtime, catalog metadata is cached in an **in-memory HashMap** for O(1) lookups. The catalog B-tree is the durable source of truth; the in-memory cache is derived from it.
+
+#### 2.12.1 System Catalog (Database Registry)
+
+The `_system/` directory is itself a database instance, opened first on startup. Its catalog B-tree stores **database registry entries** — one entry per user database.
+
+**Database registry entry**:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `database_id` | `u64` | Unique identifier, monotonically assigned |
+| `name` | `String` | Database name (unique, used as directory name) |
+| `path` | `String` | Relative path from data root to database directory |
+| `created_at` | `u64` | Timestamp of creation |
+| `config` | `DatabaseConfig` | Page size, memory budget, max doc size, resource limits |
+| `state` | `u8` | `Active`, `Dropping`, `Creating` |
+
+**Catalog B-tree key** (in `_system`):
+
+```
+entity_type[1] || entity_id[8]
+```
+
+Where `entity_type = 0x01` (Database) and `entity_id` is the `database_id` as big-endian u64.
+
+**Catalog B-tree value**: the database registry entry fields above, serialized as a compact binary format.
+
+**Name lookup**: a secondary structure (in-memory `HashMap<String, u64>` mapping name → database_id) provides O(1) name-based lookup. Populated from the catalog B-tree on startup.
+
+**WAL record types** (system catalog):
+
+| Type | Payload |
+|------|---------|
+| `CreateDatabase` | `database_id: u64`, `name: String`, `path: String`, `config: DatabaseConfig` |
+| `DropDatabase` | `database_id: u64` |
+
+**Lifecycle**:
+
+1. `create_database(name, config)`:
+   - Assign `database_id` (monotonic).
+   - Write `CreateDatabase` WAL record to `_system` WAL.
+   - Insert entry into `_system` catalog B-tree via buffer pool.
+   - Create the database directory and initialize an empty `data.db` + `meta.json`.
+   - Update in-memory cache.
+
+2. `drop_database(name)`:
+   - Mark entry as `Dropping` in catalog B-tree.
+   - Write `DropDatabase` WAL record.
+   - Close the database (flush, checkpoint).
+   - Remove the database directory.
+   - Remove entry from catalog B-tree and in-memory cache.
+
+**Startup sequence**:
+
+1. Open `_system/` database (WAL replay, checkpoint recovery).
+2. Read `_system` catalog B-tree → populate in-memory database registry.
+3. For each `Active` database: open it (see per-database startup below).
+
+#### 2.12.2 Per-Database Catalog (Collections and Indexes)
+
+Within each database's `data.db`, a **catalog B-tree** stores metadata for all collections and indexes. The root page ID of the catalog B-tree is stored in the file header (page 0 — see 2.12.3).
+
+**Catalog entry types**:
+
+```
+entity_type:
+  0x01 = Collection
+  0x02 = Index
+```
+
+**Catalog B-tree key**:
+
+```
+entity_type[1] || entity_id[8]
+```
+
+Where `entity_id` is `collection_id` or `index_id` as big-endian u64.
+
+**Collection entry value**:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `collection_id` | `u64` | Unique identifier within this database |
+| `name` | `String` | Collection name (unique within database) |
+| `primary_root_page` | `u32` | Root page of the primary B-tree (clustered) |
+| `created_at_root_page` | `u32` | Root page of the `_created_at` index B-tree |
+| `doc_count` | `u64` | Approximate document count (updated lazily) |
+| `config` | `CollectionConfig` | Max document size, other collection-level settings |
+
+**Index entry value**:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `index_id` | `u64` | Unique identifier within this database |
+| `collection_id` | `u64` | Parent collection |
+| `name` | `String` | Index name (unique within collection) |
+| `field_paths` | `Vec<FieldPath>` | Indexed field paths (single or compound) |
+| `root_page` | `u32` | Root page of the secondary index B-tree |
+| `state` | `u8` | `Building` (0x01), `Ready` (0x02), `Dropping` (0x03) |
+| `unique` | `bool` | Whether the index enforces uniqueness |
+
+**WAL record types** (per-database catalog — these already exist in section 2.8):
+
+| Type | Payload |
+|------|---------|
+| `CreateCollection` | `collection_id: u64`, `name: String` |
+| `DropCollection` | `collection_id: u64` |
+| `CreateIndex` | `index_id: u64`, `collection_id: u64`, `field_paths: Vec<FieldPath>` |
+| `DropIndex` | `index_id: u64` |
+
+**Lifecycle** (create collection):
+
+1. Assign `collection_id` (monotonic within database).
+2. Allocate two new pages: one for the primary B-tree root (empty leaf), one for the `_created_at` index root (empty leaf).
+3. Write `CreateCollection` WAL record.
+4. Insert collection entry into the catalog B-tree via the buffer pool.
+5. Update in-memory cache.
+
+**Lifecycle** (create index):
+
+1. Assign `index_id` (monotonic within database).
+2. Allocate a new page for the secondary index B-tree root (empty leaf).
+3. Write `CreateIndex` WAL record.
+4. Insert index entry into the catalog B-tree with `state = Building`.
+5. Update in-memory cache.
+6. Begin background index build (see section 3.7).
+7. On completion: update catalog entry to `state = Ready`.
+
+**Lifecycle** (drop collection):
+
+1. Write `DropCollection` WAL record.
+2. Remove collection entry and all associated index entries from catalog B-tree.
+3. Reclaim all pages belonging to the collection's B-trees (primary + secondary indexes) via the free page list.
+4. Update in-memory cache.
+
+**Per-database startup sequence**:
+
+1. Read page 0 (file header) → `catalog_root_page_id`.
+2. Walk the catalog B-tree (typically 2–3 levels for thousands of collections).
+3. Populate in-memory cache:
+   - `name_to_collection: HashMap<String, CollectionId>`
+   - `collections: HashMap<CollectionId, CollectionMeta>`
+   - `indexes: HashMap<IndexId, IndexMeta>`
+   - `collection_indexes: HashMap<CollectionId, Vec<IndexId>>`
+4. For any index with `state = Building`: drop partial index, optionally restart build.
+
+#### 2.12.3 File Header (Page 0)
+
+Page 0 of every `data.db` file is reserved as the **file header**. It uses a fixed layout (not the standard slotted page format):
+
+```
+┌──────────────────────────────────────────┐
+│ File Header (Page 0)                     │
+│   magic:              u32  (0x45584442)  │  "EXDB"
+│   version:            u32               │  File format version
+│   page_size:          u32               │  Page size in bytes (e.g. 8192)
+│   page_count:         u64               │  Total pages in data file
+│   free_list_head:     u32               │  First free page (0 = none)
+│   catalog_root_page:  u32               │  Root page of catalog B-tree
+│   next_collection_id: u64               │  Monotonic ID allocator
+│   next_index_id:      u64               │  Monotonic ID allocator
+│   checkpoint_lsn:     u64               │  LSN of last checkpoint
+│   created_at:         u64               │  Database creation timestamp
+│   reserved:           [u8; ...]         │  Remainder of page (zeroed)
+└──────────────────────────────────────────┘
+```
+
+The file header is updated during checkpointing (page count, free list head, checkpoint LSN) and during catalog mutations (catalog root page, ID allocators). Updates go through the buffer pool like any other page — the header page is pinned, modified, marked dirty, and flushed during checkpoint.
+
+#### 2.12.4 In-Memory Catalog Cache
+
+At runtime, all catalog lookups go through an **in-memory cache** — never through the B-tree directly. The cache provides O(1) access for the hot path (every insert, get, query must resolve collection name → metadata).
+
+**Cache structure** (per database):
+
+```
+CatalogCache {
+    // Collection lookup
+    name_to_collection: HashMap<String, CollectionId>
+    collections:        HashMap<CollectionId, CollectionMeta>
+
+    // Index lookup
+    indexes:            HashMap<IndexId, IndexMeta>
+    collection_indexes: HashMap<CollectionId, Vec<IndexId>>
+
+    // ID allocators
+    next_collection_id: AtomicU64
+    next_index_id:      AtomicU64
+}
+```
+
+**Cache invariant**: the in-memory cache is always consistent with the catalog B-tree. Both are updated atomically within the same commit path:
+
+1. WAL record written and fsynced.
+2. Catalog B-tree updated via buffer pool.
+3. In-memory cache updated.
+
+If the process crashes between steps 2 and 3, WAL replay on recovery reconstructs the catalog B-tree, and the cache is rebuilt from it during startup.
+
+**Cache population**: on database open, the catalog B-tree is scanned once (a few dozen pages for even very large catalogs) to populate the HashMap. At ~128 bytes per entry, 100,000 collections fit in ~1,600 pages (~13 MB) — the top levels of the catalog B-tree will always be in the buffer pool.
+
+#### 2.12.5 Catalog Scalability
+
+The catalog B-tree scales identically to data B-trees:
+
+| Collections | Catalog B-tree depth | Catalog pages | Startup scan time |
+|-------------|---------------------|---------------|-------------------|
+| 100 | 1 (single leaf) | 1–2 | < 1 ms |
+| 10,000 | 2 | ~20 | < 1 ms |
+| 100,000 | 2–3 | ~200 | ~2 ms |
+| 1,000,000 | 3 | ~2,000 | ~20 ms |
+
+Schema mutations (create/drop collection or index) are O(log N) in the number of catalog entries — a single B-tree insert or delete. The in-memory cache update is O(1).
+
+The system catalog (`_system`) scales the same way for the database registry. At 10,000+ databases, the B-tree is 2–3 levels deep; startup reads a few dozen pages.
 
 ---
 

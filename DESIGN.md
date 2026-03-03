@@ -720,6 +720,223 @@ Schema mutations (create/drop collection or index) are O(log N) in the number of
 
 The system catalog (`_system`) scales the same way for the database registry. At 10,000+ databases, the B-tree is 2–3 levels deep; startup reads a few dozen pages.
 
+### 2.13 Integrity and Error Recovery
+
+The storage engine must detect corruption, tolerate torn writes, and provide tools for diagnosis and repair. The design philosophy: the **WAL is the source of truth** for recent changes, the **page store is a materialized cache** that can be reconstructed, and **replicas are the ultimate backup** when local recovery is insufficient.
+
+#### 2.13.1 Checksum Verification
+
+**Page checksums**: the `checksum` field in every page header (section 2.3) covers the entire page contents (header fields excluding the checksum itself, slot directory, and cell data). Algorithm: CRC-32C (hardware-accelerated on modern CPUs via SSE 4.2 / ARM CRC instructions).
+
+**Verification policy**: checksums are verified **on every page read from disk** — i.e., every buffer pool cache miss in `fetch_page()`. This catches:
+
+- Silent bit flips in storage (bit rot).
+- Torn writes from previous crashes.
+- Filesystem or controller bugs.
+
+Cost: ~1% CPU overhead (CRC-32C is hardware-accelerated). This is the right trade-off — corruption that goes undetected compounds over time and becomes unrecoverable.
+
+**Checksum computation**: computed and written whenever a page is flushed to disk (buffer pool `flush_page()` and checkpoint). The checksum is the last field written to the page buffer before the disk write.
+
+**WAL record checksums**: the existing CRC-32 per WAL record (section 2.8) is verified on every read during:
+
+- Crash recovery (WAL replay from checkpoint).
+- Replication (replica applying received WAL records).
+- Integrity check (full WAL scan).
+
+A CRC mismatch in a WAL record during replay terminates replay at that point — all committed data before the corruption is safe.
+
+**File header checksums**: page 0 (file header, section 2.12.3) includes its own CRC-32C covering all header fields. Verified on database open.
+
+#### 2.13.2 Torn Write Protection
+
+A power failure or crash during a page write to `data.db` can leave a page half-written (torn). The storage engine handles this without a double-write buffer:
+
+**Principle**: the page store is a materialized acceleration structure derived from the WAL. A torn page is simply a page that missed its latest update — the correct state is recoverable from the WAL.
+
+**Detection**: on startup, every page read from disk during recovery is checksum-verified. A torn page will fail its checksum.
+
+**Recovery**: when a checksum failure is detected during normal crash recovery (section 2.10):
+
+1. The page is known to be corrupt.
+2. WAL replay will overwrite it with the correct state (since the WAL record for that page's latest modification is still available — it hasn't been checkpointed yet, or the checkpoint itself was interrupted).
+3. After recovery, the page is correct in the buffer pool and will be flushed cleanly on the next checkpoint.
+
+**Why this works**: the checkpoint protocol (section 2.9) only deletes WAL segments **after** all dirty pages have been successfully flushed and fsynced. Sequence:
+
+1. Flush all dirty pages → fsync `data.db`.
+2. Write `Checkpoint` WAL record with `checkpoint_lsn`.
+3. Update `meta.json` with `checkpoint_lsn`.
+4. **Only then**: delete WAL segments before `checkpoint_lsn`.
+
+If a crash occurs during step 1 (some pages torn), the WAL segments are still intact. On recovery, the torn pages are detected by checksum and repaired by WAL redo. If a crash occurs during step 4 (WAL deletion), extra WAL segments remain — harmless, they'll be cleaned up next checkpoint.
+
+**Critical invariant**: a WAL segment is never deleted until every page modification it contains has been durably flushed to `data.db` and verified. This is the torn write safety guarantee.
+
+#### 2.13.3 WAL Segment Lifecycle and Reclamation
+
+WAL segments accumulate as transactions commit and are reclaimed after checkpoints. Understanding the lifecycle is critical for recovery guarantees:
+
+**Segment lifecycle**:
+
+```
+Created         → Active (receiving appends)
+Active          → Sealed (reached ~64 MB, rolled over to new segment)
+Sealed          → Reclaimable (all contained records covered by a successful checkpoint)
+Reclaimable     → Deleted (reclaimed during checkpoint cleanup)
+```
+
+**Reclamation rules**:
+
+- A segment is reclaimable only if its **highest LSN < checkpoint_lsn** — meaning every record in it has been fully materialized in `data.db` and fsynced.
+- Reclamation happens at the end of the checkpoint protocol (step 7 in section 2.9), after `meta.json` is updated.
+- The active segment (currently being appended to) is never reclaimed.
+
+**What the WAL retains at any given time**:
+
+- All records from the last checkpoint onward (guaranteed).
+- The active segment and any sealed-but-not-yet-checkpointed segments.
+- After a long-running database with regular checkpoints: typically 1–2 segments (~64–128 MB).
+
+**What the WAL does NOT retain**:
+
+- Records from before the last successful checkpoint. These are gone — the page store is the only copy.
+- A full history of all transactions since database creation. The WAL is not an event log; it's a recovery mechanism.
+
+**Implication for repair**: if both a page in `data.db` AND the corresponding WAL records have been lost (e.g., page corrupted after its WAL segment was reclaimed), the data on that page is **unrecoverable from local state alone**. This is where the file header shadow copy (2.13.4) and replica reconstruction (2.13.6) come in.
+
+#### 2.13.4 File Header Redundancy (Shadow Copy)
+
+The file header (page 0) is a single point of failure — it contains the catalog root page pointer, ID allocators, free list head, and checkpoint LSN. After WAL segments have been reclaimed, page 0 cannot be reconstructed from the WAL alone.
+
+**Shadow header**: a copy of the file header is maintained at a **fixed location at the end of the data file** — specifically, the last page of `data.db` (page `page_count - 1`). This page has `page_type = FileHeaderShadow` and contains an identical copy of all file header fields.
+
+**Update protocol**: whenever the file header (page 0) is flushed to disk during checkpoint, the shadow copy is also written and fsynced. The sequence:
+
+1. Write page 0 to disk.
+2. Write shadow copy to the last page.
+3. fsync.
+
+Both copies include independent checksums.
+
+**Recovery from header corruption**:
+
+1. On database open, read page 0 and verify checksum.
+2. If checksum fails: read the shadow copy from the last page of the file (file size / page size - 1).
+3. If shadow checksum is valid: restore page 0 from the shadow copy. Log a warning.
+4. If both are corrupt: the database cannot be opened from local state. Use replica reconstruction (2.13.6).
+
+**Cost**: one extra page write per checkpoint. Negligible.
+
+#### 2.13.5 Integrity Check and Repair
+
+The system provides an explicit **integrity check** command that performs a full structural verification of the database. This can be run on demand (maintenance), on startup (optional, configurable), or after a suspected issue.
+
+**Integrity check** (`check_integrity(database)`):
+
+Phase 1 — File-level checks:
+
+1. Verify file header (page 0) checksum. Verify shadow header matches.
+2. Verify `meta.json` is readable and consistent with file header (`checkpoint_lsn`, `page_size`).
+3. Verify file size is consistent with `page_count * page_size`.
+
+Phase 2 — Page-level checks:
+
+4. Scan every page in the data file sequentially.
+5. Verify checksum of each page.
+6. Verify page header fields are within valid ranges (`page_type` is known, `num_slots` fits within page, `free_space_start ≤ free_space_end`, etc.).
+7. Collect: set of all page IDs seen, by type.
+
+Phase 3 — Free list check:
+
+8. Walk the free list from `free_list_head` to completion.
+9. Verify: no cycles (track visited pages), all pages in the list have `page_type = Free`, all page IDs are within bounds.
+10. Record the set of free pages.
+
+Phase 4 — B-tree structural checks (catalog, primary, secondary):
+
+11. Walk the catalog B-tree from `catalog_root_page`. Verify:
+    - Keys are in sorted order within each page.
+    - Internal node child pointers reference valid pages with correct `page_type`.
+    - Leaf `right_sibling` pointers form a valid chain (no cycles, ascending keys across siblings).
+    - All referenced pages are accounted for.
+12. For each collection in the catalog: walk the primary B-tree and every secondary index B-tree with the same structural checks.
+
+Phase 5 — Cross-reference checks:
+
+13. **Orphan detection**: every page in `data.db` should be either (a) in a B-tree (reachable from some root), (b) in the free list, (c) page 0 (header), or (d) last page (shadow header). Any page not accounted for is an orphan — likely a leaked page from a crash during a B-tree split or merge.
+14. **Double-allocation detection**: no page should appear in more than one B-tree or in both a B-tree and the free list.
+15. **Secondary index consistency** (optional, expensive): for a sample of secondary index entries, verify the corresponding primary B-tree entry exists and the indexed field value matches.
+
+**Output**: a report listing all issues found, categorized by severity:
+
+| Severity | Examples |
+|----------|---------|
+| **Error** | Checksum failure, B-tree structural corruption, double-allocated page |
+| **Warning** | Orphaned pages (space leak, not data loss), shadow header mismatch |
+| **Info** | Statistics (page counts by type, free space ratio, B-tree depths) |
+
+**Auto-repair** (`repair(database)`):
+
+For issues that can be safely corrected without data loss:
+
+| Issue | Auto-repair action |
+|-------|-------------------|
+| Shadow header mismatch | Rewrite shadow from primary header (or vice versa if primary is corrupt) |
+| Orphaned pages | Add to free list |
+| Corrupted page with WAL coverage | Redo from WAL (if segment still available) |
+| Corrupted page without WAL coverage | Mark page as damaged; if it's a secondary index page, drop and rebuild the index; if it's a primary B-tree page, data loss — report and skip |
+| B-tree sibling chain broken | Rebuild sibling pointers from a full tree walk |
+| Index with `state = Building` | Drop partial index and restart build |
+
+**Repair limitations**: auto-repair cannot recover data that is both corrupted in the page store and no longer covered by WAL segments. For this case, replica reconstruction (2.13.6) is the recovery path.
+
+**Configuration**:
+
+- `check_on_startup: bool` (default: `false`) — run a quick integrity check (phases 1–3 only) on database open. Full check is too expensive for routine startups.
+- `check_on_startup_full: bool` (default: `false`) — run the full integrity check on startup. Use after suspected corruption.
+
+#### 2.13.6 Replica Reconstruction
+
+When local recovery is insufficient (e.g., catastrophic disk failure, unrecoverable corruption beyond WAL coverage), a database instance can be **fully reconstructed from a replica**.
+
+**Prerequisite**: at least one replica (or the primary) has a healthy copy of the database.
+
+**Reconstruction protocol**:
+
+1. **Initiate**: the recovering node contacts a healthy source node (primary or replica) and requests a full database snapshot.
+
+2. **Source-side snapshot**:
+   a. The source begins a read-only transaction at its current `applied_ts` to get a consistent snapshot.
+   b. The source streams the **entire `data.db`** page-by-page to the recovering node. Pages are sent with their checksums.
+   c. Concurrently, new WAL records that arrive at the source after the snapshot `applied_ts` are buffered.
+
+3. **Transfer**:
+   a. Recovering node writes received pages to a new `data.db`, verifying each checksum on receipt.
+   b. After all pages are received: fsync `data.db`.
+   c. Source sends all buffered WAL records from `snapshot_ts` onward.
+   d. Recovering node writes these to its local WAL directory.
+
+4. **Finalize**:
+   a. Recovering node writes `meta.json` with the snapshot's `checkpoint_lsn`.
+   b. Recovering node opens the database normally — WAL replay applies any records after the snapshot.
+   c. Recovering node connects to the primary for ongoing WAL streaming.
+
+**Incremental catch-up vs full reconstruction**:
+
+| Scenario | Recovery method |
+|----------|----------------|
+| Replica briefly offline, WAL records available on primary | Incremental: stream missing WAL records (section 6.7) |
+| Replica WAL gap too large (primary already reclaimed those segments) | Full reconstruction from snapshot |
+| Corrupted `data.db`, local WAL intact | Local repair: re-checkpoint from WAL if enough history; otherwise full reconstruction |
+| Total data loss (disk failure) | Full reconstruction |
+
+**Reconstruction of `_system` database**: the system catalog can also be reconstructed from a replica. The recovering node requests both the `_system` snapshot and the list of database directories, then reconstructs each database individually.
+
+**Online reconstruction**: the source node continues serving reads and writes during the snapshot transfer. The consistent snapshot guarantees the recovering node gets a valid point-in-time copy. WAL records generated during the transfer are forwarded afterward.
+
+**Bandwidth optimization**: for large databases, the snapshot transfer can be compressed (LZ4 frame compression on the page stream). Pages that are entirely zeroed (free pages) can be sent as a marker rather than full page data.
+
 ---
 
 ## 3. Indexing
@@ -1256,9 +1473,61 @@ This ensures **monotonic reads**: a query at timestamp T always sees a complete,
 
 ### 6.7 Replica Failure and Recovery
 
-- **Replica falls behind**: on reconnection, the replica requests WAL records from its last `applied_ts`. The primary streams the missing records. The replica applies them in order before accepting new transactions.
-- **Replica crashes**: on restart, the replica recovers from its local checkpoint + WAL (section 2.10), then reconnects to the primary to catch up.
-- **Primary failure**: out of scope for initial design. Future: leader election among replicas.
+**Recovery tiers** — from cheapest to most expensive, the system attempts recovery in this order:
+
+**Tier 1 — Incremental catch-up** (seconds):
+
+- **Condition**: replica was briefly offline; the primary still has the WAL segments covering the gap.
+- **Process**: replica reconnects, sends its `applied_ts`. Primary streams missing WAL records. Replica applies them in order, then resumes normal replication.
+- **Availability**: replica is read-only during catch-up (serves reads at its current `applied_ts`). Becomes fully current once catch-up completes.
+
+**Tier 2 — Local crash recovery + catch-up** (seconds to minutes):
+
+- **Condition**: replica process crashed or was killed. Local disk is intact.
+- **Process**: on restart, the replica recovers from its local checkpoint + WAL (section 2.10). Then reconnects to the primary for Tier 1 incremental catch-up.
+- **Availability**: unavailable during local recovery, then read-only during catch-up.
+
+**Tier 3 — Full reconstruction from snapshot** (minutes to hours, depending on data size):
+
+- **Condition**: local data is unrecoverable — disk failure, corruption beyond WAL/repair coverage, or WAL gap too large (primary has already reclaimed the needed segments).
+- **Process**: full database reconstruction from a healthy node (section 2.13.6):
+  1. Recovering node requests a consistent snapshot from the primary (or another replica).
+  2. Source streams `data.db` page-by-page at a consistent `applied_ts`.
+  3. Source then streams WAL records from `applied_ts` onward.
+  4. Recovering node writes the snapshot, replays buffered WAL, and connects for ongoing replication.
+- **Availability**: unavailable until snapshot transfer + replay completes.
+
+**Tier selection**: the recovering node determines which tier applies:
+
+| Local state | Primary WAL available | Recovery tier |
+|-------------|----------------------|---------------|
+| Local WAL intact, `applied_ts` known | Gap covered by primary WAL | Tier 1 |
+| Local disk intact, needs crash recovery | Gap covered after local recovery | Tier 2 |
+| Local disk intact, needs crash recovery | Gap NOT covered (primary reclaimed segments) | Tier 3 |
+| Local disk failed / corrupted beyond repair | N/A | Tier 3 |
+
+**New node provisioning**: adding a new replica to the cluster follows the same Tier 3 protocol — it is functionally identical to reconstructing a failed node. The new node has no local state and receives a full snapshot.
+
+**Primary failure**: out of scope for initial design. Future: leader election among replicas.
+
+### 6.8 WAL Retention for Replication
+
+The primary must retain WAL segments long enough for replicas to catch up. Without this, a slow replica forces Tier 3 reconstruction even for brief outages.
+
+**Retention policy**: the primary retains WAL segments beyond the checkpoint horizon if any replica's `applied_ts` falls within those segments.
+
+```
+retention_lsn = min(checkpoint_lsn, min(replica.applied_ts for all replicas))
+```
+
+WAL segments are only deleted when `segment.max_lsn < retention_lsn`.
+
+**Configurable bounds**:
+
+- `wal_retention_max_size`: maximum total WAL size to retain for replication (default: 1 GB). If exceeded, the oldest segments are reclaimed even if a replica still needs them — that replica will need Tier 3 reconstruction.
+- `wal_retention_max_age`: maximum age of retained WAL segments (default: 24 hours). Same forced-reclamation behavior beyond this limit.
+
+These bounds prevent a disconnected replica from causing unbounded WAL growth on the primary.
 
 ---
 

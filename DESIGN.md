@@ -1561,7 +1561,7 @@ Given a `query` message with `index`, `range`, optional `filter`, `order`, and `
 
 Every read operation within a transaction is assigned an incremental **query ID** (`u32`, starting at 0). This ID is stored alongside the read set interval entry and serves two purposes:
 
-- **Subscription granularity**: when a subscription is invalidated, the notification includes the specific query IDs affected, so the client knows which queries to re-execute.
+- **Subscription granularity**: when a subscription is invalidated, a single notification includes **all** affected query IDs (sorted ascending), so the client knows exactly which queries to re-execute. A commit that overlaps multiple queries in the same subscription produces one notification containing every affected query ID — never multiple separate notifications.
 - **Cache keying**: query results can be cached and invalidated at the individual query level.
 
 ---
@@ -1900,8 +1900,8 @@ The registry uses the same `(collection, index)` grouping as the read set and co
    a. Look up `SubscriptionInterval` entries for the same `(collection, index)`.
    b. For each `IndexKeyWrite`: check if `old_key` or `new_key` falls within any subscription interval (same overlap check as OCC — binary search on sorted intervals).
    c. Collect affected `(subscription_id, query_id)` pairs.
-2. Group by `subscription_id`.
-3. For each affected subscription: fire notification with the set of invalidated `query_id`s. For `subscribe` mode: begin a new transaction and include its `tx_id` in the notification.
+2. Group by `subscription_id`. Within each group, deduplicate and sort `query_id`s in ascending order.
+3. For each affected subscription: fire **one** notification containing **all** invalidated `query_id`s (ascending). A single commit that overlaps N queries in the same subscription produces exactly one notification with N query IDs — never N separate notifications. For `subscribe` mode: begin a new transaction and include its `tx_id` in the notification.
 
 **Subscription update on chain commit**: when a chain transaction (the new transaction from step 3) commits, its read set replaces the subscription's previous read set in the registry. Old intervals are removed, new intervals are inserted.
 
@@ -2718,7 +2718,7 @@ On OCC conflict with `subscribe: true`, the error includes additional fields:
 | Field | Type | Description |
 |-------|------|-------------|
 | `tx` | integer | The transaction whose read set was invalidated |
-| `queries` | integer[] | Array of `query_id`s of the invalidated reads |
+| `queries` | integer[] | All `query_id`s invalidated by this commit, sorted ascending. A single commit that affects multiple queries in the subscription produces one message with every affected ID — never separate messages per query. |
 | `commit_ts` | integer | Timestamp of the commit that caused invalidation |
 
 For `subscribe` mode, the notification also includes a new transaction:

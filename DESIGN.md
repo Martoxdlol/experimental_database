@@ -221,7 +221,7 @@ All pages use a **slotted page** layout. Fixed page size (default **8 KB**, conf
 │   page_id:          u32                  │
 │   page_type:        u8                   │
 │     (BTreeInternal | BTreeLeaf           │
-│      | Overflow | Free)                  │
+│      | Heap | Overflow | Free)           │
 │   flags:            u8                   │
 │   num_slots:        u16                  │
 │   free_space_start: u16                  │
@@ -255,20 +255,41 @@ Document versions are stored directly in the leaf pages of the **primary B-tree*
 - `doc_id`: 16-byte ULID.
 - `inv_ts`: `u64::MAX - commit_ts`. Inverted so the most recent version sorts first within a given doc_id.
 
-**Leaf cell format**:
+**Leaf cell format** (inline mode — small documents):
 
 ```
 ┌────────────────────────────────────┐
 │ Key: doc_id[16] || inv_ts[8]       │  24 bytes
 ├────────────────────────────────────┤
-│ flags: u8                          │  (tombstone, overflow)
+│ flags: u8                          │  (tombstone, external)
 │ body_length: u32                   │
 │ body: [u8; body_length]            │  BSON-encoded document
 └────────────────────────────────────┘
 ```
 
-- **Tombstone** documents: `flags` has tombstone bit set, no body.
-- **Overflow**: if the document body exceeds ~75% of usable page space (~6 KB for 8 KB pages), the cell stores the first portion inline and the remainder in linked overflow pages (see 2.5).
+**Leaf cell format** (external mode — large documents):
+
+```
+┌────────────────────────────────────┐
+│ Key: doc_id[16] || inv_ts[8]       │  24 bytes
+├────────────────────────────────────┤
+│ flags: u8                          │  (tombstone, external=1)
+│ body_length: u32                   │  total body size
+│ heap_page_id: u32                  │  first heap page
+│ heap_slot_id: u16                  │  slot within heap page
+└────────────────────────────────────┘
+```
+
+**Inline vs External storage**: documents are stored in one of two modes based on their BSON-encoded body size:
+
+| Mode | Condition | Leaf Cell Contains |
+|------|-----------|-------------------|
+| Inline | `body_size ≤ EXTERNAL_THRESHOLD` | Full document body (BSON) |
+| External | `body_size > EXTERNAL_THRESHOLD` | `HeapRef` pointer to external heap (see 2.5) |
+
+`EXTERNAL_THRESHOLD` is configurable per database (default: half of page size, e.g., **4 KB** for 8 KB pages). Tuning: lower threshold → better B-tree fan-out and cache utilization; higher threshold → fewer heap lookups for medium-sized documents.
+
+- **Tombstone** documents: `flags` has tombstone bit set, no body (always inline, minimal size).
 
 **Internal node cell format**:
 
@@ -287,9 +308,15 @@ Document versions are stored directly in the leaf pages of the **primary B-tree*
 
 **One B-tree per collection**: each collection has its own primary B-tree, with its root page ID stored in the catalog.
 
-### 2.5 Overflow Pages
+### 2.5 External Heap
 
-Documents larger than the inline threshold (~75% of usable page space) use **overflow pages**.
+Documents whose BSON-encoded body exceeds `EXTERNAL_THRESHOLD` are stored in the **external heap** — a pool of heap pages in the page store dedicated to large document bodies.
+
+**Heap pages** use the standard slotted page layout (section 2.3) with `page_type = Heap`. Each slot holds one document body (or the first chunk of a multi-page document).
+
+**Single-page documents** (`body_size ≤ usable page space`): stored as a single slot in a heap page. The B-tree leaf cell's `HeapRef` points directly to `(heap_page_id, heap_slot_id)`.
+
+**Multi-page documents** (`body_size > usable page space`): the first heap page slot contains the initial chunk of the body plus a pointer to the first **overflow page**. Overflow pages form a singly-linked list:
 
 ```
 ┌─────────────────────────────────────┐
@@ -304,18 +331,25 @@ Documents larger than the inline threshold (~75% of usable page space) use **ove
 └─────────────────────────────────────┘
 ```
 
-- The B-tree leaf cell stores a portion of the body inline + a pointer to the first overflow page.
-- Overflow pages form a singly-linked list.
-- Maximum document size (16 MB) requires at most ~2,000 overflow pages at 8 KB page size.
+Maximum document size (16 MB) requires at most ~2,000 overflow pages at 8 KB page size.
+
+**Benefits of external heap**:
+
+- **B-tree compactness**: leaf pages maintain high fan-out (hundreds of entries per page) regardless of document size. A collection mixing 100-byte and 1 MB documents has the same B-tree shape.
+- **Cache efficiency**: buffer pool pages aren't dominated by a few large documents. More document keys fit per cached page.
+- **Scan performance**: index scans that evaluate predicates before fetching full document bodies avoid loading large external documents unnecessarily. Only documents that pass all filters trigger a heap fetch.
+- **Predictable splits**: B-tree splits are fast and predictable since leaf cells are small (just key + pointer for external docs).
 
 ### 2.6 Free Space Management
 
-**Free page list**: a linked list of free pages in the data file. The file header (page 0) stores the head of the free list. Each free page stores a pointer to the next free page.
+**Free page list**: a linked list of completely free pages in the data file. The file header (page 0) stores the head. Each free page stores a next pointer.
 
 - When a page is deallocated (e.g., B-tree merge, vacuum): add to free list.
 - When a new page is needed: pop from free list, or extend the data file.
 
-No per-page free space map is needed since document storage is managed by B-tree insert/split mechanics (not heap-style tuple insertion).
+**Heap free space map**: the external heap requires tracking partially-filled heap pages. An in-memory map of `(page_id → free_bytes)` identifies candidate pages for new external document inserts. This map is rebuilt from heap pages on startup and maintained incrementally during operation.
+
+B-tree pages do not need a free space map — their space is managed by B-tree insert/split mechanics.
 
 ### 2.7 Buffer Pool
 
@@ -597,23 +631,51 @@ When document versions are vacuumed (section 2.11), their secondary index entrie
 
 ## 4. Query Engine
 
-- **Access Patterns**: index-based lookups and full table scans.
-- **Operators**: `eq`, `lt`, `gt`, `gte`, `lte`, `ne`, `AND`, `OR`, `IN`, `NOT`.
-- **Constraints**: support for `limit` on all query types.
-- **Subscriptions**: live query tracking with automated invalidation and notification when the underlying read set changes via committed writes.
+### 4.1 Access Patterns
+
+- **Primary get**: point lookup by document ID via the primary B-tree.
+- **Index scan**: range scan on a secondary index with optional filter and limit.
+- **Table scan**: full collection scan with optional filter and limit.
+
+### 4.2 Operators
+
+`eq`, `lt`, `gt`, `gte`, `lte`, `ne`, `AND`, `OR`, `IN`, `NOT`.
+
+### 4.3 Query Tagging
+
+Every read operation within a transaction is assigned an incremental **query ID** (`u32`, starting at 0). This ID is stored in the read set entry and serves two purposes:
+
+- **Subscription granularity**: when a subscription is invalidated, the notification includes the specific query IDs affected, so the client knows which queries to re-execute.
+- **Cache keying**: query results can be cached and invalidated at the individual query level.
+
+### 4.4 Constraints
+
+- `limit` supported on all query types.
+- Limit interacts with read sets and conflict detection (see 5.7).
 
 ---
 
 ## 5. Transactions and Concurrency
 
-### 5.1 Transaction Types
+### 5.1 Transaction Types and Options
 
-| Type | Reads | Writes | OCC Validation |
-|------|-------|--------|----------------|
-| Read-only (query) | Yes, at pinned `read_ts` | No | No |
-| Read-write (mutation) | Yes, at pinned `begin_ts` + own writes | Yes, buffered in write set | Yes, at commit |
+Transactions are scoped to a single database and may span multiple collections. They are parameterized with:
 
-Both types are scoped to a single database and may span multiple collections within that database.
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `readonly` | bool | false | Read-only transactions cannot write data. No OCC validation at commit. |
+| `notify` | bool | false | One-shot: notify the client when any query in the read set is invalidated by a future commit. Fires once, then the subscription is removed. |
+| `subscribe` | bool | false | Persistent: on invalidation, report which query IDs were affected and automatically begin a new transaction at the latest committed timestamp, forming a **subscription chain** (see 5.8). |
+
+`notify` and `subscribe` are mutually exclusive.
+
+**Behavior matrix**:
+
+| Scenario | `subscribe: false` | `subscribe: true` |
+|----------|--------------------|--------------------|
+| Read-only commit | Read set discarded. | Read set registered as subscription. On invalidation: notify with affected query IDs + new `tx_id`. |
+| Write commit (success) | Read set discarded. | Read set registered as subscription. Chain continues reactively. |
+| Write commit (OCC conflict) | Error returned. Client retries manually. | Error returned + new **write** transaction automatically started at current timestamp for retry. |
 
 ### 5.2 Timestamps
 
@@ -631,19 +693,44 @@ All mutations within a transaction share the same `commit_ts`. The transaction i
 
 **Read-only (query)**:
 
-1. `begin()` → acquire `read_ts` = latest committed timestamp.
-2. Execute reads. All reads see the consistent snapshot at `read_ts`.
-3. `commit()` → release resources. No validation needed.
+1. `begin(readonly: true)` → acquire `read_ts` = latest committed timestamp.
+2. Execute reads. Each read is assigned an incremental `query_id` (see 4.3). All reads see the consistent snapshot at `read_ts`.
+3. `commit()` → if `subscribe` or `notify`: register read set in subscription registry. Release resources.
 
 **Read-write (mutation)**:
 
 1. `begin()` → acquire `begin_ts` = latest committed timestamp.
-2. Execute reads (recorded in read set) and writes (buffered in write set).
+2. Execute reads (recorded in read set with `query_id`s) and writes (buffered in write set).
 3. `commit()`:
    a. Acquire the next `commit_ts` (atomic increment).
    b. Validate the read set against the commit log (see 5.7).
-   c. If valid: write WAL record → fsync → apply to page store → update commit log → advance latest committed timestamp.
-   d. If conflict: abort → return error to client. Client may retry with a new transaction.
+   c. If valid: persist → invalidate → replicate → notify (see 5.11 for full protocol). If `subscribe`: register read set as subscription.
+   d. If conflict and `subscribe: true`: start a new write transaction at current timestamp, notify client of conflict + new `tx_id`.
+   e. If conflict and `subscribe: false`: return error to client.
+
+**Subscription chain** (when `subscribe: true`):
+
+```
+T1 commit (ts=10, queries: [Q0, Q1, Q2])
+  → read set registered as subscription
+  → future commit at ts=15 invalidates Q1
+    → client notified: { invalidated: [1], new_tx: { id: "...", ts: 15 } }
+    → T2 begins (ts=15)
+      → client re-executes Q1 (or all queries) in T2
+      → T2 commit → subscription updated with new read set
+      → future commit at ts=22 invalidates Q0, Q2
+        → T3 begins (ts=22)
+          → ...
+```
+
+Each link in the chain:
+1. Current transaction commits → read set becomes the subscription's watch predicate.
+2. A future commit invalidates part of the read set (detected via conflict rules in 5.7).
+3. Subscription manager creates a new transaction at the latest committed timestamp.
+4. Client is notified with the list of invalidated `query_id`s and the new transaction's ID/timestamp.
+5. Client re-executes the affected queries (or all queries) within the new transaction.
+6. New transaction commits → subscription's read set is updated.
+7. Repeat.
 
 ### 5.4 Read-Your-Own-Writes
 
@@ -690,11 +777,13 @@ ReadSet {
 ReadSetEntry:
 
     Get {
+        query_id:      u32              // incremental per transaction (see 4.3)
         collection_id: CollectionId
         doc_id:        DocId
     }
 
     IndexScan {
+        query_id:       u32
         collection_id:  CollectionId
         index_id:       IndexId
         lower_bound:    Option<EncodedKey>
@@ -705,6 +794,7 @@ ReadSetEntry:
     }
 
     TableScan {
+        query_id:       u32
         collection_id:  CollectionId
         filter:         Option<Filter>
         limit:          Option<u64>
@@ -712,7 +802,7 @@ ReadSetEntry:
     }
 ```
 
-Every query operation appends an entry. This captures both the **query parameters** (what was asked) and the **result set** (what was returned). Both are needed: query parameters define the conflict range, result set enables precise invalidation.
+Every query operation appends an entry with a unique `query_id`. This captures the **query parameters** (what was asked), the **result set** (what was returned), and the **query identity** (which query to re-execute on invalidation). Query parameters define the conflict range; result set enables precise invalidation; query ID enables granular subscription notifications.
 
 ### 5.7 OCC Validation (Conflict Detection)
 
@@ -760,52 +850,168 @@ The `index_deltas` capture the old and new index key values for each write. This
 
 **Commit log pruning**: entries with `commit_ts ≤ oldest_active_begin_ts` can be removed — no active transaction will validate against them.
 
-### 5.8 Subscription Invalidation
+### 5.8 Transaction Subscriptions
 
-Subscriptions are persistent read sets that receive push notifications when affected by new commits.
+Subscriptions operate at the **transaction level**: a subscription watches the entire read set of a committed transaction, not an individual query.
 
-A subscription is created by executing a query with `subscribe: true`. The query's read set entry becomes the subscription's **watch predicate**.
+**Registration**: when a transaction with `subscribe: true` or `notify: true` commits, its full read set (with `query_id`s) is stored in the subscription registry.
 
-**On every commit**, check all active subscriptions against the committed write set using the same conflict detection rules from 5.7:
+**Invalidation**: on every new commit, check all active subscriptions against the committed write set using the conflict detection rules from 5.7. For each affected subscription, collect the `query_id`s of conflicting read set entries.
 
-| Subscription Type | Invalidation Trigger |
-|-------------------|---------------------|
-| Point (Get) | Committed write to the watched `(collection, doc_id)`. |
-| Index scan | Committed write with an `IndexDelta` in the watched range, or to a document in the result set. |
-| Table scan | Any committed write to the watched collection (with filter optimization). |
+| Subscription Mode | On Invalidation |
+|-------------------|----------------|
+| `notify` | Send one-shot notification with affected `query_id`s. Remove subscription. |
+| `subscribe` | Send notification with affected `query_id`s + new transaction `(tx_id, ts)`. Subscription persists — updated when the chain transaction commits its new read set. |
 
-**Subscription registry** — indexed for fast lookup:
+**Subscription registry** — indexed for fast invalidation lookup:
 
 ```
 SubscriptionRegistry {
     // O(1) lookup for point watches
-    point_index: HashMap<(CollectionId, DocId), Vec<SubscriptionId>>
+    point_index: HashMap<(CollectionId, DocId), Vec<(SubscriptionId, QueryId)>>
 
     // Grouped by (collection, index) for range overlap checks
-    scan_index:  HashMap<(CollectionId, Option<IndexId>), Vec<SubscriptionId>>
+    scan_index:  HashMap<(CollectionId, Option<IndexId>), Vec<(SubscriptionId, QueryId)>>
 }
 ```
 
-When a commit writes to `(collection, doc_id)`:
+**Invalidation walk** — when a commit writes to `(collection, doc_id)`:
 
-1. Check `point_index[(collection, doc_id)]` for direct matches.
-2. For each scan subscription on this collection: check if the write's `IndexDelta` key falls within the subscription's bounds, or if `doc_id` is in the subscription's `result_doc_ids`.
-3. Fire invalidation notification for all matched subscriptions.
+1. Check `point_index[(collection, doc_id)]` → collect `(subscription_id, query_id)` pairs.
+2. For each scan subscription on this collection: check if the write's `IndexDelta` key falls within the subscription's bounds, or if `doc_id` is in the subscription's `result_doc_ids` → collect affected `(subscription_id, query_id)` pairs.
+3. Group by `subscription_id`.
+4. For each affected subscription: fire notification with the set of invalidated `query_id`s. For `subscribe` mode: begin a new transaction and include its `tx_id` in the notification.
 
-### 5.9 Concurrency Model
+**Subscription update on chain commit**: when a chain transaction (the new transaction from step 4) commits, its read set replaces the subscription's previous read set. The registry indexes are updated accordingly.
+
+### 5.9 Query Result Caching
+
+The subscription mechanism naturally enables **query result caching**: the server (or client) can cache the full result of a query alongside its read set. On subsequent identical queries, the cached result is returned immediately if no intervening commit has invalidated the read set.
+
+**Cache invalidation** uses the same conflict detection logic as subscriptions (5.8): when a commit's write set overlaps with a cached query's read set, the cached entry is evicted. This provides exact invalidation — no stale reads, no false positives for non-overlapping writes.
+
+**Cache lifecycle**: cached results are associated with the `read_ts` at which they were computed. A cache hit is valid if and only if no commit in `(read_ts, current_ts)` conflicts with the read set. This check is equivalent to the OCC validation in 5.7.
+
+### 5.10 Concurrency Model
 
 - **Async runtime**: all I/O and computation runs on the tokio async runtime.
 - **Buffer pool locking**: page-level read/write latches (short-lived, never held across await points).
-- **Write serialization**: WAL append + `commit_ts` assignment is a critical section, serialized via a mutex or single-writer channel. This is the serialization point for all writes.
+- **Write serialization**: WAL append + `commit_ts` assignment is a critical section, serialized via a single-writer committer (mutex or channel). This is the serialization point for all writes.
 - **Read concurrency**: fully concurrent. Multiple readers at different `read_ts` values traverse B-trees simultaneously without coordination.
 - **OCC advantage**: readers never block writers, writers never block readers. Conflicts are detected only at commit time.
+
+### 5.11 Commit Protocol and Ordering Guarantees
+
+The commit protocol enforces a strict ordering of effects. When a client receives commit confirmation, it is guaranteed that:
+
+1. Data is durably persisted.
+2. All subscriptions and caches on **all nodes** have been invalidated.
+3. All replicas have applied the changes.
+4. Any new transaction on any node will see the committed data.
+
+**Commit sequence** (on the primary):
+
+```
+1. OCC validation                           [VALIDATE]
+2. Assign commit_ts                         [TIMESTAMP]
+3. Write WAL record + fsync                 [PERSIST]
+4. Apply mutations to page store            [MATERIALIZE]
+5. Update commit log                        [LOG]
+6. Invalidate local subscriptions/caches    [INVALIDATE]
+7. Replicate to all replicas (see 6.2)      [REPLICATE]
+   Each replica: apply WAL → update page
+   store → invalidate local subscriptions
+8. Wait for replica acknowledgements        [SYNC]
+9. Advance latest_committed_ts              [VISIBLE]
+10. Notify the client                       [RESPOND]
+```
+
+**Critical ordering**: `latest_committed_ts` (step 9) is only advanced after all replicas confirm (step 8). This ensures that no new transaction on any node can begin at a timestamp for which some replica hasn't yet applied the data.
+
+**Monotonic visibility**: a query at timestamp T on any node is guaranteed to see all commits with `commit_ts ≤ T`. It is impossible for a newer timestamp to return older data than a query at an earlier timestamp.
+
+**Write-to-read latency**: the window between steps 3 and 9 is a brief period where the data is persisted but not yet visible to new transactions. This is intentional — visibility is deferred until all nodes are consistent. During this window, the committing client has not yet been notified, so no external observer can expect to see the data.
 
 ---
 
 ## 6. Distributed Architecture
 
-- **Replication**: single Primary node for all write operations with multiple Read Replicas.
-- **Consistency**: strong consistency across nodes via replication logs.
+### 6.1 Topology
+
+Single **Primary** with multiple **Read Replicas**. All nodes can accept client connections.
+
+| Role | Writes | Reads | Subscriptions |
+|------|--------|-------|---------------|
+| Primary | Yes (commits locally) | Yes | Yes (local) |
+| Replica | No (promotes to primary) | Yes (local snapshot) | Yes (local, invalidated via WAL stream) |
+
+### 6.2 WAL Streaming
+
+The primary continuously streams committed WAL records to all replicas:
+
+1. Primary commits a transaction (WAL + page store + local invalidation).
+2. Primary sends the WAL record to all replicas via persistent TCP connections.
+3. Each replica:
+   a. Applies the WAL record to its local page store and indexes.
+   b. Invalidates local subscriptions/caches affected by the commit.
+   c. Sends acknowledgement to primary.
+4. Primary waits for acknowledgements (see 6.5), then advances `latest_committed_ts`.
+
+### 6.3 Transaction Execution on Replicas
+
+**Read-only transactions**: execute entirely on the local replica.
+
+- Reads are served from the replica's page store at timestamps the replica has already applied.
+- No primary contact needed.
+- Subscriptions are registered locally — invalidated when the replica receives WAL records from the primary.
+
+**Write transactions**: execute locally, commit via the primary.
+
+- Reads from the local replica's snapshot at `begin_ts`.
+- Writes buffered in the local write set.
+- At commit time: **promote** to primary (see 6.4).
+
+### 6.4 Transaction Promotion
+
+When a write transaction on a replica reaches commit:
+
+1. Originating replica sends to primary: `{ begin_ts, read_set, write_set }`.
+2. Primary assigns `commit_ts` and validates OCC against its commit log.
+3. If valid: primary executes the full commit protocol (5.11 steps 3–9).
+4. Primary responds to originating replica: `{ commit_ts }` on success, or `{ conflict }` on OCC failure.
+5. Originating replica notifies the client (success or error, following `subscribe` semantics from 5.1).
+
+If OCC fails and `subscribe: true`: the originating replica starts a new write transaction at the current timestamp and notifies the client with the new `tx_id`.
+
+### 6.5 Replication Consistency
+
+**Default: strict synchronous replication** — the primary waits for **all** replicas to acknowledge before advancing the committed timestamp.
+
+**Configurable**: can be relaxed to **Primary + 1** (at least one replica confirms; remaining catch up asynchronously). This trades some consistency for lower write latency.
+
+| Mode | Guarantees | Trade-off |
+|------|-----------|-----------|
+| Strict (all replicas) | Any read on any node immediately sees committed data. | Write latency = max(replica round-trips). |
+| Primary + 1 | Committed data is on at least 2 nodes. Lagging replicas may serve slightly stale reads. | Lower write latency. |
+
+In both modes, the committing client is only notified after the required acknowledgements are received.
+
+### 6.6 Monotonic Reads
+
+Each replica tracks its `applied_ts` — the highest WAL timestamp it has fully applied and made visible locally.
+
+**Guarantee**: a replica never serves a read at a timestamp it hasn't fully applied. This is enforced by:
+
+- Transactions on a replica can only begin at timestamps `≤ applied_ts`.
+- If a client requests a read at a timestamp the replica hasn't reached, the replica either waits until caught up or returns an error.
+
+This ensures **monotonic reads**: a query at timestamp T always sees a complete, consistent snapshot of all commits up to T. No "time travel" — a newer timestamp always reflects a superset of an older timestamp's data.
+
+### 6.7 Replica Failure and Recovery
+
+- **Replica falls behind**: on reconnection, the replica requests WAL records from its last `applied_ts`. The primary streams the missing records. The replica applies them in order before accepting new transactions.
+- **Replica crashes**: on restart, the replica recovers from its local checkpoint + WAL (section 2.10), then reconnects to the primary to catch up.
+- **Primary failure**: out of scope for initial design. Future: leader election among replicas.
 
 ---
 

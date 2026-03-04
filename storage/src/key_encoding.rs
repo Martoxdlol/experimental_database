@@ -123,7 +123,7 @@ fn encode_float64(buf: &mut Vec<u8>, v: f64) {
     if bits[0] & 0x80 == 0 {
         bits[0] ^= 0x80; // positive: flip sign bit
     } else {
-        for b in &mut bits {
+        for b in bits.iter_mut() {
             *b ^= 0xFF; // negative: flip all bits
         }
     }

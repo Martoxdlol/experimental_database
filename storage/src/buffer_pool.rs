@@ -496,10 +496,10 @@ impl BufferPool {
         let mut result = Vec::new();
         for frame in &self.frames {
             let guard = frame.lock.read();
-            if guard.dirty {
-                if let Some(page_id) = guard.page_id {
-                    result.push((page_id, guard.data.clone(), guard.lsn));
-                }
+            if guard.dirty
+                && let Some(page_id) = guard.page_id
+            {
+                result.push((page_id, guard.data.clone(), guard.lsn));
             }
         }
         result

@@ -1,10 +1,10 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use crate::types::*;
-use crate::page::{SlottedPage, SlottedPageMut};
 use crate::free_list::FreePageList;
+use crate::page::{SlottedPage, SlottedPageMut};
+use crate::types::*;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BufferPoolError {
@@ -289,7 +289,10 @@ impl BufferPool {
     }
 
     /// Fetch a page for reading (shared lock).
-    pub fn fetch_page_shared(&self, page_id: PageId) -> Result<SharedPageGuard<'_>, BufferPoolError> {
+    pub fn fetch_page_shared(
+        &self,
+        page_id: PageId,
+    ) -> Result<SharedPageGuard<'_>, BufferPoolError> {
         // Check page table.
         {
             let pt = self.page_table.read();
@@ -350,7 +353,10 @@ impl BufferPool {
     }
 
     /// Fetch a page for writing (exclusive lock).
-    pub fn fetch_page_exclusive(&self, page_id: PageId) -> Result<ExclusivePageGuard<'_>, BufferPoolError> {
+    pub fn fetch_page_exclusive(
+        &self,
+        page_id: PageId,
+    ) -> Result<ExclusivePageGuard<'_>, BufferPoolError> {
         // Check page table.
         {
             let pt = self.page_table.read();
@@ -543,7 +549,7 @@ impl BufferPool {
 mod tests {
     use super::*;
 
-    fn make_pool(page_count: usize, frame_count: u32) -> BufferPool {
+    fn _make_pool(page_count: usize, frame_count: u32) -> BufferPool {
         let io = Box::new(MemPageIO::new(DEFAULT_PAGE_SIZE, page_count));
         BufferPool::new(io, DEFAULT_PAGE_SIZE, frame_count)
     }

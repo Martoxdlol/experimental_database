@@ -1,7 +1,7 @@
-use crate::types::*;
+use super::node::{BTreeNode, KeySizeHint};
 use crate::buffer_pool::{BufferPool, BufferPoolError};
 use crate::free_list::FreePageList;
-use super::node::{BTreeNode, KeySizeHint};
+use crate::types::*;
 
 /// Insert a cell into a B-tree.
 /// Returns the (possibly new) root page ID.
@@ -51,8 +51,8 @@ pub fn btree_insert(
     let insert_slot = {
         let page = guard.as_slotted_page();
         match BTreeNode::leaf_search(&page, &key_vec, key_hint) {
-            Ok(s) => s,   // exact match — insert at same position (duplicate version)
-            Err(s) => s,  // insertion point
+            Ok(s) => s,  // exact match — insert at same position (duplicate version)
+            Err(s) => s, // insertion point
         }
     };
     {
@@ -65,11 +65,28 @@ pub fn btree_insert(
     }
 
     // Leaf is full — need to split.
-    let (separator_key, new_page_id) = split_leaf(pool, &mut guard, cell_data, &key_vec, insert_slot, key_hint, free_list, lsn)?;
+    let (separator_key, new_page_id) = split_leaf(
+        pool,
+        &mut guard,
+        cell_data,
+        &key_vec,
+        insert_slot,
+        key_hint,
+        free_list,
+        lsn,
+    )?;
     drop(guard);
 
     // Propagate the split upward.
-    propagate_split(pool, root_page_id, &path, &separator_key, new_page_id, free_list, lsn)
+    propagate_split(
+        pool,
+        root_page_id,
+        &path,
+        &separator_key,
+        new_page_id,
+        free_list,
+        lsn,
+    )
 }
 
 /// Split a leaf page. Returns (separator_key, new_page_id).
@@ -84,7 +101,6 @@ fn split_leaf(
     free_list: &mut FreePageList,
     lsn: Lsn,
 ) -> Result<(Vec<u8>, PageId), BufferPoolError> {
-
     // Collect all existing cells + the new cell.
     let (mut all_cells, old_right_sibling) = {
         let sp = guard.as_slotted_page();
@@ -159,7 +175,8 @@ fn propagate_split(
             let mut pos = n;
             for i in 0..n {
                 if let Some((k, _)) = BTreeNode::internal_cell_key_and_child(&sp, i)
-                    && sep_key.as_slice() <= k {
+                    && sep_key.as_slice() <= k
+                {
                     pos = i;
                     break;
                 }
@@ -177,9 +194,8 @@ fn propagate_split(
         }
 
         // Parent is full — split the internal node.
-        let (new_sep, new_internal_id) = split_internal(
-            pool, &mut parent_guard, &cell, insert_pos, free_list, lsn,
-        )?;
+        let (new_sep, new_internal_id) =
+            split_internal(pool, &mut parent_guard, &cell, insert_pos, free_list, lsn)?;
         sep_key = new_sep;
         child_page_id = new_internal_id;
     }
@@ -229,7 +245,9 @@ fn split_internal(
     let mid_cell = &all_cells[mid];
     let mid_key_len = mid_cell.len() - 4;
     let sep_key = mid_cell[..mid_key_len].to_vec();
-    let mid_child = PageId(u32::from_le_bytes(mid_cell[mid_key_len..].try_into().unwrap()));
+    let mid_child = PageId(u32::from_le_bytes(
+        mid_cell[mid_key_len..].try_into().unwrap(),
+    ));
 
     // Allocate new internal page.
     let mut new_guard = pool.new_page(PageType::BTreeInternal, free_list)?;
@@ -265,16 +283,16 @@ fn split_internal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::btree::cursor::BTreeCursor;
     use crate::buffer_pool::MemPageIO;
     use crate::page::SlottedPageMut;
-    use crate::btree::cursor::BTreeCursor;
 
     fn make_pool(pages: usize, frames: u32) -> BufferPool {
         let io = Box::new(MemPageIO::new(DEFAULT_PAGE_SIZE, pages));
         BufferPool::new(io, DEFAULT_PAGE_SIZE, frames)
     }
 
-    fn init_empty_leaf(pool: &BufferPool, page_id: PageId) {
+    fn _init_empty_leaf(pool: &BufferPool, page_id: PageId) {
         let mut guard = pool.fetch_page_exclusive(page_id).unwrap();
         let mut sp = guard.as_slotted_page_mut();
         sp.init(page_id, PageType::BTreeLeaf);
@@ -308,9 +326,14 @@ mod tests {
         let mut fl = FreePageList::new(None);
         let cell = make_primary_cell(1, 100);
         let new_root = btree_insert(
-            &pool, PageId(1), &cell,
-            KeySizeHint::Fixed(PRIMARY_KEY_SIZE), &mut fl, Lsn(0),
-        ).unwrap();
+            &pool,
+            PageId(1),
+            &cell,
+            KeySizeHint::Fixed(PRIMARY_KEY_SIZE),
+            &mut fl,
+            Lsn(0),
+        )
+        .unwrap();
         assert_eq!(new_root, PageId(1));
 
         // Verify cell is there.
@@ -338,9 +361,14 @@ mod tests {
         for i in (0..50u8).rev() {
             let cell = make_primary_cell(i, 1);
             root = btree_insert(
-                &pool, root, &cell,
-                KeySizeHint::Fixed(PRIMARY_KEY_SIZE), &mut fl, Lsn(0),
-            ).unwrap();
+                &pool,
+                root,
+                &cell,
+                KeySizeHint::Fixed(PRIMARY_KEY_SIZE),
+                &mut fl,
+                Lsn(0),
+            )
+            .unwrap();
         }
 
         // Scan and verify sorted order.
@@ -385,9 +413,14 @@ mod tests {
             cell.extend_from_slice(&4u32.to_le_bytes());
             cell.extend_from_slice(b"body");
             root = btree_insert(
-                &pool, root, &cell,
-                KeySizeHint::Fixed(PRIMARY_KEY_SIZE), &mut fl, Lsn(0),
-            ).unwrap();
+                &pool,
+                root,
+                &cell,
+                KeySizeHint::Fixed(PRIMARY_KEY_SIZE),
+                &mut fl,
+                Lsn(0),
+            )
+            .unwrap();
         }
 
         // Root should now be an internal node.

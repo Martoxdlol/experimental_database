@@ -1,5 +1,5 @@
-use crate::types::*;
 use crate::buffer_pool::{BufferPool, BufferPoolError};
+use crate::types::*;
 
 /// Manages the free page linked list.
 /// Accessed exclusively by the single writer — no locking needed.
@@ -52,7 +52,7 @@ mod tests {
     use crate::buffer_pool::{MemPageIO, PageIO};
     use crate::page::SlottedPageMut;
 
-    fn init_free_page(io: &MemPageIO, page_id: PageId, next: u32) {
+    fn _init_free_page(io: &MemPageIO, page_id: PageId, next: u32) {
         let mut buf = vec![0u8; DEFAULT_PAGE_SIZE as usize];
         let mut sp = SlottedPageMut::new(&mut buf, DEFAULT_PAGE_SIZE);
         sp.init(page_id, PageType::Free);

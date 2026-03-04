@@ -1,0 +1,4 @@
+/ralph-loop:ralph-loop "Implement storage engine based on docs/DESIGN.md and following docs/plan/01_storage/*.md, do it in storage package." --completion-promise "DONE" --max-iterations 20
+
+
+/ralph-loop:ralph-loop "Based on DESIGN.md, build a overview implementation plan with layers and interfaces between them. Do this in docs/plan/overview/*.md. This plan must consider each module and layer of the entire database project. Must specify high level types and interfaces that communicate between layers and how they interact. Must also include a high level diagramas for different process of interactions between layers." --completion-promise "DONE" --max-iterations 20

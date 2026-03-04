@@ -64,10 +64,11 @@ pub struct FileHeader {
     pub next_collection_id: U64<LittleEndian>,
     pub next_index_id: U64<LittleEndian>,
     pub checkpoint_lsn: U64<LittleEndian>,      // Lsn
+    pub visible_ts: U64<LittleEndian>,          // latest visible timestamp
     pub created_at: U64<LittleEndian>,          // millis since epoch
 }
 // Layout is packed (zerocopy LE wrapper types have alignment 1).
-// Total size: 4+4+4+8+4+4+4+4+8+8+8+8 = 68 bytes.
+// Total size: 4+4+4+8+4+4+4+4+8+8+8+8+8 = 76 bytes.
 // Remainder of page 0 is zeroed (reserved for future fields).
 
 impl FileHeader {
@@ -220,7 +221,7 @@ StorageEngine::open(path, config, handler):
    - If data.db exists:
      a. Read page 0 → FileHeader
      b. Verify magic + version
-     c. Read checkpoint_lsn
+     c. Read checkpoint_lsn and visible_ts from FileHeader
 
 4. Recovery (if existing database):
    - dwb = DoubleWriteBuffer::new(path/data.dwb, page_storage, config.page_size)
@@ -272,7 +273,7 @@ Like open_in_memory() but with user-provided backends. Checks `page_storage.is_d
 1. Run final checkpoint (if durable)
 2. Shutdown WAL writer
 3. Flush buffer pool (discard remaining clean frames)
-4. Write final file header to page 0
+4. Write final file header to page 0 (including checkpoint_lsn and visible_ts)
 5. page_storage.sync()
 ```
 
@@ -329,22 +330,9 @@ impl BTreeHandle {
 
 - File header is on page 0, read at startup.
 - Updated via `update_file_header()` which acquires the file header lock, applies the update, and writes page 0 through the buffer pool.
-- Updated after: checkpoint (checkpoint_lsn), create/drop collection (catalog roots, ID allocators), free list changes (free_list_head).
+- Updated after: checkpoint (checkpoint_lsn, visible_ts), create/drop collection (catalog roots, ID allocators), free list changes (free_list_head).
 
-### meta.json
-
-In addition to the in-file header, a `meta.json` sidecar file stores:
-```json
-{
-    "checkpoint_lsn": 12345,
-    "page_size": 8192,
-    "version": 1
-}
-```
-
-Written atomically: write to `meta.json.tmp`, fsync, rename to `meta.json`.
-
-**Precedence on open():** `meta.json` is read **first** to obtain `checkpoint_lsn` (it survives even if page 0 is corrupt, since it is a separate file written atomically). If `meta.json` does not exist (new database, or upgrading from an older version that did not write it), fall back to reading `checkpoint_lsn` from page 0's `FileHeader`. After recovery completes, both `meta.json` and page 0 are written so they stay in sync going forward.
+Both `checkpoint_lsn` and `visible_ts` are read from the FileHeader (page 0) on startup. No sidecar files are needed.
 
 ## Error Handling
 

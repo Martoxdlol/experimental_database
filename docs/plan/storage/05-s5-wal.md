@@ -39,6 +39,7 @@ pub const WAL_RECORD_CREATE_INDEX: u8 = 0x05;
 pub const WAL_RECORD_DROP_INDEX: u8 = 0x06;
 pub const WAL_RECORD_INDEX_READY: u8 = 0x07;
 pub const WAL_RECORD_VACUUM: u8 = 0x08;
+pub const WAL_RECORD_VISIBLE_TS: u8 = 0x09;
 
 /// WAL segment file header: 32 bytes.
 /// Serialized manually with from_le_bytes()/to_le_bytes() (written once per segment).

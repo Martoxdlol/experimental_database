@@ -9,7 +9,7 @@ Order of executing transactions:
 - start replication messages
 - start invalidating cache and subscriptions
 - await replication response
-- CRITICAL: allow new timestamp (the new data becomes available to new queries)
+- CRITICAL: allow new timestamp (the new data becomes available to new queries) - Save to WAL (I think)
 - await cache invalidation
 - respond to client
 - await active subscriptions invalidation
@@ -18,4 +18,3 @@ The new thing is the indicator of the newest ready timestamp to read from on inc
 This is needed to prevent the case when the primary makes data available to new transactions before the replication.
 If the primary fails before replication data loss occurs.
 
-I

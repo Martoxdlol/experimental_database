@@ -1,6 +1,6 @@
 # Interaction Diagrams
 
-## 1. Document Write Commit (Full 10-Step Protocol)
+## 1. Document Write Commit (Full 11-Step Protocol)
 
 ```
 Caller          Database(L6)   CommitCoord(L5)   WAL(L2)     DocStore(L3)  Replication(L7)  Subs(L5)
@@ -21,34 +21,37 @@ Caller          Database(L6)   CommitCoord(L5)   WAL(L2)     DocStore(L3)  Repli
   |                 |                |               |              |              |             |
   |                 |          4. MATERIALIZE          |              |              |             |
   |                 |                |------------insert_version---->|              |             |
-  |                 |                |               |   (B-tree     |              |             |
-  |                 |                |               |    insert)    |              |             |
   |                 |                |<-------------------------------|              |             |
   |                 |                |               |              |              |             |
   |                 |          5. LOG                  |              |              |             |
   |                 |          commit_log.append()     |              |              |             |
   |                 |                |               |              |              |             |
-  |                 |          6. INVALIDATE           |              |              |             |
-  |                 |                |---------------------------------------------->|             |
+  |                 |          6. CONCURRENT START     |              |              |             |
+  |                 |          6a.   |---------------------------------------->|   |             |
+  |                 |                |               |              | replicate    |             |
+  |                 |          6b.   |---------------------------------------------->|             |
   |                 |                |               |              |   check_invalidation()     |
-  |                 |                |<----------------------------------------------|             |
   |                 |                |               |              |              |             |
-  |                 |          7. REPLICATE (via ReplicationHook)   |              |             |
-  |                 |                |---------------------------------------->|                   |
-  |                 |                |               |              |    stream WAL record        |
-  |                 |          8. SYNC                 |              |              |             |
-  |                 |                |<----------------------------------------|                   |
-  |                 |                |               |              |    ack from replicas        |
+  |                 |          7. AWAIT REPLICATION    |              |              |             |
+  |                 |                |<----------------------------------------|   |             |
+  |                 |                |               |              |   ack         |             |
   |                 |                |               |              |              |             |
-  |                 |          9. VISIBLE              |              |              |             |
-  |                 |          advance latest_ts       |              |              |             |
+  |                 |          8. PERSIST VISIBLE_TS   |              |              |             |
+  |                 |                |--append+fsync->|              |              |             |
+  |                 |                |   VISIBLE_TS   |              |              |             |
+  |                 |                |               |              |              |             |
+  |                 |          9. ADVANCE visible_ts   |              |              |             |
+  |                 |          (new readers can now    |              |              |             |
+  |                 |           see commit_ts data)    |              |              |             |
   |                 |                |               |              |              |             |
   |                 |         10. RESPOND              |              |              |             |
   |                 |<--CommitResult--|               |              |              |             |
   |<--ok(commit_ts)-|                |               |              |              |             |
+  |                 |                |               |              |              |             |
+  |                 |         11. PUSH INVALIDATION (fire-and-forget to subscriber sessions)    |
 ```
 
-Note: Steps 7-8 call `self.replication.replicate_and_wait()` — if `NoReplication` is injected (embedded mode), these are no-ops.
+Note: Steps 6a (replicate) and 6b (check invalidation) run concurrently. Without replication (NoReplication), 6a is a no-op. Step 11 pushes invalidation events to subscriber sessions asynchronously — the committing client does NOT wait for other clients to receive their subscription notifications.
 
 ## 2. Point Read (Get by ID) — Embedded Usage
 
@@ -171,7 +174,11 @@ Primary(L6)      PrimaryReplicator(L7)    Network         ReplicaClient(L7)    R
   |                      |<--ack-------------|<---ack------------|                  |
   |<--ok-----------------|                   |                   |                  |
   |                      |                   |                   |                  |
-  | advance latest_ts    |                   |                   |                  |
+  | persist WAL_RECORD_VISIBLE_TS            |                   |                  |
+  |-------------------append+fsync---------->|                   |                  |
+  |<------------------lsn--------------------|                   |                  |
+  |                      |                   |                   |                  |
+  | advance visible_ts   |                   |                   |                  |
 ```
 
 ## 6. Crash Recovery + Startup Sequence
@@ -180,7 +187,8 @@ Primary(L6)      PrimaryReplicator(L7)    Network         ReplicaClient(L7)    R
                         Database::open()
                            |
                     +------v------+
-                    | Read meta.json|
+                    | Read FileHeader|
+                    | (page 0)      |
                     | checkpoint_lsn|
                     +------+------+
                            |
@@ -248,7 +256,7 @@ Caller                          Database(L6)
   |--tx.commit(opts)------------->|  OCC + WAL + materialize + replicate
   |<--CommitResult::Success------|
   |                                |
-  |--begin_readonly()----------->|  snapshot at latest_ts
+  |--begin_readonly()----------->|  snapshot at visible_ts
   |<--ReadonlyTransaction--------|
   |                                |
   |--tx.query("users",...) ----->|  scan + filter + read set

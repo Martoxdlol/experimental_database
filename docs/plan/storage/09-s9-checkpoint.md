@@ -92,7 +92,6 @@ impl Checkpoint {
 >
 > `Checkpoint::run()` returns `Result<Lsn>`. The caller (StorageEngine, S13) is responsible for:
 > 1. Updating `FileHeader.checkpoint_lsn` in the data file header page.
-> 2. Updating `meta.json` with the new checkpoint LSN.
 >
 > This keeps S9 free of any dependency on S13 and avoids a circular dependency.
 

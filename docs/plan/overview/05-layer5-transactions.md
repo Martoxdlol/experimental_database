@@ -20,6 +20,8 @@ impl TsAllocator {
 }
 ```
 
+> **Note:** `visible_ts` (the latest timestamp safe for new readers) lives on `CommitCoordinator`, not here. `TsAllocator.latest()` tracks the highest *allocated* timestamp, but that may be ahead of what has been replicated. See the "Visibility Fence" section below.
+
 ### `read_set.rs` — Read Set (Scanned Intervals)
 
 **WHY HERE:** Tracks which portions of the index key space a transaction has observed. Used for OCC validation and subscription invalidation — core transaction semantics.
@@ -238,6 +240,7 @@ pub enum CommitResult {
 
 pub struct CommitCoordinator {
     ts_allocator: TsAllocator,
+    visible_ts: AtomicU64,  // latest timestamp whose data is safe for new readers
     commit_log: RwLock<CommitLog>,
     subscriptions: RwLock<SubscriptionRegistry>,
     wal_writer: WalWriter,
@@ -246,6 +249,8 @@ pub struct CommitCoordinator {
 }
 
 impl CommitCoordinator {
+    pub fn visible_ts(&self) -> Ts;  // latest timestamp safe for new readers
+
     /// The single-writer commit loop
     pub async fn run(&mut self);
     // For each request:
@@ -254,10 +259,25 @@ impl CommitCoordinator {
     //   3. Write WAL record + fsync
     //   4. Apply mutations to page store (via L3)
     //   5. Update commit log
-    //   6. Invalidate subscriptions
-    //   7-8. self.replication.replicate_and_wait() — calls L7 if wired, no-op otherwise
-    //   9. Advance latest_committed_ts
-    //   10. Notify client
+    //   6. START CONCURRENT:
+    //      a. self.replication.replicate_and_wait(lsn, record)
+    //      b. subscriptions.check_invalidation(index_writes)
+    //   7. AWAIT replication (6a)
+    //   8. Write WAL_RECORD_VISIBLE_TS(commit_ts) + fsync
+    //   9. Advance visible_ts = commit_ts (in-memory)
+    //  10. Respond to committing client
+    //  11. FIRE-AND-FORGET: push invalidation events (6b results) to subscriber sessions
+    //
+    // Notes:
+    // - Steps 6a and 6b run concurrently (tokio::join! or similar).
+    // - Without replication (NoReplication), step 6a is a no-op so
+    //   visible_ts advances immediately after WAL fsync.
+    // - visible_ts is persisted to WAL (WAL_RECORD_VISIBLE_TS) so
+    //   recovery knows the last replicated point.
+    // - New readers use visible_ts (not ts_allocator.latest()) for
+    //   their read_ts.
+    // - On recovery: visible_ts = last WAL_RECORD_VISIBLE_TS found
+    //   during replay.
 }
 
 /// Handle for submitting commit requests from any task
@@ -267,8 +287,42 @@ pub struct CommitHandle {
 
 impl CommitHandle {
     pub async fn commit(&self, request: CommitRequest) -> CommitResult;
+    pub fn visible_ts(&self) -> Ts;  // delegates to CommitCoordinator's AtomicU64
 }
 ```
+
+### Visibility Fence (`visible_ts`)
+
+`visible_ts` is the latest timestamp that is safe for new read transactions to observe. It is separate from `ts_allocator.current` (which tracks the highest *allocated* timestamp).
+
+**Key rules:**
+
+- `begin_readonly()` uses `visible_ts`, **NOT** `ts_allocator.latest()`.
+- `visible_ts` only advances after replication confirms the commit **AND** the advancement is persisted to WAL (via `WAL_RECORD_VISIBLE_TS`).
+- Without replication (`NoReplication`): `visible_ts` advances immediately after the commit's WAL fsync — no fence is needed.
+
+**Why this matters (phantom read prevention):**
+
+Without a visibility fence, the following scenario is possible:
+1. Primary commits `ts=101` and advances its read timestamp.
+2. A new reader on the primary observes data at `ts=101`.
+3. Primary is destroyed before replication completes.
+4. Replica only has data through `ts=100`.
+5. The reader saw a "phantom" — data that is permanently lost.
+
+With `visible_ts`, step 2 cannot happen until replication of `ts=101` is confirmed, preventing phantom reads of un-replicated data.
+
+**Recovery behavior:**
+
+On startup, `visible_ts` is set to the last `WAL_RECORD_VISIBLE_TS` found during WAL replay. Any commits that exist locally beyond `visible_ts` were written to WAL but not yet replicated — they remain locally present but invisible to new readers until they are re-replicated and `visible_ts` advances again.
+
+**Vacuum interaction:**
+
+Vacuum must use `min(oldest_active_read_ts, visible_ts)` as its safe threshold -- see Layer 3 vacuum strategy.
+
+**WAL record type:**
+
+`WAL_RECORD_VISIBLE_TS` (type tag `0x09`) is added to the WAL record type registry in S5. Its payload is a single `u64` — the new visible timestamp. This record is written and fsynced after replication confirms, before `visible_ts` is advanced in memory.
 
 ## Interfaces Exposed to Higher Layers
 

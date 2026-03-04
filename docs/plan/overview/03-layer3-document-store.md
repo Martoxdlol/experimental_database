@@ -201,8 +201,12 @@ impl IndexBuilder {
 Instead of periodically scanning the entire primary B-tree to find reclaimable old versions (O(total entries)), use the **write path as a source of vacuum candidates**:
 
 1. **On each commit**: when a `TxCommit` contains a Replace or Delete mutation, the *previous* version at `(doc_id, old_ts)` becomes a future vacuum candidate. Push it (along with its old secondary index keys from the IndexDelta) into a **pending vacuum queue**.
-2. **Periodically**: check `oldest_active_read_ts` from L5 (TxManager).
-3. **Drain eligible entries**: any pending entry where `old_ts` is older than the most recent version visible at `oldest_active_read_ts` is safe to remove.
+2. **Periodically**: compute the vacuum-safe threshold:
+   ```
+   vacuum_safe_ts = min(oldest_active_read_ts, visible_ts)
+   ```
+   where `oldest_active_read_ts` comes from L5 (TxManager) and `visible_ts` is the latest replicated timestamp (see Layer 5, Visibility Fence). `visible_ts` is the latest replicated timestamp. Un-replicated commits (`ts > visible_ts`) may have replaced versions that readers at `visible_ts` still need. Using `min()` ensures we never vacuum versions that are still the "latest visible" at either the oldest active reader's snapshot or the visibility fence.
+3. **Drain eligible entries**: any pending entry where `old_ts` is older than the most recent version visible at `vacuum_safe_ts` is safe to remove.
 4. **Execute**: write a `Vacuum` WAL record (0x08) with the entries, then call Layer 2's `VacuumTask.remove_entries()` to perform the actual B-tree key deletions.
 
 **Advantages over B-tree scan**:

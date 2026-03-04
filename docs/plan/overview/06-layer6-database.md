@@ -60,7 +60,8 @@ impl Database {
 
     // --- Transaction API ---
 
-    /// Begin a read-only transaction (snapshot at current ts)
+    /// Begin a read-only transaction (snapshot at current visible_ts —
+    /// the latest replicated/committed timestamp, not ts_allocator.latest())
     pub fn begin_readonly(&self) -> ReadonlyTransaction;
 
     /// Begin a read-write transaction
@@ -103,7 +104,9 @@ impl Database {
 ### Transaction API (within `database.rs`)
 
 ```rust
-/// Read-only transaction — snapshot isolation
+/// Read-only transaction — snapshot isolation.
+/// `read_ts` is set to `visible_ts` (the latest replicated/committed timestamp),
+/// ensuring readers only see data that has been fully committed and replicated.
 pub struct ReadonlyTransaction<'db> {
     db: &'db Database,
     read_ts: Ts,
@@ -183,11 +186,13 @@ impl ReplicationHook for NoReplication {
 **WHY HERE:** Provides O(1) lookups by BOTH name and id for collections and indexes. Derived from the durable catalog B-tree in Layer 2. All query interfaces support both access patterns.
 
 ```rust
+/// Note: When a collection is created, a `_created_at` secondary index is
+/// automatically created and stored as a regular IndexMeta entry (not as a
+/// special field on CollectionMeta).
 pub struct CollectionMeta {
     pub collection_id: CollectionId,
     pub name: String,
     pub primary_root_page: PageId,
-    pub created_at_root_page: PageId,
     pub doc_count: u64,
 }
 
@@ -347,7 +352,7 @@ tx.commit(CommitOptions::default()).await?;
 ## Startup Sequence (Embedded)
 
 ```
-1. StorageEngine::recover() — DWB restore + WAL replay
+1. StorageEngine::open() — includes DWB restore + WAL replay internally
 2. Scan catalog B-tree → build CatalogCache
 3. Open primary + secondary index B-tree handles
 4. Create CommitCoordinator with ReplicationHook (or NoReplication)
@@ -387,7 +392,7 @@ Each database's `data.db` contains TWO catalog B-trees:
 | **By-ID (primary)** | `entity_type[1] \|\| entity_id[8]` | Primary lookup by collection_id or index_id |
 | **By-Name (secondary)** | `entity_type[1] \|\| name_bytes[var] \|\| 0x00` | Name → ID lookup for create/drop/query |
 
-The file header (page 0) stores the root page of the by-ID B-tree. The by-name B-tree root is stored as a special catalog entry in the by-ID B-tree.
+The file header (page 0) stores the root pages of both catalog B-trees.
 
 ## Interfaces Exposed to Higher Layers
 

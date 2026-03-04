@@ -1,110 +1,77 @@
 # Integration Modules
 
-## Purpose
+**Purpose:** Coordinate across all layers without adding business logic. Database instance lifecycle, system database, in-memory catalog cache (dual-indexed by name AND id), and configuration.
 
-These modules tie the layers together into cohesive database instances.
+## Modules
 
-## `database.rs` — Per-Database Instance
+### `database.rs` — Per-Database Instance
 
-A `Database` encapsulates all per-database state: storage engine, indexes, transactions, and background tasks.
+**WHY HERE:** Brings together storage engine, document store, query engine, and transaction manager into a single operational unit. Orchestration, not logic.
 
 ```rust
 pub struct Database {
+    pub name: String,
     pub config: DatabaseConfig,
-    pub db_dir: PathBuf,
 
-    // Layer 2: Storage
-    pub buffer_pool: Arc<BufferPool>,
-    pub wal_writer: Arc<WalWriter>,
-    pub checkpoint_mgr: CheckpointManager,
-    pub free_list: Mutex<FreeList>,
-    pub heap_mgr: Mutex<HeapManager>,
+    // Layer 2
+    storage: Arc<StorageEngine>,
 
-    // Layer 2/3: Catalog
-    pub catalog: RwLock<CatalogCache>,
+    // Layer 3
+    primary_indexes: RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>,
+    secondary_indexes: RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>,
 
-    // Layer 3: Indexes (per collection)
-    pub primary_indexes: RwLock<HashMap<CollectionId, PrimaryIndex>>,
-    pub secondary_indexes: RwLock<HashMap<IndexId, SecondaryIndex>>,
+    // Layer 5
+    commit_handle: CommitHandle,
+    ts_allocator: TsAllocator,
+    subscriptions: Arc<RwLock<SubscriptionRegistry>>,
 
-    // Layer 5: Transactions
-    pub tx_manager: TransactionManager,
+    // Integration
+    catalog: Arc<RwLock<CatalogCache>>,
 
-    // Background tasks
-    pub is_replica: bool,
-    pub shutdown: CancellationToken,
+    // State
+    is_replica: bool,
+    shutdown: CancellationToken,
 }
 
 impl Database {
-    pub async fn open(config: DatabaseConfig, db_dir: PathBuf) -> Result<Self>;
-    pub async fn close(&self) -> Result<()>;
+    /// Open a database from disk (recovery + catalog load)
+    pub async fn open(path: &Path, config: DatabaseConfig) -> Result<Self>;
 
-    // === Collection management ===
-    pub async fn create_collection(&self, name: &str) -> Result<CollectionId>;
-    pub async fn drop_collection_by_name(&self, name: &str) -> Result<()>;
-    pub async fn drop_collection_by_id(&self, id: CollectionId) -> Result<()>;
+    /// Close the database (flush, checkpoint, shutdown tasks)
+    pub async fn close(&mut self) -> Result<()>;
+
+    // --- Transaction API ---
+    pub fn begin_readonly(&self) -> ReadonlyTransaction;
+    pub fn begin_mutation(&self) -> Result<MutationTransaction>;
+
+    // --- Collection Management ---
+    pub fn create_collection(&self, name: &str) -> Result<CollectionId>;
+    pub fn drop_collection(&self, name: &str) -> Result<()>;
+    pub fn list_collections(&self) -> Vec<CollectionMeta>;
     pub fn get_collection_by_name(&self, name: &str) -> Option<CollectionMeta>;
     pub fn get_collection_by_id(&self, id: CollectionId) -> Option<CollectionMeta>;
-    pub fn list_collections(&self) -> Vec<CollectionMeta>;
 
-    // === Index management ===
-    pub async fn create_index(&self, collection: &str, fields: Vec<FieldPath>, name: Option<String>) -> Result<IndexId>;
-    pub async fn drop_index_by_name(&self, collection: &str, name: &str) -> Result<()>;
-    pub async fn drop_index_by_id(&self, id: IndexId) -> Result<()>;
-    pub fn get_index_by_name(&self, collection: &str, name: &str) -> Option<IndexMeta>;
-    pub fn get_index_by_id(&self, id: IndexId) -> Option<IndexMeta>;
+    // --- Index Management ---
+    pub fn create_index(&self, collection: &str, name: &str,
+                        fields: Vec<FieldPath>) -> Result<IndexId>;
+    pub fn drop_index(&self, collection: &str, name: &str) -> Result<()>;
     pub fn list_indexes(&self, collection: &str) -> Vec<IndexMeta>;
+    pub fn get_index_by_name(&self, collection_id: CollectionId,
+                              name: &str) -> Option<IndexMeta>;
+    pub fn get_index_by_id(&self, id: IndexId) -> Option<IndexMeta>;
 
-    // === Transaction operations (delegate to tx_manager) ===
-    pub fn begin_transaction(&self, readonly: bool, subscribe: bool, notify: bool) -> Transaction;
-    pub async fn commit_transaction(&self, tx: Transaction) -> CommitResult;
-
-    // === Query operations (delegate to query engine) ===
-    pub fn execute_get(&self, tx: &mut Transaction, collection: &str, doc_id: DocId) -> Result<Option<Document>>;
-    pub fn execute_query(&self, tx: &mut Transaction, collection: &str, plan: &QueryPlan) -> Result<QueryResult>;
+    // --- Internal ---
+    fn start_background_tasks(&self);
+    fn start_checkpoint_task(&self);
+    fn start_vacuum_task(&self);
 }
 ```
 
-## `catalog.rs` — Catalog B-Trees + In-Memory Cache
+### `catalog_cache.rs` — In-Memory Dual-Indexed Catalog
 
-### Durable Storage: Two B-Trees
-
-The catalog uses **two B-trees** in `data.db` for dual-indexed lookup:
-
-```
-Catalog B-Tree by ID (primary):
-  Key:   entity_type[1] || entity_id[8]     (big-endian)
-  Value: serialized CollectionEntry or IndexEntry
-
-Catalog B-Tree by Name (secondary):
-  Key:   entity_type[1] || name_bytes[var]   (0x00-terminated)
-  Value: entity_id[8]                        (pointer to primary)
-```
-
-Both B-trees are updated atomically in the same WAL commit. The name B-tree enforces uniqueness — insert fails if the key already exists.
-
-For the system catalog (`_system/`), the same dual-index pattern applies:
-- By ID: `0x01 || database_id[8]`
-- By Name: `0x01 || name_bytes`
-
-### In-Memory Cache
+**WHY HERE:** Provides O(1) lookups by BOTH name and id for collections, indexes, and databases. Derived from the durable catalog B-tree in Layer 2. All query interfaces support both access patterns.
 
 ```rust
-pub struct CatalogCache {
-    // === Collection lookups (bidirectional) ===
-    name_to_collection: HashMap<String, CollectionId>,
-    collections: HashMap<CollectionId, CollectionMeta>,
-
-    // === Index lookups (bidirectional) ===
-    indexes: HashMap<IndexId, IndexMeta>,
-    index_name_to_id: HashMap<(CollectionId, String), IndexId>,
-    collection_indexes: HashMap<CollectionId, Vec<IndexId>>,
-
-    // === ID allocators ===
-    next_collection_id: AtomicU64,
-    next_index_id: AtomicU64,
-}
-
 pub struct CollectionMeta {
     pub collection_id: CollectionId,
     pub name: String,
@@ -124,64 +91,99 @@ pub struct IndexMeta {
 
 pub enum IndexState { Building, Ready, Dropping }
 
+pub struct CatalogCache {
+    // Collection lookup (bidirectional)
+    name_to_collection: HashMap<String, CollectionId>,
+    collections: HashMap<CollectionId, CollectionMeta>,
+
+    // Index lookup (bidirectional)
+    indexes: HashMap<IndexId, IndexMeta>,
+    index_name_to_id: HashMap<(CollectionId, String), IndexId>,
+    collection_indexes: HashMap<CollectionId, Vec<IndexId>>,
+
+    // ID allocators (derived from file header)
+    next_collection_id: AtomicU64,
+    next_index_id: AtomicU64,
+}
+
 impl CatalogCache {
-    // --- Rebuild from durable B-trees on startup ---
-    pub fn rebuild_from_btrees(
-        id_btree: &BTree,
-        name_btree: &BTree,
-    ) -> Result<Self>;
+    /// Build from catalog B-tree scan on startup
+    pub fn from_btree(btree: &BTreeHandle) -> Result<Self>;
 
-    // --- Collection queries ---
+    // --- By Name ---
     pub fn get_collection_by_name(&self, name: &str) -> Option<&CollectionMeta>;
+    pub fn get_index_by_name(&self, collection_id: CollectionId,
+                              name: &str) -> Option<&IndexMeta>;
+
+    // --- By ID ---
     pub fn get_collection_by_id(&self, id: CollectionId) -> Option<&CollectionMeta>;
-    pub fn list_collections(&self) -> Vec<&CollectionMeta>;
-
-    // --- Index queries ---
-    pub fn get_index_by_name(&self, collection_id: CollectionId, name: &str) -> Option<&IndexMeta>;
     pub fn get_index_by_id(&self, id: IndexId) -> Option<&IndexMeta>;
-    pub fn list_indexes(&self, collection_id: CollectionId) -> Vec<&IndexMeta>;
-    pub fn list_ready_indexes(&self, collection_id: CollectionId) -> Vec<&IndexMeta>;
 
-    // --- Mutations (called by writer task after WAL commit) ---
-    pub fn insert_collection(&mut self, meta: CollectionMeta) -> Result<()>;
-    pub fn remove_collection(&mut self, id: CollectionId) -> Result<()>;
-    pub fn insert_index(&mut self, meta: IndexMeta) -> Result<()>;
-    pub fn remove_index(&mut self, id: IndexId) -> Result<()>;
-    pub fn mark_index_ready(&mut self, id: IndexId) -> Result<()>;
+    // --- Listing ---
+    pub fn list_collections(&self) -> Vec<&CollectionMeta>;
+    pub fn list_indexes(&self, collection_id: CollectionId) -> Vec<&IndexMeta>;
+    pub fn all_collections(&self) -> Vec<&CollectionMeta>;
+
+    // --- Mutation (synchronized with catalog B-tree writes) ---
+    pub fn add_collection(&mut self, meta: CollectionMeta);
+    pub fn remove_collection(&mut self, id: CollectionId);
+    pub fn add_index(&mut self, meta: IndexMeta);
+    pub fn remove_index(&mut self, id: IndexId);
+    pub fn set_index_state(&mut self, id: IndexId, state: IndexState);
+
+    // --- ID allocation ---
+    pub fn next_collection_id(&self) -> CollectionId;
+    pub fn next_index_id(&self) -> IndexId;
 }
 ```
 
-## `system.rs` — System Database + Multi-DB Management
+### `system_database.rs` — System Database (Database Registry)
+
+**WHY HERE:** Manages the `_system/` database which is itself a database instance tracking all user databases. Dual-indexed by name AND id.
 
 ```rust
+pub struct DatabaseMeta {
+    pub database_id: DatabaseId,
+    pub name: String,
+    pub path: String,
+    pub created_at: u64,
+    pub config: DatabaseConfig,
+    pub state: DatabaseState,
+}
+
+pub enum DatabaseState { Active, Creating, Dropping }
+
 pub struct SystemDatabase {
-    // The _system database instance (holds the database registry catalog)
-    pub system_db: Database,
+    inner: Database,  // the _system/ database instance
 
-    // All open user databases — dual-indexed
-    pub databases_by_name: RwLock<HashMap<String, Arc<Database>>>,
-    pub databases_by_id: RwLock<HashMap<DatabaseId, Arc<Database>>>,
-
-    pub config: ServerConfig,
+    // In-memory registry (bidirectional)
+    databases_by_name: RwLock<HashMap<String, DatabaseId>>,
+    databases_by_id: RwLock<HashMap<DatabaseId, DatabaseMeta>>,
 }
 
 impl SystemDatabase {
-    pub async fn open(data_root: PathBuf, config: ServerConfig) -> Result<Self>;
-    pub async fn close(&self) -> Result<()>;
+    pub async fn open(data_root: &Path) -> Result<Self>;
+    pub async fn close(&mut self) -> Result<()>;
 
-    // === Database lifecycle ===
-    pub async fn create_database(&self, name: &str, config: Option<DatabaseConfig>) -> Result<DatabaseId>;
-    pub async fn drop_database_by_name(&self, name: &str) -> Result<()>;
-    pub async fn drop_database_by_id(&self, id: DatabaseId) -> Result<()>;
+    // --- By Name ---
+    pub fn get_database_by_name(&self, name: &str) -> Option<DatabaseMeta>;
 
-    // === Database queries ===
-    pub fn get_database_by_name(&self, name: &str) -> Result<Arc<Database>>;
-    pub fn get_database_by_id(&self, id: DatabaseId) -> Result<Arc<Database>>;
-    pub fn list_databases(&self) -> Vec<DatabaseInfo>;
+    // --- By ID ---
+    pub fn get_database_by_id(&self, id: DatabaseId) -> Option<DatabaseMeta>;
+
+    // --- Listing ---
+    pub fn list_databases(&self) -> Vec<DatabaseMeta>;
+
+    // --- Lifecycle ---
+    pub async fn create_database(&self, name: &str, config: DatabaseConfig)
+        -> Result<DatabaseId>;
+    pub async fn drop_database(&self, name: &str) -> Result<()>;
 }
 ```
 
-## `config.rs` — Configuration Types
+### `config.rs` — Configuration
+
+**WHY HERE:** Defines all configuration structures used across layers.
 
 ```rust
 pub struct ServerConfig {
@@ -195,67 +197,92 @@ pub struct ServerConfig {
     pub transactions: TransactionConfig,
 }
 
+pub struct ListenConfig {
+    pub tcp: Option<SocketAddr>,
+    pub tls: Option<SocketAddr>,
+    pub quic: Option<SocketAddr>,
+    pub websocket: Option<SocketAddr>,
+}
+
 pub struct DatabaseConfig {
-    pub page_size: usize,          // default: 8192
-    pub memory_budget: usize,      // default: 256 MB
-    pub max_doc_size: usize,       // default: 16 MB
-    pub external_threshold: usize, // default: page_size / 2
-    pub checkpoint_wal_threshold: u64,   // default: 64 MB
-    pub checkpoint_time_threshold: Duration, // default: 5 min
+    pub page_size: usize,        // default 8192
+    pub memory_budget: usize,    // default 256MB
+    pub max_doc_size: usize,     // default 16MB
+    pub external_threshold: usize,
+    pub wal_segment_size: usize,
+    pub checkpoint_wal_threshold: usize,
+    pub checkpoint_interval: Duration,
+}
+
+pub struct ReplicationConfig {
+    pub mode: ReplicationMode,
+    pub wal_retention_max_size: usize,
+    pub wal_retention_max_age: Duration,
+}
+
+pub struct TransactionConfig {
+    pub idle_timeout: Duration,
+    pub max_lifetime: Duration,
+    pub max_intervals: usize,
+    pub max_scanned_bytes: usize,
+    pub max_scanned_docs: usize,
 }
 ```
 
-## Startup Sequence Diagram
+## Startup Sequence
 
 ```
-  main.rs
-    │
-    ├── Read config.json → ServerConfig
-    │
-    ├── SystemDatabase::open(data_root)
-    │   │
-    │   ├── Open _system/ database
-    │   │   ├── DWB recovery (if needed)
-    │   │   ├── WAL replay from checkpoint_lsn
-    │   │   └── Rebuild catalog cache (database registry)
-    │   │
-    │   └── For each Active database in registry:
-    │       ├── Database::open(db_dir)
-    │       │   ├── DWB recovery
-    │       │   ├── WAL replay
-    │       │   ├── Rebuild catalog cache (collections + indexes)
-    │       │   ├── Initialize buffer pool
-    │       │   ├── Initialize TransactionManager
-    │       │   └── Start background tasks:
-    │       │       ├── Checkpoint task
-    │       │       ├── Vacuum task
-    │       │       └── Index build tasks (for Building indexes)
-    │       └── Store Arc<Database> in databases map
-    │
-    ├── Server::start(config, system_db)
-    │   ├── Spawn TCP listener
-    │   ├── Spawn TLS listener (if configured)
-    │   ├── Spawn QUIC listener (if configured)
-    │   └── Spawn WebSocket listener (if configured)
-    │
-    └── If replica:
-        └── ReplicaClient::start(primary_addr)
-            └── Connect → receive WAL stream → apply
+1. Load ServerConfig from config file
+2. Open _system/ database (SystemDatabase::open)
+   a. StorageEngine::recover() — DWB restore + WAL replay
+   b. Scan catalog B-tree → populate database registry
+3. For each Active database in registry:
+   a. Database::open(path, config)
+      i.   StorageEngine::recover()
+      ii.  Scan catalog B-tree → build CatalogCache
+      iii. Open primary indexes and secondary indexes
+      iv.  Start CommitCoordinator task
+      v.   Start checkpoint background task
+      vi.  Start vacuum background task
+4. If replica: start ReplicaClient
+5. If primary: start PrimaryReplicationServer
+6. Start Server (transport listeners)
+7. Accept connections
 ```
 
 ## Shutdown Sequence
 
 ```
-  Shutdown signal (SIGTERM / ctrl-c)
-    │
-    ├── Stop accepting new connections
-    ├── Close existing connections (rollback open transactions)
-    ├── If replica: disconnect from primary
-    ├── If primary: wait for final replication acks
-    │
-    └── For each database:
-        ├── Stop background tasks (vacuum, index build)
-        ├── Final checkpoint (flush all dirty pages)
-        ├── Close WAL (sync final segment)
-        └── Close data file
+1. Stop accepting new connections
+2. Signal shutdown to all sessions
+3. Wait for active transactions to complete (with timeout)
+4. For each database:
+   a. Stop background tasks (vacuum, checkpoint, index builds)
+   b. Final checkpoint
+   c. Close storage engine
+5. Close _system/ database
+6. Exit
 ```
+
+## Catalog Consistency Invariant
+
+The in-memory `CatalogCache` is always consistent with the catalog B-tree. Both are updated atomically within the same commit path:
+
+1. WAL record written and fsynced
+2. Catalog B-tree updated via buffer pool
+3. In-memory cache updated
+
+If crash between steps 2 and 3: WAL replay reconstructs the B-tree, cache rebuilt on startup.
+
+## Dual B-Tree Catalog (Layer 2 Storage)
+
+Each database's `data.db` contains TWO catalog B-trees:
+
+| B-Tree | Key Format | Purpose |
+|--------|-----------|---------|
+| **By-ID (primary)** | `entity_type[1] \|\| entity_id[8]` | Primary lookup by collection_id or index_id |
+| **By-Name (secondary)** | `entity_type[1] \|\| name_bytes[var] \|\| 0x00` | Name → ID lookup for create/drop/query |
+
+The file header (page 0) stores the root page of the by-ID B-tree. The by-name B-tree root is stored as a special catalog entry in the by-ID B-tree.
+
+Both B-trees are updated atomically during catalog mutations (create/drop collection/index). On startup, both are scanned to populate the bidirectional `CatalogCache`.

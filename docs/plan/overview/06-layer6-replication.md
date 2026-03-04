@@ -1,201 +1,182 @@
-# Layer 6: Distributed / Replication
+# Layer 6: Replication
 
-## Purpose
+**Layer purpose:** WAL streaming from primary to replicas, transaction promotion (write commits from replicas), 3-tier recovery (incremental catch-up, local crash recovery, full reconstruction), and snapshot transfer.
 
-WAL streaming from primary to replicas, transaction promotion, replica recovery (3 tiers), and WAL retention management.
+## Modules
 
-## Sub-Modules
+### `primary_server.rs` — Primary Replication Server
 
-### `replication/primary.rs` — Primary WAL Streaming Server
+**WHY HERE:** Streams committed WAL records to replicas and collects acknowledgements. Replication is a distributed systems concern that sits above the commit protocol.
 
 ```rust
+use crate::storage::wal::{WalReader, WalRecord, Lsn};
+
 pub struct PrimaryReplicationServer {
-    wal_reader: Arc<WalReader>,
-    replicas: RwLock<HashMap<ReplicaId, ReplicaConnection>>,
-    wal_retention: WalRetentionPolicy,
+    wal_reader: WalReader,
+    replicas: RwLock<Vec<ReplicaConnection>>,
+    commit_notify: broadcast::Receiver<Lsn>,  // notified on each new commit
 }
 
-pub struct ReplicaConnection {
-    pub replica_id: ReplicaId,
-    pub applied_lsn: Lsn,
-    pub applied_ts: Ts,
-    pub tcp_stream: TcpStream,
-    pub ack_channel: mpsc::Receiver<Lsn>,
+struct ReplicaConnection {
+    id: u64,
+    applied_lsn: AtomicU64,
+    applied_ts: AtomicU64,
+    writer: TcpStream,
 }
 
 impl PrimaryReplicationServer {
-    pub async fn start(addr: SocketAddr, database: Arc<Database>) -> Result<Self>;
+    pub fn new(wal_reader: WalReader, commit_notify: broadcast::Receiver<Lsn>) -> Self;
 
-    // Stream WAL records to a specific replica from their applied_lsn
-    pub async fn stream_to_replica(&self, replica_id: ReplicaId) -> Result<()>;
+    /// Start the replication server listening for replica connections
+    pub async fn start(&self, addr: SocketAddr) -> Result<()>;
 
-    // Broadcast a new commit to all replicas and collect acks
-    pub async fn broadcast_and_wait(
-        &self,
-        wal_record_bytes: &[u8],
-        lsn: Lsn,
-        mode: ReplicationMode,
-    ) -> Result<()>;
+    /// Wait for all (or required) replicas to acknowledge up to lsn
+    pub async fn wait_for_ack(&self, lsn: Lsn, mode: ReplicationMode) -> Result<()>;
 
-    // Compute retention_lsn for WAL segment reclamation
-    pub fn retention_lsn(&self, checkpoint_lsn: Lsn) -> Lsn;
+    /// Get the minimum applied_lsn across all replicas (for WAL retention)
+    pub fn min_replica_lsn(&self) -> Lsn;
+
+    // Per-connection handler:
+    // 1. Receive replica's applied_lsn
+    // 2. Stream missing WAL records from that point
+    // 3. On new commits: stream new records
+    // 4. Receive ack messages, update applied_lsn/applied_ts
+    async fn handle_replica(&self, conn: TcpStream) -> Result<()>;
 }
 
 pub enum ReplicationMode {
-    Strict,       // Wait for all replicas
-    PrimaryPlusOne, // Wait for at least one
+    Strict,        // wait for ALL replicas
+    PrimaryPlusOne, // wait for at least 1 replica
 }
 ```
 
-### `replication/replica.rs` — Replica Client
+### `replica_client.rs` — Replica Replication Client
+
+**WHY HERE:** Connects to primary, receives WAL records, applies them locally. Inverse of `primary_server.rs`.
 
 ```rust
 pub struct ReplicaClient {
     primary_addr: SocketAddr,
-    database: Arc<Database>,
+    storage: Arc<StorageEngine>,
+    commit_coordinator: CommitHandle,  // to apply received records
     applied_lsn: AtomicU64,
     applied_ts: AtomicU64,
     shutdown: CancellationToken,
 }
 
 impl ReplicaClient {
-    pub async fn start(
-        database: Arc<Database>,
-        primary_addr: SocketAddr,
-    ) -> Result<Self>;
+    pub fn new(primary_addr: SocketAddr, storage: Arc<StorageEngine>,
+               commit: CommitHandle, shutdown: CancellationToken) -> Self;
 
-    // Main loop: connect, receive WAL records, apply, ack
-    async fn run_replica(&self) -> Result<()>;
+    /// Start the replica client (reconnects with exponential backoff)
+    pub async fn run(&self) -> Result<()>;
 
-    // Apply a single WAL record to local state
-    async fn apply_wal_record(&self, record: &WalRecord) -> Result<()>;
+    // Inner loop:
+    // 1. Connect to primary
+    // 2. Send applied_lsn
+    // 3. Receive and apply WAL records:
+    //    a. Write to local WAL
+    //    b. Apply to local page store
+    //    c. Invalidate local subscriptions
+    //    d. Send ack to primary
+    async fn run_replication_loop(&self) -> Result<()>;
 
-    // Reconnect with exponential backoff
-    async fn reconnect(&self) -> Result<TcpStream>;
+    pub fn applied_lsn(&self) -> Lsn;
+    pub fn applied_ts(&self) -> Ts;
 }
 ```
 
-### `replication/promotion.rs` — Transaction Promotion
+### `promotion.rs` — Transaction Promotion
+
+**WHY HERE:** Handles write transactions originating on replicas by forwarding to the primary for commit validation.
 
 ```rust
-pub struct PromotionRequest {
-    pub begin_ts: Ts,
-    pub read_set: ReadSet,
-    pub write_set: WriteSet,
+pub struct PromotionClient {
+    primary_addr: SocketAddr,
+}
+
+impl PromotionClient {
+    /// Send a transaction's write set to the primary for validation and commit
+    pub async fn promote(
+        &self,
+        begin_ts: Ts,
+        read_set: ReadSet,
+        write_set: WriteSet,
+    ) -> Result<PromotionResult>;
 }
 
 pub enum PromotionResult {
     Success { commit_ts: Ts },
-    Conflict { error: ConflictError, new_tx: Option<(TxId, Ts)> },
+    Conflict { error: ConflictError },
 }
-
-// On the replica side:
-pub async fn promote_transaction(
-    primary_addr: SocketAddr,
-    request: PromotionRequest,
-) -> Result<PromotionResult>;
-
-// On the primary side (within the writer task):
-pub fn handle_promotion(
-    request: PromotionRequest,
-    tx_manager: &TransactionManager,
-) -> PromotionResult;
 ```
 
-### `replication/snapshot.rs` — Full Reconstruction (Tier 3)
+### `snapshot.rs` — Snapshot Transfer (Tier 3 Recovery)
+
+**WHY HERE:** Full database reconstruction by streaming pages from a healthy node.
 
 ```rust
-pub struct SnapshotTransfer { /* ... */ }
+pub struct SnapshotSender {
+    storage: Arc<StorageEngine>,
+}
 
-impl SnapshotTransfer {
-    // Source side: stream data.db pages + buffered WAL
-    pub async fn send_snapshot(
-        database: &Database,
-        stream: &mut TcpStream,
-    ) -> Result<()>;
+impl SnapshotSender {
+    /// Stream a consistent snapshot of the entire data.db to a recovering node
+    /// 1. Begin read-only snapshot at current applied_ts
+    /// 2. Stream pages one by one with checksums
+    /// 3. Buffer new WAL records arriving during transfer
+    /// 4. Send buffered WAL records after page transfer completes
+    pub async fn send_snapshot(&self, conn: TcpStream) -> Result<()>;
+}
 
-    // Receiving side: write pages, then WAL, then finalize
-    pub async fn receive_snapshot(
-        db_dir: &Path,
-        stream: &mut TcpStream,
-        config: &DatabaseConfig,
-    ) -> Result<()>;
+pub struct SnapshotReceiver {
+    target_path: PathBuf,
+}
+
+impl SnapshotReceiver {
+    /// Receive a full snapshot and write to target path
+    /// 1. Receive pages, verify checksums, write to new data.db
+    /// 2. Receive WAL records, write to wal/
+    /// 3. Write meta.json with snapshot checkpoint_lsn
+    pub async fn receive_snapshot(&self, conn: TcpStream) -> Result<()>;
 }
 ```
 
-## Interfaces
+### `recovery_tiers.rs` — Recovery Tier Selection
 
-### Depends On
+**WHY HERE:** Determines which recovery strategy to use based on local state and primary WAL availability.
 
-| Layer | Interface |
-|---|---|
-| Layer 2 | `WalWriter::append()`, `WalReader::raw_bytes_from()`, `BufferPool`, `CheckpointManager` |
-| Layer 3 | `PrimaryIndex::insert_version()`, `SecondaryIndex::apply_delta()` |
-| Layer 5 | `TransactionManager::commit()`, `SubscriptionRegistry::check_invalidation()` |
+```rust
+pub enum RecoveryTier {
+    /// Tier 1: Incremental catch-up (replica briefly offline, WAL available)
+    IncrementalCatchup { from_lsn: Lsn },
+    /// Tier 2: Local crash recovery + incremental catch-up
+    LocalRecoveryThenCatchup,
+    /// Tier 3: Full reconstruction from snapshot
+    FullReconstruction,
+}
 
-### Exposes To
+/// Determine the appropriate recovery tier
+pub fn select_recovery_tier(
+    local_state: &LocalState,
+    primary_oldest_lsn: Lsn,
+) -> RecoveryTier;
 
-| Consumer | Interface |
-|---|---|
-| Layer 5 (commit protocol) | `PrimaryReplicationServer::broadcast_and_wait()` |
-| Layer 7 (session, for replica writes) | `promote_transaction()` |
-| `database.rs` | `ReplicaClient::start()`, `PrimaryReplicationServer::start()` |
-
-## Replication Flow Diagram
-
-```
-                PRIMARY                                          REPLICA
-  ┌──────────────────────────────┐                  ┌──────────────────────────────┐
-  │  Writer Task                 │                  │  ReplicaClient               │
-  │                              │                  │                              │
-  │  commit → WAL record         │                  │                              │
-  │           │                  │   TCP stream     │                              │
-  │           ├──── WAL bytes ──────────────────────▶│  receive WAL record          │
-  │           │                  │                  │  │                            │
-  │           │                  │                  │  ├── write to local WAL       │
-  │           │                  │                  │  ├── apply to page store      │
-  │           │                  │                  │  ├── update indexes           │
-  │           │                  │                  │  ├── invalidate local subs    │
-  │           │                  │                  │  │                            │
-  │           │      ack         │                  │  ├── send ACK ───────────────▶│
-  │           │◀─────────────────────────────────────  │                            │
-  │           │                  │                  │  └── advance applied_ts       │
-  │  advance latest_committed_ts │                  │                              │
-  │  notify client               │                  │                              │
-  └──────────────────────────────┘                  └──────────────────────────────┘
+pub struct LocalState {
+    pub data_file_exists: bool,
+    pub data_file_valid: bool,
+    pub wal_intact: bool,
+    pub applied_lsn: Option<Lsn>,
+}
 ```
 
-## Replica Recovery Tiers
+## Interfaces Exposed to Higher Layers
 
-```
-  Replica comes back online
-          │
-          ▼
-  ┌──────────────────────┐
-  │ Check local state    │
-  │ (disk intact? WAL?)  │
-  └──────────┬───────────┘
-             │
-     ┌───────┴────────┐
-     │ Disk intact?   │
-     └──┬──────────┬──┘
-        │yes       │no → TIER 3 (full reconstruction)
-        ▼
-  ┌──────────────────┐
-  │ Local recovery   │  (DWB + WAL replay)
-  │ (TIER 2)         │
-  └──────┬───────────┘
-         │
-  ┌──────▼───────────────┐
-  │ Check primary WAL    │
-  │ gap covered?         │
-  └──┬──────────────┬────┘
-     │yes           │no → TIER 3
-     ▼
-  ┌──────────────────┐
-  │ Incremental      │
-  │ catch-up (TIER 1)│
-  │ stream missing   │
-  │ WAL records      │
-  └──────────────────┘
-```
+| Interface | Used By | Purpose |
+|-----------|---------|---------|
+| `PrimaryReplicationServer::start` | Integration (startup) | Start replication |
+| `PrimaryReplicationServer::wait_for_ack` | L5 (commit step 8) | Synchronous replication |
+| `ReplicaClient::run` | Integration (startup) | Start replica |
+| `PromotionClient::promote` | L5 (commit on replica) | Write forwarding |
+| `SnapshotSender/Receiver` | Integration (recovery) | Full reconstruction |
+| `min_replica_lsn` | L2 (WAL retention) | Segment reclamation |

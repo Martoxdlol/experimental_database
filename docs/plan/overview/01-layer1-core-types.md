@@ -1,44 +1,78 @@
 # Layer 1: Core Types & Encoding
 
-## Purpose
-
-Provides foundational types, encoding, and ordering used by every other layer. No dependencies on higher layers.
+**Layer purpose:** Foundational types and encoding used by all higher layers. No I/O, no state, no dependencies on other layers. Pure data definitions and transformations.
 
 ## Modules
 
-### `types.rs` — Core Type Definitions
+### `types.rs` — Core Identifiers and Value Types
 
-All identifiers and domain types used across the system.
+**WHY HERE:** These are domain-agnostic identifiers and value types with no behavior beyond representation.
 
 ```rust
-// === Identifiers ===
-pub struct DocId(pub u128);          // 128-bit ULID
-pub struct CollectionId(pub u64);    // Monotonic within a database
-pub struct IndexId(pub u64);         // Monotonic within a database
-pub struct DatabaseId(pub u64);      // Monotonic (system catalog)
-pub struct TxId(pub u64);           // Transaction identifier
-pub type Ts = u64;                   // Monotonic logical timestamp
-pub type Lsn = u64;                 // WAL byte offset (Log Sequence Number)
-pub type PageId = u32;              // Page identifier in data.db
-pub type FrameId = u32;             // Buffer pool frame index
-pub type QueryId = u32;             // Per-transaction query counter
-pub type SubscriptionId = u64;      // Global subscription identifier
+/// 128-bit ULID document identifier
+pub struct DocId([u8; 16]);
 
-// === Field Paths ===
-pub struct FieldPath(pub Vec<String>);  // ["user", "email"] for nested
+/// Monotonic collection identifier
+pub struct CollectionId(u64);
 
-// === Scalar Values (for index keys and filter evaluation) ===
+/// Monotonic index identifier
+pub struct IndexId(u64);
+
+/// Monotonic database identifier
+pub struct DatabaseId(u64);
+
+/// Logical timestamp for MVCC
+pub type Ts = u64;
+
+/// Transaction identifier
+pub type TxId = u64;
+
+/// Scalar values for index comparisons and filter evaluation
 pub enum Scalar {
-    Undefined,
     Null,
     Int64(i64),
     Float64(f64),
     Boolean(bool),
     String(String),
     Bytes(Vec<u8>),
+    Id(DocId),
 }
 
-// === Filter Expressions (used by query engine + protocol) ===
+/// Type ordering tag (section 1.6)
+pub enum TypeTag {
+    Undefined = 0x00,
+    Null      = 0x01,
+    Int64     = 0x02,
+    Float64   = 0x03,
+    Boolean   = 0x04,
+    String    = 0x05,
+    Bytes     = 0x06,
+    Array     = 0x07,
+}
+```
+
+### `field_path.rs` — Field Path Representation
+
+**WHY HERE:** A pure data structure representing nested document field paths, used throughout query/index/filter layers.
+
+```rust
+/// Identifies a (possibly nested) field within a document
+pub struct FieldPath {
+    segments: Vec<String>,
+}
+
+impl FieldPath {
+    pub fn new(segments: Vec<String>) -> Self;
+    pub fn single(name: &str) -> Self;
+    pub fn segments(&self) -> &[String];
+}
+```
+
+### `filter.rs` — Filter Expression AST
+
+**WHY HERE:** Pure AST representation of filter expressions, used by query engine and subscriptions. No evaluation logic here.
+
+```rust
 pub enum Filter {
     Eq(FieldPath, Scalar),
     Ne(FieldPath, Scalar),
@@ -52,7 +86,7 @@ pub enum Filter {
     Not(Box<Filter>),
 }
 
-// === Index Range Expressions ===
+/// Index range expression (section 4.3)
 pub enum RangeExpr {
     Eq(FieldPath, Scalar),
     Gt(FieldPath, Scalar),
@@ -60,69 +94,61 @@ pub enum RangeExpr {
     Lt(FieldPath, Scalar),
     Lte(FieldPath, Scalar),
 }
+```
 
-// === Page Types ===
-pub enum PageType {
-    BTreeInternal = 0x01,
-    BTreeLeaf = 0x02,
-    Heap = 0x03,
-    Overflow = 0x04,
-    Free = 0x05,
-    FileHeaderShadow = 0x06,
-}
+### `encoding.rs` — Document Encoding (BSON/JSON)
 
-// === Document Body ===
-pub type Document = bson::Document;  // BSON document (via bson crate)
+**WHY HERE:** Serialization/deserialization of documents to/from binary and text formats. Pure encoding with no storage concerns.
+
+```rust
+/// Encode a serde_json::Value to BSON bytes
+pub fn encode_document(doc: &serde_json::Value) -> Result<Vec<u8>>;
+
+/// Decode BSON bytes to serde_json::Value
+pub fn decode_document(bson: &[u8]) -> Result<serde_json::Value>;
+
+/// Apply RFC 7396 merge-patch
+pub fn apply_patch(base: &mut serde_json::Value, patch: &serde_json::Value);
+
+/// Apply _meta.unset field removal
+pub fn apply_unset(doc: &mut serde_json::Value, unset: &[FieldPath]);
+
+/// Extract a scalar value at a field path
+pub fn extract_scalar(doc: &serde_json::Value, path: &FieldPath) -> Option<Scalar>;
+
+/// Extract values at a field path (array-aware: returns multiple for arrays)
+pub fn extract_scalars(doc: &serde_json::Value, path: &FieldPath) -> Vec<Scalar>;
+
+/// Strip _meta from document root, return parsed meta
+pub fn strip_meta(doc: &mut serde_json::Value) -> Option<MetaInfo>;
+
+/// Parse _meta.types for JSON wire format type hints
+pub fn apply_type_hints(doc: &mut serde_json::Value, types: &serde_json::Value);
 ```
 
 ### `ulid.rs` — ULID Generation
 
-```rust
-pub trait UlidGenerator {
-    fn generate(&self) -> DocId;
-}
-
-// Crockford Base32 encode/decode
-pub fn encode_ulid(id: DocId) -> String;          // 26-char lowercase
-pub fn decode_ulid(s: &str) -> Result<DocId>;     // case-insensitive
-```
-
-### `encoding.rs` — Document Encoding
+**WHY HERE:** Pure ID generation with no dependencies on storage or domain logic.
 
 ```rust
-// BSON ↔ bytes
-pub fn encode_document(doc: &Document) -> Vec<u8>;
-pub fn decode_document(bytes: &[u8]) -> Result<Document>;
+/// Generate a new ULID with current timestamp
+pub fn generate_ulid() -> DocId;
 
-// JSON wire format with _meta.types support
-pub fn json_to_document(json: &serde_json::Value) -> Result<Document>;
-pub fn document_to_json(doc: &Document) -> serde_json::Value;
+/// Encode DocId as 26-char Crockford Base32
+pub fn encode_ulid(id: &DocId) -> String;
 
-// Field extraction from documents
-pub fn extract_field(doc: &Document, path: &FieldPath) -> Option<Scalar>;
-pub fn extract_field_value(doc: &Document, path: &FieldPath) -> Option<bson::Bson>;
-
-// Patch application (RFC 7396 merge-patch + _meta.unset)
-pub fn apply_patch(base: &Document, patch: &Document) -> Document;
+/// Decode Crockford Base32 string to DocId (case-insensitive)
+pub fn decode_ulid(s: &str) -> Result<DocId>;
 ```
 
 ## Interfaces Exposed to Higher Layers
 
-| Consumer Layer | Types/Functions Used |
-|---|---|
-| Layer 2 (Storage) | `DocId`, `CollectionId`, `IndexId`, `Lsn`, `PageId`, `PageType`, `Document`, `Ts` |
-| Layer 3 (Indexing) | `Scalar`, `FieldPath`, `extract_field()`, `DocId`, `Ts` |
-| Layer 4 (Query) | `Filter`, `RangeExpr`, `FieldPath`, `Scalar`, `QueryId` |
-| Layer 5 (Transactions) | `TxId`, `Ts`, `DocId`, `CollectionId`, `IndexId` |
-| Layer 6 (Replication) | `Lsn`, `Ts`, `DatabaseId` |
-| Layer 7 (Protocol) | `Filter`, `RangeExpr`, `json_to_document()`, `encode_ulid()`/`decode_ulid()` |
-
-## Type Ordering
-
-The `Scalar` enum implements `Ord` following the total ordering from DESIGN.md §1.6:
-
-```
-Undefined < Null < Int64 < Float64 < Boolean < String < Bytes
-```
-
-Within each type: natural ordering. Int64 and Float64 are **distinct** — no cross-type numeric comparison.
+| Interface | Used By |
+|-----------|---------|
+| `DocId`, `CollectionId`, `IndexId`, `Ts`, `TxId` | All layers |
+| `Scalar`, `TypeTag` | L3 (key encoding), L4 (filter eval) |
+| `FieldPath` | L3, L4, L5, L7 |
+| `Filter`, `RangeExpr` | L4 (query planning), L5 (subscriptions), L7 (message parsing) |
+| `encode_document`, `decode_document` | L3 (doc store), L7 (wire protocol) |
+| `apply_patch`, `extract_scalar` | L3 (doc mutations), L4 (post-filter eval) |
+| `generate_ulid`, `encode_ulid`, `decode_ulid` | L3 (insert), L7 (API) |

@@ -1,0 +1,211 @@
+# Layer 3: Document Store & Indexing
+
+**Layer purpose:** Adds document/MVCC semantics on top of Layer 2 storage primitives. This is where domain concepts (DocId, timestamps, tombstones, version resolution) enter the system. The primary B-tree IS the document store — it is both storage and primary index (clustered). This layer uses Layer 2 `BTreeHandle` but adds all document-aware logic.
+
+## Modules
+
+### `key_encoding.rs` — Order-Preserving Key Encoding
+
+**WHY HERE:** Converts domain-typed scalars into byte-comparable keys for B-tree storage. Requires knowledge of the type ordering (section 1.6) and encoding rules (section 3.4) — these are document/domain concepts that Layer 2 doesn't need.
+
+```rust
+use crate::core::types::{Scalar, TypeTag, DocId, Ts};
+
+/// Encode a scalar value into an order-preserving byte representation
+pub fn encode_scalar(scalar: &Scalar) -> Vec<u8>;
+
+/// Decode an order-preserving byte representation back to a scalar
+pub fn decode_scalar(data: &[u8]) -> Result<(Scalar, usize)>;  // returns (value, bytes_consumed)
+
+/// Construct primary index key: doc_id[16] || inv_ts[8]
+pub fn make_primary_key(doc_id: &DocId, ts: Ts) -> [u8; 24];
+
+/// Parse a primary key back into components
+pub fn parse_primary_key(key: &[u8]) -> Result<(DocId, Ts)>;
+
+/// Construct secondary index key: type_tag[1] || encoded_value || doc_id[16] || inv_ts[8]
+pub fn make_secondary_key(values: &[Scalar], doc_id: &DocId, ts: Ts) -> Vec<u8>;
+
+/// Parse secondary key suffix to extract doc_id and ts
+pub fn parse_secondary_key_suffix(key: &[u8]) -> Result<(DocId, Ts)>;
+
+/// Compute inverted timestamp for descending sort within doc_id group
+pub fn inv_ts(ts: Ts) -> u64 { u64::MAX - ts }
+
+/// Compute successor key for range bounds
+pub fn successor_key(key: &[u8]) -> Vec<u8>;
+```
+
+### `primary_index.rs` — Document Store (Clustered Primary B-Tree)
+
+**WHY HERE:** Adds MVCC version semantics on top of the raw B-tree. Constructs `doc_id||inv_ts` keys, handles tombstones, makes inline-vs-heap decisions. This is where "insert a document" becomes "insert a versioned entry in a B-tree".
+
+```rust
+use crate::storage::BTreeHandle;
+use crate::storage::HeapRef;
+use crate::core::types::{DocId, Ts};
+
+pub struct PrimaryIndex {
+    btree: BTreeHandle,
+    heap: Arc<Heap>,
+    external_threshold: usize,
+}
+
+/// Cell flags stored in the B-tree value
+pub struct CellFlags {
+    pub tombstone: bool,
+    pub external: bool,
+}
+
+impl PrimaryIndex {
+    pub fn new(btree: BTreeHandle, heap: Arc<Heap>, external_threshold: usize) -> Self;
+
+    /// Insert a new document version (used at commit time)
+    /// Constructs key = doc_id || inv_ts(commit_ts)
+    /// Value = flags[1] || body_len[4] || body (inline) or heap_ref (external)
+    pub fn insert_version(&self, doc_id: &DocId, commit_ts: Ts,
+                          body: Option<&[u8]>) -> Result<()>;
+    // body=None means tombstone (delete)
+
+    /// Get the latest visible version of a document at read_ts
+    /// Seeks to doc_id || inv_ts(read_ts), takes first entry with ts <= read_ts
+    /// Returns None if tombstone or doc doesn't exist
+    pub fn get_at_ts(&self, doc_id: &DocId, read_ts: Ts) -> Result<Option<Vec<u8>>>;
+
+    /// Get the latest visible version's timestamp (for verification)
+    pub fn get_version_ts(&self, doc_id: &DocId, read_ts: Ts) -> Result<Option<Ts>>;
+
+    /// Scan all visible document versions at read_ts
+    pub fn scan_at_ts(&self, read_ts: Ts, direction: ScanDirection) -> PrimaryScanner;
+
+    /// Internal: decide inline vs external storage
+    fn store_body(&self, body: &[u8]) -> Result<StoredBody>;
+    fn load_body(&self, value: &[u8]) -> Result<Vec<u8>>;
+}
+
+enum StoredBody {
+    Inline(Vec<u8>),
+    External(HeapRef),
+}
+
+/// Iterator over visible documents in primary index
+pub struct PrimaryScanner { /* ... */ }
+impl Iterator for PrimaryScanner {
+    type Item = Result<(DocId, Ts, Vec<u8>)>;  // (doc_id, version_ts, body)
+}
+```
+
+### `secondary_index.rs` — Secondary Index with Version Resolution
+
+**WHY HERE:** Adds MVCC-aware scanning to secondary index B-trees. Must resolve versions and skip stale entries — requires domain knowledge of timestamps and doc_ids.
+
+```rust
+use crate::storage::BTreeHandle;
+
+pub struct SecondaryIndex {
+    btree: BTreeHandle,
+    primary: Arc<PrimaryIndex>,
+}
+
+impl SecondaryIndex {
+    pub fn new(btree: BTreeHandle, primary: Arc<PrimaryIndex>) -> Self;
+
+    /// Insert a secondary index entry for a document version
+    pub fn insert_entry(&self, encoded_key: &[u8], doc_id: &DocId, ts: Ts) -> Result<()>;
+
+    /// Remove a secondary index entry
+    pub fn remove_entry(&self, encoded_key: &[u8], doc_id: &DocId, ts: Ts) -> Result<()>;
+
+    /// Scan with version resolution (section 3.5)
+    /// For each (doc_id, inv_ts):
+    ///   - Skip if version_ts > read_ts
+    ///   - Within same doc_id: take first (highest ts <= read_ts), skip rest
+    ///   - Verify against primary index (skip stale entries)
+    pub fn scan_at_ts(&self, lower: &[u8], upper: Bound<&[u8]>,
+                      read_ts: Ts, direction: ScanDirection) -> SecondaryScanner;
+}
+
+/// Iterator yielding verified (doc_id, version_ts) pairs from secondary index
+pub struct SecondaryScanner { /* ... */ }
+impl Iterator for SecondaryScanner {
+    type Item = Result<(DocId, Ts)>;
+}
+```
+
+### `version_resolution.rs` — MVCC Version Resolution Logic
+
+**WHY HERE:** Encapsulates the shared MVCC resolution algorithm used by both primary and secondary scans. Domain logic that requires understanding of timestamps and tombstones.
+
+```rust
+/// Given a stream of (doc_id, ts) pairs from a B-tree scan,
+/// resolve to the latest visible version per doc_id at read_ts
+pub struct VersionResolver {
+    read_ts: Ts,
+    current_doc_id: Option<DocId>,
+    found_visible: bool,
+}
+
+impl VersionResolver {
+    pub fn new(read_ts: Ts) -> Self;
+
+    /// Process next entry. Returns Some(ts) if this is the visible version,
+    /// None if it should be skipped.
+    pub fn process(&mut self, doc_id: &DocId, ts: Ts) -> Option<Ts>;
+
+    /// Check if a version is visible at read_ts
+    pub fn is_visible(ts: Ts, read_ts: Ts) -> bool { ts <= read_ts }
+}
+```
+
+### `array_indexing.rs` — Array Index Entry Expansion
+
+**WHY HERE:** Handles the domain-specific rule that array fields produce one index entry per element. Requires knowledge of document structure and scalar extraction.
+
+```rust
+use crate::core::types::{Scalar, FieldPath, DocId, Ts};
+use crate::core::encoding::extract_scalars;
+
+/// For a document, compute all secondary index entries for a given index definition
+/// Handles single fields, compound fields, and array expansion
+/// Returns: Vec of (encoded_key_prefix) — caller appends doc_id || inv_ts
+pub fn compute_index_entries(
+    doc: &serde_json::Value,
+    field_paths: &[FieldPath],
+) -> Result<Vec<Vec<u8>>>;
+// Validates: at most one array field in compound index
+```
+
+### `index_builder.rs` — Background Index Building
+
+**WHY HERE:** Scans the primary B-tree at a snapshot timestamp and inserts entries into a Building secondary index. Requires MVCC snapshot semantics.
+
+```rust
+pub struct IndexBuilder {
+    primary: Arc<PrimaryIndex>,
+    secondary: SecondaryIndex,
+    field_paths: Vec<FieldPath>,
+}
+
+impl IndexBuilder {
+    pub fn new(primary: Arc<PrimaryIndex>, secondary: SecondaryIndex,
+               field_paths: Vec<FieldPath>) -> Self;
+
+    /// Run background build: scan primary at build_snapshot_ts,
+    /// insert entries into secondary index
+    pub async fn build(&self, build_snapshot_ts: Ts) -> Result<()>;
+}
+```
+
+## Interfaces Exposed to Higher Layers
+
+| Interface | Used By | Purpose |
+|-----------|---------|---------|
+| `PrimaryIndex::insert_version` | L5 (commit) | Apply mutations |
+| `PrimaryIndex::get_at_ts` | L4 (point read) | Document retrieval |
+| `PrimaryIndex::scan_at_ts` | L4 (table scan) | Full collection iteration |
+| `SecondaryIndex::scan_at_ts` | L4 (index scan) | Range queries with MVCC |
+| `SecondaryIndex::insert_entry/remove_entry` | L5 (commit, vacuum) | Index maintenance |
+| `make_primary_key`, `make_secondary_key` | L5 (read set, conflict detection) | Key encoding for intervals |
+| `compute_index_entries` | L5 (index delta computation) | Index key generation |
+| `IndexBuilder::build` | Integration (background task) | Index backfill |
+| `key_encoding::encode_scalar` | L4 (range encoder) | Query range to byte interval |

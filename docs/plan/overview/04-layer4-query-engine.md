@@ -1,36 +1,44 @@
 # Layer 4: Query Engine
 
-## Purpose
+**Layer purpose:** Query planning, range encoding, scan execution, post-filter evaluation, read-your-writes merge, and read set interval generation. Translates user queries into Layer 3 operations and produces read set intervals for Layer 5.
 
-Translates high-level query requests into index operations. Implements the three-stage pipeline: Source → Post-Filter → Terminal. Produces read set intervals for OCC/subscriptions.
+## Modules
 
-## Sub-Modules
+### `planner.rs` — Query Planning
 
-### `query/planner.rs` — Query Planning
+**WHY HERE:** Selects the access method (primary get, index scan, table scan) based on the query parameters. Requires knowledge of indexes and their states — domain-aware decision making.
 
 ```rust
+use crate::core::types::{CollectionId, IndexId, DocId, Ts, FieldPath};
+use crate::core::filter::{Filter, RangeExpr};
+
+/// Query plan produced by the planner
 pub enum QueryPlan {
+    /// Point lookup by document ID
     PrimaryGet {
         collection_id: CollectionId,
         doc_id: DocId,
     },
+    /// Range scan on a named index
     IndexScan {
         collection_id: CollectionId,
         index_id: IndexId,
-        lower_bound: Vec<u8>,          // Encoded key (inclusive)
-        upper_bound: Bound<Vec<u8>>,   // Excluded or Unbounded
+        lower_bound: Vec<u8>,       // encoded byte interval
+        upper_bound: Bound<Vec<u8>>,
         direction: ScanDirection,
         post_filter: Option<Filter>,
         limit: Option<usize>,
     },
+    /// Full collection scan via _created_at index
     TableScan {
         collection_id: CollectionId,
+        direction: ScanDirection,
         post_filter: Option<Filter>,
         limit: Option<usize>,
-        direction: ScanDirection,
     },
 }
 
+/// Plan a query based on the specified index and range expressions
 pub fn plan_query(
     catalog: &CatalogCache,
     collection: &str,
@@ -42,123 +50,94 @@ pub fn plan_query(
 ) -> Result<QueryPlan>;
 ```
 
-### `query/range.rs` — Index Range Expression Encoding
+### `range_encoder.rs` — Range Expression to Byte Interval
 
-Converts `RangeExpr` predicates into byte interval bounds.
+**WHY HERE:** Translates typed range expressions into byte intervals on the encoded key space. Requires knowledge of order-preserving key encoding (Layer 3) and index field definitions.
 
 ```rust
-pub struct IndexRange {
-    pub lower: Vec<u8>,
-    pub upper: Bound<Vec<u8>>,
-}
+use crate::core::filter::RangeExpr;
+use crate::docstore::key_encoding;
 
+/// Encode range expressions into a contiguous byte interval
+/// Follows the rules from section 4.3
 pub fn encode_range(
-    index_fields: &[FieldPath],
-    range_exprs: &[RangeExpr],
-) -> Result<IndexRange>;
+    field_paths: &[FieldPath],
+    range: &[RangeExpr],
+) -> Result<(Vec<u8>, Bound<Vec<u8>>)>;
+// Returns (lower_bound, upper_bound)
 
-// Validates range expression ordering rules (§4.3)
-pub fn validate_range_exprs(
-    index_fields: &[FieldPath],
-    range_exprs: &[RangeExpr],
+/// Validate range expressions against index field order
+pub fn validate_range(
+    field_paths: &[FieldPath],
+    range: &[RangeExpr],
 ) -> Result<()>;
 ```
 
-### `query/scan.rs` — Scan Execution
+### `scan.rs` — Scan Execution
+
+**WHY HERE:** Orchestrates the Source → PostFilter → Terminal pipeline. Drives Layer 3 iterators and collects results.
 
 ```rust
-pub struct QueryResult {
-    pub query_id: QueryId,
-    pub docs: Vec<Document>,
-    pub read_intervals: Vec<ReadInterval>,  // For read set
-}
+use crate::docstore::{PrimaryIndex, SecondaryIndex};
 
+/// Execute a query plan and return matching documents
 pub fn execute_query(
     plan: &QueryPlan,
-    read_ts: Ts,
-    query_id: QueryId,
-    primary: &PrimaryIndex,
+    primary_index: &PrimaryIndex,
     secondary_indexes: &HashMap<IndexId, SecondaryIndex>,
-    write_set: Option<&WriteSet>,  // For read-your-writes
+    read_ts: Ts,
+    write_set: Option<&WriteSet>,  // for read-your-writes
 ) -> Result<QueryResult>;
+
+pub struct QueryResult {
+    pub docs: Vec<serde_json::Value>,
+    pub read_intervals: Vec<ReadInterval>,  // for read set
+    pub scanned_docs: usize,
+    pub scanned_bytes: usize,
+}
 ```
 
-### `query/filter.rs` — Post-Filter Evaluation
+### `post_filter.rs` — Filter Evaluation
+
+**WHY HERE:** Evaluates arbitrary filter expressions against documents. Requires scalar extraction and comparison logic — domain-aware evaluation.
 
 ```rust
-pub fn filter_matches(doc: &Document, filter: &Filter) -> bool;
+use crate::core::types::Scalar;
+use crate::core::filter::Filter;
+use crate::core::encoding::extract_scalar;
 
-// Internal: extract field + compare
-fn evaluate_comparison(doc: &Document, path: &FieldPath, op: CompareOp, value: &Scalar) -> bool;
+/// Evaluate a filter expression against a document
+pub fn filter_matches(doc: &serde_json::Value, filter: &Filter) -> bool;
+
+/// Compare two scalars (type-strict, per section 1.6)
+pub fn compare_scalars(a: &Scalar, b: &Scalar) -> Option<Ordering>;
 ```
 
-## Interfaces
+### `merge.rs` — Read-Your-Own-Writes Merge
 
-### Depends On (lower layers)
+**WHY HERE:** Merges snapshot results with the in-memory write set to provide read-your-writes within a transaction. Requires knowledge of write set structure (domain-specific).
 
-| Layer | Interface Used |
-|---|---|
-| Layer 3 | `PrimaryIndex::get_at_ts()`, `SecondaryIndex::scan_range_at_ts()`, `PrimaryIndex::scan_at_ts()` |
-| Layer 2 | `CatalogCache` (resolve collection name → ID, index name → meta) |
-| Layer 1 | `Filter`, `RangeExpr`, `Scalar`, `FieldPath`, `encode_scalar()` |
+```rust
+use crate::tx::WriteSet;
 
-### Exposes To (higher layers)
-
-| Consumer | Interface |
-|---|---|
-| Layer 5 (Transactions) | `plan_query()`, `execute_query()` — called within transaction context |
-| Layer 7 (Protocol) | Indirectly via transaction sessions |
-
-## Query Pipeline Diagram
-
-```
-  Client query message
-         │
-         ▼
-  ┌──────────────┐
-  │ plan_query() │  Resolve index, validate range, encode bounds
-  └──────┬───────┘
-         │ QueryPlan
-         ▼
-  ┌──────────────┐
-  │ SOURCE       │  PrimaryGet / IndexScan / TableScan
-  │              │  → stream of (doc_id, document) in key order
-  └──────┬───────┘
-         │ documents
-         ▼
-  ┌──────────────┐
-  │ POST-FILTER  │  filter_matches(doc, filter)
-  │ (optional)   │  → skip non-matching docs
-  └──────┬───────┘
-         │ filtered docs
-         ▼
-  ┌──────────────┐
-  │ TERMINAL     │  collect / first / limit(N)
-  │              │  → stop when limit reached
-  └──────┬───────┘
-         │
-         ▼
-  ┌──────────────────┐
-  │ ReadInterval     │  Record scanned byte range
-  │ (for read set)   │  Apply limit-aware tightening
-  └──────────────────┘
-         │
-         ▼
-     QueryResult { query_id, docs, read_intervals }
+/// Merge snapshot scan results with write set for read-your-writes
+/// - Documents inserted in write set that match the query: include
+/// - Documents deleted in write set: exclude
+/// - Documents modified in write set: use write set version
+pub fn merge_with_write_set(
+    snapshot_results: Vec<(DocId, serde_json::Value)>,
+    write_set: &WriteSet,
+    collection_id: CollectionId,
+    filter: Option<&Filter>,
+) -> Vec<(DocId, serde_json::Value)>;
 ```
 
-## Read-Your-Writes Integration
+## Interfaces Exposed to Higher Layers
 
-When executing within a write transaction, the scan merges results from the snapshot with the write set:
-
-```
-  Snapshot at read_ts   +   WriteSet
-         │                      │
-         ▼                      ▼
-  ┌──────────────────────────────────┐
-  │        Merge Strategy            │
-  │  • Inserted docs: include       │
-  │  • Deleted docs: exclude        │
-  │  • Modified docs: use write set │
-  └──────────────────────────────────┘
-```
+| Interface | Used By | Purpose |
+|-----------|---------|---------|
+| `plan_query` | L5 (transaction commit), L7 (query message handling) | Query planning |
+| `execute_query` | L7 (query message handling) | Full query execution |
+| `QueryResult.read_intervals` | L5 (read set recording) | OCC and subscriptions |
+| `filter_matches` | L4 internal (post-filter), L5 (subscription eval) | Filter evaluation |
+| `encode_range` | L5 (read set interval construction) | Byte interval generation |

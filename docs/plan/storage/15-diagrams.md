@@ -117,7 +117,8 @@ insert(key=M, value=...)
 │          right_sibling = X                        │
 │                                                   │
 │ 1. Allocate new_page from free_list              │
-│ 2. Find median (D or E)                          │
+│ 2. Split after D; E becomes first key of new leaf;│
+│    promote E to parent                            │
 │ 3. Move upper half to new_page:                  │
 │                                                   │
 │    old_leaf[A B C D]     new_leaf[E F G H]       │
@@ -409,6 +410,8 @@ Overflow Page (page 44)
 │  page_type = OVERFLOW                                    │
 │  next_page: 51  ─────────────────────────────────────┐   │
 ├──────────────────────────────────────────────────────┤   │
+│ data_length: u32                                      │   │
+├──────────────────────────────────────────────────────┤   │
 │                                                       │   │
 │ [========== 4076 bytes of blob data =============]   │   │
 │                                                       │   │
@@ -422,6 +425,8 @@ Overflow Page (page 51)
 │ PageHeader                                                │
 │  page_type = OVERFLOW                                    │
 │  next_page: 0  ← END OF CHAIN                           │
+├──────────────────────────────────────────────────────────┤
+│ data_length: u32                                          │
 ├──────────────────────────────────────────────────────────┤
 │                                                           │
 │ [========== remaining 4124 bytes of blob data ========]  │

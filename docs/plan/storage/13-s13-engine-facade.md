@@ -60,12 +60,14 @@ pub struct FileHeader {
     pub free_list_head: U32<LittleEndian>,      // PageId
     pub catalog_root_page: U32<LittleEndian>,   // PageId
     pub catalog_name_root_page: U32<LittleEndian>, // by-name B-tree root
-    pub _padding: U32<LittleEndian>,            // align to 8-byte boundary
+    pub _reserved: [u8; 4],                     // reserved for future use
     pub next_collection_id: U64<LittleEndian>,
     pub next_index_id: U64<LittleEndian>,
     pub checkpoint_lsn: U64<LittleEndian>,      // Lsn
     pub created_at: U64<LittleEndian>,          // millis since epoch
 }
+// Layout is packed (zerocopy LE wrapper types have alignment 1).
+// Total size: 4+4+4+8+4+4+4+4+8+8+8+8 = 68 bytes.
 // Remainder of page 0 is zeroed (reserved for future fields).
 
 impl FileHeader {
@@ -87,8 +89,7 @@ pub struct StorageEngine {
     wal_writer: Arc<WalWriter>,
     wal_reader: WalReader,
     heap: Mutex<Heap>,
-    dwb: Option<DoubleWriteBuffer>,
-    checkpoint: Checkpoint,
+    checkpoint: Checkpoint,  // owns the DWB (if durable)
     vacuum_task: VacuumTask,
 
     // Metadata
@@ -123,10 +124,15 @@ impl StorageEngine {
     pub fn open_in_memory(config: StorageConfig) -> Result<Self>;
 
     /// Open with custom backends.
+    /// If the backend is durable and `handler` is Some, runs recovery.
+    /// If the backend is durable and `handler` is None, recovery is skipped
+    /// (caller's responsibility to ensure consistency).
+    /// If the backend is not durable, `handler` is ignored.
     pub fn open_with_backend(
         page_storage: Arc<dyn PageStorage>,
         wal_storage: Arc<dyn WalStorage>,
         config: StorageConfig,
+        handler: Option<&mut dyn WalRecordHandler>,
     ) -> Result<Self>;
 
     /// Close the engine: final checkpoint, flush, shutdown WAL writer.
@@ -258,14 +264,14 @@ StorageEngine::open_in_memory(config):
 
 ### open_with_backend()
 
-Like open_in_memory() but with user-provided backends. Checks `page_storage.is_durable()` to determine DWB/checkpoint behavior.
+Like open_in_memory() but with user-provided backends. Checks `page_storage.is_durable()` to determine DWB/checkpoint behavior. If the backend is durable and `handler` is `Some`, recovery runs automatically (same as `open()`). If the backend is durable and `handler` is `None`, recovery is skipped — the caller is responsible for ensuring consistency. If the backend is not durable, `handler` is ignored and no recovery runs.
 
 ### close()
 
 ```
 1. Run final checkpoint (if durable)
 2. Shutdown WAL writer
-3. Flush buffer pool (write remaining dirty pages via DWB if durable)
+3. Flush buffer pool (discard remaining clean frames)
 4. Write final file header to page 0
 5. page_storage.sync()
 ```

@@ -152,13 +152,15 @@ Like the free list, the heap is accessed only by the single writer for store/fre
 With `page_size = 8192`, the usable data per overflow page is:
 
 ```
-8192 - 32 (PageHeader) - 4 (next_overflow_page) - 4 (data_length) = 8152 bytes
+8192 - 32 (PageHeader) - 4 (data_length) = 8156 bytes
 ```
+
+Note: `next_overflow_page` is stored in `PageHeader.prev_or_ptr` (part of the 32-byte header), so it is not subtracted again.
 
 As a safety limit, the maximum overflow chain length is capped at ~2000 pages, giving:
 
 ```
-2000 × 8152 = 16,304,000 bytes ≈ 16 MB
+2000 × 8156 = 16,312,000 bytes ≈ 16 MB
 ```
 
 This is a configurable safety limit to prevent runaway chains from a single blob. It can be raised if needed, but keeping it bounded avoids unbounded I/O for a single `load()` call.

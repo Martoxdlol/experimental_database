@@ -51,7 +51,7 @@ impl DoubleWriteBuffer {
     ///   4. page_storage.sync()
     ///   5. Truncate dwb_path to 0
     ///   6. fsync dwb_path (the truncation)
-    pub fn write_pages(&self, pages: &[(PageId, &[u8])]) -> Result<()>;
+    pub fn write_pages(&self, pages: &[(PageId, Vec<u8>)]) -> Result<()>;
 
     /// Recover from a crash: restore any torn pages in page_storage from DWB.
     /// Returns the number of pages restored.
@@ -101,11 +101,11 @@ Checkpoint Flush via DWB:
    - checksum = CRC-32C of first 12 bytes
 3. For each (page_id, page_data) in pages:
    - Write page_id as u32 LE (4 bytes)
-   - Write page_data (page_size bytes)
+   - Write &page_data (page_size bytes)
 4. fsync dwb_path ← THIS IS THE CRITICAL POINT
    After this, all dirty pages are safely in the DWB.
 5. For each (page_id, page_data) in pages:
-   - page_storage.write_page(page_id, page_data)
+   - page_storage.write_page(page_id, &page_data)
 6. page_storage.sync()  ← data.db is now up to date
 7. Truncate dwb_path to 0
 8. fsync dwb_path

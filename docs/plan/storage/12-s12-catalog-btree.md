@@ -40,7 +40,6 @@ pub struct CollectionEntry {
     pub collection_id: u64,
     pub name: String,
     pub primary_root_page: PageId,
-    pub created_at_root_page: PageId,
     pub doc_count: u64,
 }
 
@@ -88,6 +87,7 @@ pub fn serialize_name_value(entity_id: u64) -> [u8; 8];
 pub fn deserialize_name_value(data: &[u8]) -> u64;
 
 // ─── Scan Helpers ───
+// Same entity_type prefix as ID tree — these are used in separate B-trees
 
 /// Scan prefix for all collections in the ID B-tree.
 pub fn collection_id_scan_prefix() -> [u8; 1];  // [0x01]
@@ -111,7 +111,6 @@ collection_id:         u64 LE    (8 bytes)
 name_len:              u16 LE    (2 bytes)
 name:                  [u8; name_len]
 primary_root_page:     u32 LE    (4 bytes)
-created_at_root_page:  u32 LE    (4 bytes)
 doc_count:             u64 LE    (8 bytes)
 ```
 

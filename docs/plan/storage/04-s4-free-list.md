@@ -62,7 +62,7 @@ A free page uses the standard page layout with `page_type = Free`. The `prev_or_
 ### allocate()
 
 1. If `head == 0` (list empty):
-   - Extend the file by 1 page: `page_storage.extend(current_count + 1)`.
+   - Extend the file by 1 page: `page_storage.extend(current_count + 1)` (accessed via `self.buffer_pool.page_storage().extend(...)`).
    - The new page_id = old page_count.
    - Return the new page_id. (Caller will initialize it.)
 2. If `head != 0` (list has pages):

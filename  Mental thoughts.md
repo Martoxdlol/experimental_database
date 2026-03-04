@@ -1,5 +1,7 @@
 # Mental thoughts
 
+Order of executing transactions:
+
 - transaction management order
 - client -> commit
 - commit to WAL and memory pages cache (single writer) - (WAL fsync) - (only locking process)
@@ -15,3 +17,5 @@
 The new thing is the indicator of the newest ready timestamp to read from on incoming transactions.
 This is needed to prevent the case when the primary makes data available to new transactions before the replication.
 If the primary fails before replication data loss occurs.
+
+I

@@ -103,9 +103,9 @@ impl BufferPool {
     /// Flush a specific page to the backend (for checkpoint use).
     pub fn flush_page(&self, page_id: PageId) -> Result<()>;
 
-    /// Snapshot all dirty frames: returns (page_id, page_data_copy) pairs.
+    /// Snapshot all dirty frames: returns (page_id, page_data_copy, lsn) tuples.
     /// Does NOT clear dirty flags (checkpoint does that after DWB write).
-    pub fn dirty_pages(&self) -> Vec<(PageId, Vec<u8>)>;
+    pub fn dirty_pages(&self) -> Vec<(PageId, Vec<u8>, Lsn)>;
 
     /// Mark a specific frame as clean (after checkpoint scatter-write).
     /// Only clears dirty if the frame's LSN hasn't changed since snapshot.
@@ -160,7 +160,7 @@ impl BufferPool {
 1. Acquire `page_table.read()`. Look up page_id. Not found → release page_table.
 2. Read page from backend into a **temporary buffer** (no latch held during I/O).
 3. Call `find_victim()` to get a free frame_id.
-4. Acquire `page_table.write()`. Check again if page_id was loaded by another thread (double-check). If so, use that frame. Otherwise insert `(page_id, frame_id)`.
+4. Acquire `page_table.write()`. Check again if page_id was loaded by another thread (double-check). If so, use that frame (SharedPageGuard::new() atomically increments pin_count as part of construction, before returning). Otherwise insert `(page_id, frame_id)`.
 5. Acquire `frames[frame_id].lock.write()`. Copy temp buffer into frame data. Set `page_id = Some(page_id)`, `dirty = false`, `ref_bit = true`. Atomically store `frames[frame_id].pin_count = 1` (Release ordering).
 6. Downgrade to read lock (or release write + acquire read). Return SharedPageGuard.
 
@@ -170,7 +170,7 @@ impl BufferPool {
 
 1. Start at `clock_hand.fetch_add(1) % frame_count`.
 2. Scan frames in a circle:
-   a. If `frame.pin_count.load(Acquire) > 0`, skip (frame is pinned — no need to acquire the lock).
+   a. If `frame.pin_count.load(Acquire) > 0`, skip (frame is pinned — optimization to skip obviously-pinned frames without attempting the lock).
    b. Try to acquire `frame.lock.try_write()`. If fails (frame in use), skip.
    c. If `dirty`, skip (dirty frames are NOT evicted — checkpoint flushes them).
    d. If `ref_bit`, clear it, skip (second chance).
@@ -195,9 +195,9 @@ Same as fetch_page_shared() but acquire write lock on the frame instead of read 
 
 1. Iterate all frames.
 2. For each frame, acquire read lock briefly.
-3. If dirty and page_id is Some: copy data to output vec, record page_id and LSN.
+3. If dirty and page_id is Some: copy data to output vec, record page_id, data, and LSN.
 4. Release lock.
-5. Return all (page_id, data) pairs.
+5. Return all (page_id, data, lsn) tuples.
 
 ### mark_clean()
 

@@ -7,16 +7,18 @@ Define the locking hierarchy and rules to prevent deadlocks in the storage engin
 ## Latch Hierarchy (Strict Ordering)
 
 ```
-Level 1 (outermost):  page_table: RwLock<HashMap<PageId, FrameId>>
-Level 2:              frame[i].lock: RwLock<FrameData>
-Level 3 (innermost):  free_list: Mutex<FreeList>
+Level 1 (outermost):  free_list: Mutex<FreeList>
                       heap: Mutex<Heap>
                       file_header: Mutex<FileHeader>
+Level 2:              page_table: RwLock<HashMap<PageId, FrameId>>
+Level 3 (innermost):  frame[i].lock: RwLock<FrameData>
 ```
 
-**Rule 1**: Never acquire a higher-level lock while holding a lower-level lock.
-- Never acquire page_table while holding a frame lock.
-- Never acquire a frame lock while holding free_list/heap/file_header mutex.
+**Rule 1**: When both a component mutex (free_list, heap, file_header) and frame locks are needed, acquire the component mutex FIRST, then frame locks.
+- This matches the actual call pattern: `BTree::insert()` receives `&mut FreeList` (already locked by caller), then acquires frame locks during traversal and splits (S6).
+- `VacuumTask::remove_entries()` holds `&mut FreeList` while calling `BTree::delete()`, which acquires frame locks (S11).
+- `Heap` operations hold the heap mutex while accessing pages through the buffer pool (S7).
+- Never acquire a component mutex (free_list, heap, file_header) while holding a frame lock.
 
 **Rule 2**: page_table lock is held briefly — never during I/O.
 - Acquire page_table.read() → lookup frame_id → release.
@@ -159,7 +161,7 @@ During a root split, a new root page is allocated (which may have a **higher** `
 
 | # | Rule | Reason |
 |---|------|--------|
-| 1 | page_table before frame locks | Hierarchy prevents deadlock |
+| 1 | Component mutexes (free_list, heap, file_header) before page_table before frame locks | Hierarchy prevents deadlock |
 | 2 | page_table held briefly, never during I/O | Prevents blocking all page access |
 | 3 | Multiple frames: ascending page_id order | Prevents A-B/B-A deadlock |
 | 4 | No frame locks across I/O or await | Prevents async deadlocks |

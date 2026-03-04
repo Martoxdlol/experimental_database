@@ -102,7 +102,10 @@ impl<'a> SlottedPage<'a> {
     pub fn insert_slot(&mut self, data: &[u8]) -> Result<u16, PageFullError>;
 
     /// Update an existing slot's data in-place.
-    /// If new data fits in old space, reuse. Otherwise delete + insert.
+    /// If new data fits in old space, reuse. Otherwise mark old cell space
+    /// as reclaimable, write new cell data at free_space_end (growing backward),
+    /// and update the EXISTING slot entry's offset and length to point to the
+    /// new cell. This preserves the slot index.
     pub fn update_slot(&mut self, slot: u16, data: &[u8]) -> Result<(), PageFullError>;
 
     /// Delete a slot (mark as tombstone, length = 0).
@@ -189,7 +192,7 @@ Offset page_size:              End of page
 1. Calculate needed space: `SLOT_ENTRY_SIZE + data.len()`.
 2. Check if `free_space() >= needed`. If not, try `compact()` then recheck. If still not enough, return `PageFullError`.
 3. Write cell data at `free_space_end - data.len()`. Update `free_space_end`.
-4. Write slot entry at `free_space_start`: `(offset=new_free_space_end, length=data.len())`.
+4. Write slot entry at `free_space_start`: `(offset=new_free_space_end, length=data.len())` (i.e., free_space_end after step 3: old_free_space_end - data.len()).
 5. Update `free_space_start += SLOT_ENTRY_SIZE`.
 6. Increment `num_slots`.
 7. Return slot index (= old num_slots).

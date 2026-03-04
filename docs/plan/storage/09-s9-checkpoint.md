@@ -51,6 +51,14 @@ impl Checkpoint {
 ┌─────────────────────────────────────────────────────────────┐
 │ Step 1: Record checkpoint_lsn = wal_writer.current_lsn()   │
 │         (This is the LSN up to which we'll flush)           │
+│         Note: current_lsn() returns the position of the    │
+│         NEXT record to be written, not the last written     │
+│         record. This means recovery will replay from a      │
+│         position that includes all records written before   │
+│         the checkpoint started. Any concurrent WAL writes   │
+│         between this point and the checkpoint completion    │
+│         will also be replayed on recovery — this is safe    │
+│         because WAL replay is idempotent.                   │
 ├─────────────────────────────────────────────────────────────┤
 │ Step 2: Snapshot dirty pages                                │
 │         dirty = buffer_pool.dirty_pages()                   │

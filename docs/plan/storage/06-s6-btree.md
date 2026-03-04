@@ -61,16 +61,13 @@ impl BTree {
 /// Iterator over (key, value) pairs from a range scan.
 pub struct ScanIterator {
     buffer_pool: Arc<BufferPool>,
-    direction: ScanDirection,
-    // Current position
     current_page: Option<PageId>,
     current_slot: u16,
-    // Bounds
-    lower: Vec<u8>,
-    lower_inclusive: bool,
-    upper: Vec<u8>,
-    upper_inclusive: bool,
-    exhausted: bool,
+    lower: Option<(Vec<u8>, bool)>,  // None = unbounded, Some((key, inclusive))
+    upper: Option<(Vec<u8>, bool)>,  // None = unbounded, Some((key, inclusive))
+    direction: ScanDirection,
+    root_page: PageId,  // needed for backward scan re-traversal
+    done: bool,
 }
 
 impl Iterator for ScanIterator {

@@ -37,7 +37,7 @@ pub const WAL_RECORD_CREATE_COLLECTION: u8 = 0x03;
 pub const WAL_RECORD_DROP_COLLECTION: u8 = 0x04;
 pub const WAL_RECORD_CREATE_INDEX: u8 = 0x05;
 pub const WAL_RECORD_DROP_INDEX: u8 = 0x06;
-pub const WAL_RECORD_PAGE_WRITE: u8 = 0x07;
+pub const WAL_RECORD_INDEX_READY: u8 = 0x07;
 pub const WAL_RECORD_VACUUM: u8 = 0x08;
 
 /// WAL segment file header: 32 bytes.
@@ -92,6 +92,8 @@ enum WalWriteRequest {
 
 impl WalWriter {
     /// Create a new WAL writer. Spawns a background task for group commit.
+    /// Requires an active tokio runtime. Must be called from within an async
+    /// context or after runtime setup.
     pub fn new(storage: Arc<dyn WalStorage>, config: WalConfig) -> Result<Self>;
 
     /// Append a record. Blocks until fsynced. Returns the assigned LSN.

@@ -38,7 +38,7 @@ impl Recovery {
     /// Run full crash recovery on a database directory.
     ///
     /// Steps:
-    /// 1. Read meta.json → checkpoint_lsn
+    /// 1. Use provided checkpoint_lsn parameter
     /// 2. DWB recovery (restore torn pages)
     /// 3. Open WAL, replay from checkpoint_lsn
     /// 4. Call handler for each replayed record

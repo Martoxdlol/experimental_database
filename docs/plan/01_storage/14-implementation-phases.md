@@ -1,79 +1,168 @@
 # 14 — Implementation Phases
 
-The storage layer is built bottom-up in four phases. Each phase produces runnable, tested code.
+Step-by-step build order. Each phase produces testable, compiling code.
 
----
+## Phase A: Foundation
 
-## Phase A: Foundations (types + page + WAL)
+Build the primitives that everything else depends on. No disk I/O yet — just data structures and encoding.
 
-**Goal**: a working WAL that can write, read, and verify records.
+### A1: Types (`types.rs`)
+- All newtypes: `PageId`, `FrameId`, `Lsn`, `Timestamp`, `CollectionId`, `IndexId`, `DocId`, `TxId`
+- Enums: `PageType`, `WalRecordType`, `IndexState`, `DatabaseState`, `OpType`
+- Constants: page sizes, header sizes, magic numbers
+- `HeapRef`, `FieldPath`, `EncodedKey`
+- **Tests**: basic construction, Ord for newtypes, Lsn arithmetic
 
-| Step | File | What | Tests |
-|------|------|------|-------|
-| A1 | `types.rs` | All shared types, constants, enums | Compile check |
-| A2 | `page.rs` | `PageHeader` read/write, `SlottedPage` init/insert/remove/compact, checksum | Unit: insert cells, verify checksums, compact, page full |
-| A3 | `wal/record.rs` | `WalRecord` enum, serialize/deserialize for all record types | Unit: round-trip each record type |
-| A4 | `wal/segment.rs` | `WalSegment` create/open/append/read, `SegmentHeader` | Integration: create segment, append frames, read back |
-| A5 | `wal/writer.rs` | `WalWriter` with group commit, segment rollover | Integration: concurrent writes, verify fsync ordering |
-| A6 | `wal/reader.rs` | `WalReader` scan from LSN, segment discovery, reclaim | Integration: write N records, scan them, reclaim old segments |
-| A7 | `key_encoding.rs` | All encode/decode functions, successor_prefix | Unit: round-trip each type, verify sort order with memcmp |
+### A2: Page Format (`page.rs`)
+- `PageHeader` read/write (32-byte binary format)
+- `SlottedPage` / `SlottedPageMut` on `&[u8]` / `&mut [u8]`
+- Cell operations: `insert_cell`, `delete_cell`, `update_cell`, `compact`
+- Slot directory management
+- CRC-32C checksum compute + verify
+- **Tests**: see test plan §T1
 
-**Deliverable**: WAL writes and reads end-to-end. Key encoding is correct and order-preserving.
+### A3: Key Encoding (`key_encoding.rs`)
+- `encode_scalar` / `decode_scalar` for all types
+- `encode_primary_key` / `decode_primary_key`
+- `encode_secondary_key` / `decode_secondary_key_suffix`
+- `successor_prefix` / `successor_key`
+- `extract_field_value` from BSON documents
+- **Tests**: see test plan §T2
 
----
+### A4: WAL Records (`wal/record.rs`)
+- Binary serialization/deserialization for all record types
+- `encoding` module (read/write primitives)
+- CRC-32C computation in frame header
+- **Tests**: round-trip serialize/deserialize for every record type
 
-## Phase B: Buffer Pool + B-Tree
+### A5: WAL Segments (`wal/segment.rs`)
+- `SegmentHeader` read/write
+- `WalSegment::create`, `open_read`, `open_append`
+- `append()`, `sync()`, `should_rollover()`
+- `list_segments()`, `segment_filename()`
+- **Tests**: create segment, write records, read back
 
-**Goal**: a working B-tree backed by the buffer pool, with insert/get/scan/delete.
+### A6: WAL Writer (`wal/writer.rs`)
+- `WalWriter` with mpsc channel and group commit loop
+- `WriteRequest` with oneshot response
+- Segment rollover
+- `WalWriter::write()` async helper
+- **Tests**: single write, concurrent writes, group commit batching, rollover
 
-| Step | File | What | Tests |
-|------|------|------|-------|
-| B1 | `buffer_pool.rs` | Frame management, fetch/pin/unpin, clock eviction (clean only), disk I/O | Unit with `MemPageIO`: pin/unpin, eviction, checksum verify |
-| B2 | `freelist.rs` | Free page list push/pop | Unit: push/pop cycles |
-| B3 | `btree/node.rs` | Leaf + internal node ops: search, insert_cell, split | Unit: insert cells into a single page, verify ordering, split |
-| B4 | `btree/cursor.rs` | Seek + advance across leaf chain | Integration: insert N keys, seek to middle, scan forward/backward |
-| B5 | `btree/ops.rs` | `BTree::get`, `insert`, `delete`, `range_scan` | Integration: insert 10K keys, get each, range scan, delete some |
-| B6 | `heap.rs` | External heap store/read/delete, overflow chains | Integration: store small + large docs, read back, delete |
+### A7: WAL Reader (`wal/reader.rs`)
+- `WalReader::open`, `next()`
+- Forward scan with CRC verification
+- Cross-segment scanning
+- End-of-data detection
+- **Tests**: read back what writer wrote, detect corruption
 
-**Deliverable**: standalone B-tree that can insert, get, range scan, and handle large documents.
+## Phase B: Buffer Pool + Free List + File Header
 
----
+### B1: PageIO Trait + Implementations (`traits.rs` or inline)
+- `PageIO` trait
+- `FilePageIO` (pread/pwrite)
+- `MemPageIO` (in-memory for testing)
+- **Tests**: read/write round-trip, extend
 
-## Phase C: Catalog + Checkpoint + Recovery
+### B2: Buffer Pool (`buffer_pool.rs`)
+- `BufferPool::new` with `PageIO`
+- `FrameSlot` with `parking_lot::RwLock`
+- `SharedPageGuard` / `ExclusivePageGuard` with RAII drop
+- `fetch_page_shared` / `fetch_page_exclusive`
+- Clock eviction (`find_victim`)
+- `new_page`, `flush_page`
+- `snapshot_dirty_frames`, `mark_clean_if_lsn`
+- **Tests**: see test plan §T3
 
-**Goal**: a full storage engine that survives crashes.
+### B3: Free Page List (`free_list.rs`)
+- `FreePageList::new`, `push`, `pop`
+- Read/write via buffer pool
+- **Tests**: push/pop round-trip, empty list, multi-page chain
 
-| Step | File | What | Tests |
-|------|------|------|-------|
-| C1 | `catalog.rs` | Catalog B-tree, `CatalogCache`, create/drop collection/index | Integration: create collections, verify cache |
-| C2 | `dwb.rs` | DWB write/read/truncate/recovery | Unit: write pages, read back, simulate torn write |
-| C3 | `checkpoint.rs` | Full checkpoint protocol (DWB → scatter-write → WAL reclaim) | Integration: dirty some pages, checkpoint, verify clean |
-| C4 | `recovery.rs` | DWB recovery + WAL replay | Integration: crash simulation (write WAL, don't checkpoint, recover) |
+### B4: File Header (`file_header.rs`)
+- `FileHeader` serialize/deserialize
+- Checksum verification
+- Shadow header write/read
+- `read_file_header_with_fallback`
+- New database initialization
+- **Tests**: round-trip, checksum verification, shadow fallback
 
-**Deliverable**: storage engine that creates collections, writes documents, checkpoints, and recovers from crashes.
+## Phase C: B-Tree + Heap + Catalog
 
----
+### C1: B-Tree Node (`btree/node.rs`)
+- `BTreeNode` static methods for internal + leaf operations
+- Cell parsing for primary keys (fixed 24-byte)
+- Cell parsing for variable-length secondary keys
+- Binary search within pages
+- **Tests**: insert/read cells, binary search correctness
 
-## Phase D: Engine Integration
+### C2: B-Tree Cursor (`btree/cursor.rs`)
+- `BTreeCursor::new`, `seek`, `seek_first`, `seek_last`
+- `next()` with sibling traversal
+- `is_valid`, `key`, `cell_data`
+- **Tests**: seek to exact key, seek to range, scan forward
 
-**Goal**: `StorageEngine` as the single entry point for all storage operations.
+### C3: B-Tree Insert (`btree/insert.rs`)
+- `btree_insert` with path tracking
+- Leaf insert (no split)
+- Leaf split (allocate new page, redistribute, propagate)
+- Root split (allocate new root)
+- **Tests**: see test plan §T4
 
-| Step | File | What | Tests |
-|------|------|------|-------|
-| D1 | `engine.rs` | `StorageEngine::open/create/shutdown` | Integration: create DB, reopen, verify state |
-| D2 | `engine.rs` | `get_document`, `index_scan`, `apply_mutations` | Integration: insert docs via apply_mutations, query back |
-| D3 | `engine.rs` | Background checkpoint task, early checkpoint trigger | Integration: fill buffer pool, verify early checkpoint fires |
-| D4 | End-to-end | Full flow: create collection → insert → query → checkpoint → crash → recover → query | Crash recovery test |
+### C4: B-Tree Delete (`btree/delete.rs`)
+- `btree_delete`
+- Leaf delete (no merge)
+- Redistribute from sibling
+- Merge with sibling
+- Root collapse
+- **Tests**: delete with redistribution, merge, empty tree
 
-**Deliverable**: complete storage layer ready for the transaction layer to build on top.
+### C5: B-Tree Scan (`btree/scan.rs`)
+- `BTreeScan::new`, `next()`
+- `BTreeReverseScan`
+- Upper bound checking
+- **Tests**: scan entire tree, scan range, reverse scan
 
----
+### C6: External Heap (`heap.rs`)
+- `ExternalHeap::store`, `read`, `delete`, `replace`
+- Single-page and multi-page (overflow) paths
+- `HeapFreeSpaceMap`
+- **Tests**: see test plan §T5
 
-## Out of Scope (for later phases)
+### C7: Catalog (`catalog.rs`)
+- `CatalogCache` with all lookup methods
+- `CatalogManager` with create/drop operations
+- `SharedCatalog` with ArcSwap
+- Catalog B-tree key/value serialization
+- **Tests**: create collection/index, lookup, drop, cache consistency
 
-- Transaction layer (write set, read set, OCC, subscriptions)
-- Query engine (query planning, post-filters)
-- Replication
-- Network protocol
-- Authentication
-- Vacuuming (partial — the storage ops exist, scheduling doesn't)
+## Phase D: Checkpoint + Recovery + Engine
+
+### D1: Checkpoint (`checkpoint.rs`)
+- DWB write/read/clear
+- `CheckpointManager::run_checkpoint`
+- Checkpoint background task with timer
+- **Tests**: see test plan §T6
+
+### D2: Recovery (`recovery.rs`)
+- `recover_dwb` (torn page repair)
+- `replay_wal` (full WAL replay)
+- `recover_database` (orchestration)
+- `meta.json` read/write
+- **Tests**: see test plan §T7
+
+### D3: Engine (`engine.rs`)
+- `StorageEngine::open`, `shutdown`
+- Writer task loop
+- Read/write operation routing
+- **Tests**: see test plan §T8
+
+## Estimated Sizes
+
+| Phase | Files | ~LoC | Key complexity |
+|-------|-------|------|----------------|
+| A | 7 | 2500 | WAL serialization, key encoding |
+| B | 4 | 1500 | Buffer pool concurrency, clock eviction |
+| C | 7 | 3000 | B-tree split/merge, heap overflow |
+| D | 3 | 1500 | Recovery orchestration, engine lifecycle |
+| **Total** | **21** | **~8500** | |

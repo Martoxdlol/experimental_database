@@ -1,150 +1,254 @@
-# 04 — Buffer Pool (`storage/buffer_pool.rs`)
+# 04 — Buffer Pool
 
-Manages a fixed-size pool of in-memory page frames (DESIGN §2.7). All page reads/writes go through the buffer pool.
+Implements DESIGN.md §2.7. Per-frame RwLock, clock eviction, positional I/O.
 
-## Structs
+## File: `src/storage/buffer_pool.rs`
+
+### Core Structures
 
 ```rust
-/// A single frame in the buffer pool.
-struct Frame {
-    data: Box<[u8]>,       // PAGE_SIZE bytes
-    page_id: Option<PageId>,
-    pin_count: u32,
-    dirty: bool,
-    ref_bit: bool,         // for clock eviction
-}
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::os::unix::fs::FileExt; // pread/pwrite
 
-/// Configuration for the buffer pool.
-pub struct BufferPoolConfig {
-    pub page_size: u32,
-    pub frame_count: u32,        // memory_budget / page_size
-    pub data_file: PathBuf,      // path to data.db
-}
-
-/// The buffer pool. Thread-safe — uses interior mutability.
+/// The buffer pool manages page frames in memory.
 pub struct BufferPool {
-    frames: Vec<parking_lot::Mutex<Frame>>,
-    page_table: parking_lot::RwLock<HashMap<PageId, FrameId>>,
-    page_size: u32,
-    frame_count: u32,
+    /// Maps on-disk PageId → in-memory FrameId.
+    page_table: RwLock<HashMap<PageId, FrameId>>,
+    /// Fixed-size array of page frames, allocated once at startup.
+    frames: Vec<FrameSlot>,
+    /// Clock eviction hand (index into frames).
     clock_hand: AtomicU32,
-    file: tokio::sync::Mutex<tokio::fs::File>, // data.db handle
-    // Callback for triggering early checkpoint when no clean frames available
-    checkpoint_trigger: Option<Box<dyn Fn() + Send + Sync>>,
+    /// Number of frames.
+    frame_count: u32,
+    /// Page size in bytes.
+    page_size: u32,
+    /// Data file handle (opened once, shared via pread/pwrite).
+    data_file: std::fs::File,
+    /// Current file size in pages (for file extension).
+    page_count: RwLock<u64>,
+}
+
+/// One frame in the buffer pool.
+pub struct FrameSlot {
+    /// Per-frame lock protecting all mutable state.
+    lock: RwLock<FrameInner>,
+}
+
+struct FrameInner {
+    /// Page-sized buffer.
+    data: Vec<u8>,
+    /// Which page is loaded (None = frame is free).
+    page_id: Option<PageId>,
+    /// Number of active pins (shared + exclusive).
+    pin_count: u32,
+    /// Whether the page has been modified since last flush.
+    dirty: bool,
+    /// Clock reference bit for eviction.
+    ref_bit: bool,
+    /// LSN of last modification (used by checkpoint mark-clean).
+    lsn: Lsn,
 }
 ```
 
-## RAII Guard for Pinned Pages
+### Page Guards (RAII)
 
 ```rust
-/// RAII guard for a pinned page. Automatically unpins on drop.
-/// Derefs to the page buffer for direct read access.
-pub struct PinnedPage<'a> {
-    pool: &'a BufferPool,
+/// Shared (read) access to a page. Multiple readers allowed per frame.
+pub struct SharedPageGuard<'a> {
     frame_id: FrameId,
-    // Cached pointer to frame data for the lifetime of the pin.
+    page_id: PageId,
+    guard: RwLockReadGuard<'a, FrameInner>,
+    pool: &'a BufferPool,
 }
 
-impl<'a> PinnedPage<'a> {
-    /// Get the page data as a byte slice.
+impl<'a> SharedPageGuard<'a> {
+    /// Read-only access to page data.
     pub fn data(&self) -> &[u8];
 
-    /// Get a mutable reference to the page data. Marks the frame as dirty.
-    pub fn data_mut(&mut self) -> &mut [u8];
-
-    /// Get the page ID.
+    /// The page ID.
     pub fn page_id(&self) -> PageId;
 
-    /// Explicitly mark as dirty (also done automatically by data_mut).
-    pub fn mark_dirty(&mut self);
+    /// Convenience: wrap data as SlottedPage.
+    pub fn as_slotted_page(&self) -> SlottedPage<'_>;
 }
 
-impl<'a> Drop for PinnedPage<'a> {
+impl Drop for SharedPageGuard<'_> {
     fn drop(&mut self) {
-        // Decrement pin_count on the frame
+        // Decrement pin_count. (Requires briefly upgrading to write —
+        // or use an AtomicU32 for pin_count outside the RwLock.)
+    }
+}
+
+/// Exclusive (write) access to a page. One writer, no concurrent readers.
+pub struct ExclusivePageGuard<'a> {
+    frame_id: FrameId,
+    page_id: PageId,
+    guard: RwLockWriteGuard<'a, FrameInner>,
+    pool: &'a BufferPool,
+    modified: bool,
+}
+
+impl<'a> ExclusivePageGuard<'a> {
+    /// Read-only access.
+    pub fn data(&self) -> &[u8];
+
+    /// Mutable access. Sets the internal `modified` flag.
+    pub fn data_mut(&mut self) -> &mut [u8];
+
+    /// The page ID.
+    pub fn page_id(&self) -> PageId;
+
+    /// Convenience: wrap data as SlottedPageMut.
+    pub fn as_slotted_page_mut(&mut self) -> SlottedPageMut<'_>;
+}
+
+impl Drop for ExclusivePageGuard<'_> {
+    fn drop(&mut self) {
+        // If modified: mark frame dirty, set ref_bit.
+        // Decrement pin_count.
     }
 }
 ```
 
-## Methods
+### BufferPool Operations
 
 ```rust
 impl BufferPool {
-    /// Create a new buffer pool. Opens (or creates) data.db.
-    pub async fn new(config: BufferPoolConfig) -> Result<Self, StorageError>;
+    /// Create a new buffer pool.
+    /// `frame_count` = memory_budget / page_size.
+    pub fn new(
+        data_file: std::fs::File,
+        page_size: u32,
+        frame_count: u32,
+        initial_page_count: u64,
+    ) -> Self;
 
-    /// Fetch a page by ID. If cached, pin and return. Otherwise, evict a
-    /// clean frame, read from disk, pin, return.
-    /// Verifies page checksum on disk read.
-    pub async fn fetch_page(&self, page_id: PageId) -> Result<PinnedPage<'_>, StorageError>;
+    /// Fetch a page for reading (shared lock on the frame).
+    /// On cache miss: evict a frame, read from disk via pread.
+    pub fn fetch_page_shared(&self, page_id: PageId) -> Result<SharedPageGuard<'_>>;
 
-    /// Allocate a new page. Uses free list (via `alloc_fn`) or extends the file.
-    /// `alloc_fn` is called to pop from the free list — see freelist.rs.
-    pub async fn new_page(
+    /// Fetch a page for writing (exclusive lock on the frame).
+    /// On cache miss: evict a frame, read from disk via pread.
+    pub fn fetch_page_exclusive(&self, page_id: PageId) -> Result<ExclusivePageGuard<'_>>;
+
+    /// Allocate a new page. Tries free list first, then extends file.
+    /// Returns an exclusively pinned guard for the new page.
+    pub fn new_page(
         &self,
         page_type: PageType,
-        alloc_fn: &dyn Fn(&BufferPool) -> Option<PageId>,
-    ) -> Result<PinnedPage<'_>, StorageError>;
+        free_list: &mut FreePageList,
+    ) -> Result<ExclusivePageGuard<'_>>;
 
-    /// Collect all dirty frame page IDs. Used by checkpoint.
-    pub fn dirty_pages(&self) -> Vec<(PageId, FrameId)>;
+    /// Flush a specific dirty page to disk via pwrite.
+    /// Used by checkpoint. Acquires exclusive frame lock briefly.
+    pub fn flush_page(&self, page_id: PageId) -> Result<()>;
 
-    /// Read a frame's data by FrameId (for DWB/checkpoint to read dirty pages).
-    pub fn read_frame(&self, frame_id: FrameId) -> Vec<u8>;
+    /// Snapshot dirty frames: returns Vec<(PageId, page_data_copy, lsn)>.
+    /// Called by checkpoint while writer lock is held.
+    pub fn snapshot_dirty_frames(&self) -> Vec<(PageId, Vec<u8>, Lsn)>;
 
-    /// Mark a frame as clean (after checkpoint has flushed it).
-    pub fn mark_clean(&self, frame_id: FrameId);
+    /// Mark a frame clean if its LSN matches `expected_lsn`.
+    /// Used by checkpoint after scatter-write.
+    pub fn mark_clean_if_lsn(&self, page_id: PageId, expected_lsn: Lsn);
 
-    /// Total number of frames.
-    pub fn frame_count(&self) -> u32;
-
-    /// Read a page directly from disk (bypassing cache). Used by DWB recovery.
-    pub async fn read_page_raw(&self, page_id: PageId) -> Result<Vec<u8>, StorageError>;
-
-    /// Write a page directly to disk at its position. Used by DWB recovery.
-    pub async fn write_page_raw(&self, page_id: PageId, data: &[u8]) -> Result<(), StorageError>;
-
-    /// Flush (fsync) the data file.
-    pub async fn sync_data_file(&self) -> Result<(), StorageError>;
-
-    /// Extend the data file by one page. Returns the new page ID.
-    pub async fn extend_file(&self) -> Result<PageId, StorageError>;
+    /// Extend the data file by one page. Returns the new page's PageId.
+    fn extend_file(&self) -> Result<PageId>;
 }
 ```
 
-## Clock Eviction (internal)
+### Clock Eviction Algorithm
 
 ```rust
 impl BufferPool {
-    /// Find a victim frame using the clock algorithm.
-    /// Only considers unpinned, clean frames.
-    /// Returns None if all frames are pinned or dirty (caller triggers checkpoint).
-    fn find_victim(&self) -> Option<FrameId>;
+    /// Find a victim frame to evict. Only evicts clean, unpinned frames.
+    /// Returns Err if no frame is available (triggers early checkpoint).
+    fn find_victim(&self) -> Result<FrameId> {
+        // Algorithm:
+        // 1. Start at clock_hand.fetch_add(1) % frame_count.
+        // 2. Scan up to 2 * frame_count frames.
+        // 3. For each frame, try_read() on the lock:
+        //    - If locked (in use): skip.
+        //    - If page_id is None (free frame): use it.
+        //    - If dirty: skip (dirty frames never evicted).
+        //    - If pin_count > 0: skip.
+        //    - If ref_bit: clear ref_bit, skip (second chance).
+        //    - Else: evict — this is the victim.
+        // 4. If no victim found after full scan: return Err(BufferPoolFull).
+    }
 }
 ```
 
-## Key Design Decisions
+### Positional I/O
 
-1. **No dirty eviction**: per DESIGN §2.7, dirty frames are never evicted. If `find_victim()` returns `None`, the caller triggers an early checkpoint. After checkpoint marks frames clean, eviction can proceed.
+All disk reads/writes use `FileExt::read_exact_at` / `write_all_at` (pread/pwrite semantics). No file-level mutex needed. The data file's seek position is never used.
 
-2. **Checksum on every read**: `fetch_page()` verifies the page checksum when reading from disk. A checksum mismatch returns `StorageError::CorruptPage`.
+```rust
+impl BufferPool {
+    fn read_page_from_disk(&self, page_id: PageId, buf: &mut [u8]) -> Result<()> {
+        let offset = page_id.0 as u64 * self.page_size as u64;
+        self.data_file.read_exact_at(buf, offset)?;
+        // Verify checksum
+        let page = SlottedPage::new(buf, self.page_size);
+        if !page.verify_checksum() {
+            return Err(StorageError::ChecksumMismatch { page_id });
+        }
+        Ok(())
+    }
 
-3. **Pin contract**: callers hold `PinnedPage` for the duration of access. The RAII guard auto-unpins on drop.
+    fn write_page_to_disk(&self, page_id: PageId, buf: &[u8]) -> Result<()> {
+        let offset = page_id.0 as u64 * self.page_size as u64;
+        self.data_file.write_all_at(buf, offset)?;
+        Ok(())
+    }
+}
+```
 
-4. **Concurrency**: each frame has its own `Mutex`. The page table is a `RwLock<HashMap>`. This allows concurrent reads to different pages without contention.
+### Pin Count Design Choice
 
-## Error Type
+The `pin_count` can be either:
+- **Inside `FrameInner`** (requires write lock to modify) — simpler but more contention.
+- **As `AtomicU32` outside the RwLock** — allows pin/unpin without write lock.
+
+Recommendation: use `AtomicU32` for `pin_count` and `AtomicBool` for `ref_bit` alongside the RwLock, to avoid needing write access just for pin counting.
+
+```rust
+pub struct FrameSlot {
+    lock: RwLock<FrameData>,      // protects data[], page_id, dirty, lsn
+    pin_count: AtomicU32,          // outside lock
+    ref_bit: AtomicBool,           // outside lock
+}
+
+struct FrameData {
+    data: Vec<u8>,
+    page_id: Option<PageId>,
+    dirty: bool,
+    lsn: Lsn,
+}
+```
+
+### Error Types
 
 ```rust
 #[derive(Debug, thiserror::Error)]
-pub enum StorageError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("Page {0:?} checksum mismatch (corrupt page)")]
-    CorruptPage(PageId),
-    #[error("Buffer pool full: no clean frames available")]
+pub enum BufferPoolError {
+    #[error("buffer pool full: no clean, unpinned frames available")]
     BufferPoolFull,
-    #[error("Page {0:?} not found in data file")]
-    PageNotFound(PageId),
+
+    #[error("page checksum mismatch for page {page_id:?}")]
+    ChecksumMismatch { page_id: PageId },
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
 }
 ```
+
+### Concurrency Properties (§2.7.1)
+
+1. **Per-frame RwLock**: readers on different pages never contend.
+2. **Positional I/O**: no file mutex; concurrent pread + pwrite.
+3. **Page table RwLock**: held briefly (lookup/insert only); never held during I/O.
+4. **Clock hand**: AtomicU32, no lock needed.
+5. **Latch ordering**: always ascending `page_id` when acquiring multiple frames.
+6. **No latches across await**: frame locks are `parking_lot::RwLock` (sync), held in sync blocks. I/O is done outside the latch into temp buffers.

@@ -1,15 +1,102 @@
-# 03 — Write-Ahead Log (`storage/wal/`)
+# 03 — Write-Ahead Log (WAL)
 
-Four files: `record.rs`, `segment.rs`, `writer.rs`, `reader.rs`.
+Implements DESIGN.md §2.8. Covers segments, records, writer (group commit), and reader.
 
-## WAL Record Types (`wal/record.rs`)
+## Files
 
-### Structs
+```
+src/storage/wal/
+  mod.rs       — re-exports
+  segment.rs   — segment file format, header, open/create
+  record.rs    — WAL record types, serialization/deserialization
+  writer.rs    — WalWriter (single task, group commit via mpsc)
+  reader.rs    — WalReader (forward scan with CRC verification)
+```
+
+## Segment File Format (§2.8.2)
+
+### `segment.rs`
 
 ```rust
-/// Deserialized WAL record — the in-memory representation of a single WAL entry.
+/// Segment header: 32 bytes at file offset 0.
 #[derive(Debug, Clone)]
-pub enum WalRecord {
+pub struct SegmentHeader {
+    pub magic: u32,           // 0x57414C00
+    pub version: u16,         // 1
+    pub _reserved: u16,
+    pub segment_id: u32,      // matches filename number
+    pub base_lsn: Lsn,        // LSN of first record in segment
+    pub created_at_ms: u64,   // wall-clock ms
+}
+
+/// Manages a single WAL segment file.
+pub struct WalSegment {
+    file: std::fs::File,      // opened for read or read+append
+    header: SegmentHeader,
+    write_offset: u64,        // current append position (header.base_lsn + data written)
+}
+
+impl WalSegment {
+    /// Create a new segment file with pre-allocation.
+    pub fn create(
+        dir: &Path,
+        segment_id: u32,
+        base_lsn: Lsn,
+        target_size: u64,     // ~64 MB pre-alloc
+    ) -> Result<Self>;
+
+    /// Open an existing segment for reading.
+    pub fn open_read(path: &Path) -> Result<Self>;
+
+    /// Open the active segment for appending.
+    pub fn open_append(path: &Path) -> Result<Self>;
+
+    /// Append raw bytes (one or more serialized records). No fsync.
+    pub fn append(&mut self, data: &[u8]) -> Result<()>;
+
+    /// fsync the segment file.
+    pub fn sync(&self) -> Result<()>;
+
+    /// Current write position as LSN.
+    pub fn current_lsn(&self) -> Lsn;
+
+    /// Whether the segment has exceeded the target size.
+    pub fn should_rollover(&self, target_size: u64) -> bool;
+
+    /// Segment ID for filename construction.
+    pub fn segment_id(&self) -> u32;
+
+    /// Segment file path.
+    pub fn path(&self) -> &Path;
+}
+
+/// Scan a WAL directory and return segments ordered by base_lsn.
+pub fn list_segments(dir: &Path) -> Result<Vec<PathBuf>>;
+
+/// Segment filename: segment-{id:06}.wal
+pub fn segment_filename(segment_id: u32) -> String;
+```
+
+## WAL Record Format (§2.8.3–2.8.5)
+
+### `record.rs`
+
+```rust
+/// Frame header: 9 bytes prepended to every WAL record.
+/// [payload_len: u32 LE] [crc32c: u32 LE] [record_type: u8]
+pub const FRAME_HEADER_SIZE: usize = 9;
+
+/// Deserialized WAL record with its LSN.
+#[derive(Debug)]
+pub struct WalRecord {
+    pub lsn: Lsn,
+    pub record_type: WalRecordType,
+    pub payload: WalPayload,
+}
+
+/// Typed WAL record payloads.
+#[derive(Debug)]
+pub enum WalPayload {
     TxCommit(TxCommitRecord),
     Checkpoint(CheckpointRecord),
     CreateCollection(CreateCollectionRecord),
@@ -22,20 +109,20 @@ pub enum WalRecord {
     DropDatabase(DropDatabaseRecord),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TxCommitRecord {
-    pub tx_id: u64,
+    pub tx_id: TxId,
     pub commit_ts: Timestamp,
     pub mutations: Vec<Mutation>,
     pub index_deltas: Vec<IndexDelta>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Mutation {
     pub collection_id: CollectionId,
     pub doc_id: DocId,
     pub op_type: OpType,
-    pub body: Vec<u8>,  // BSON-encoded, empty for Delete
+    pub body: Vec<u8>,    // BSON, empty for Delete
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,32 +133,32 @@ pub enum OpType {
     Delete  = 0x03,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct IndexDelta {
     pub index_id: IndexId,
     pub collection_id: CollectionId,
     pub doc_id: DocId,
-    pub old_key: Option<Vec<u8>>,  // encoded index key
-    pub new_key: Option<Vec<u8>>,
+    pub old_key: Option<EncodedKey>,
+    pub new_key: Option<EncodedKey>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CheckpointRecord {
     pub checkpoint_lsn: Lsn,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CreateCollectionRecord {
     pub collection_id: CollectionId,
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DropCollectionRecord {
     pub collection_id: CollectionId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CreateIndexRecord {
     pub index_id: IndexId,
     pub collection_id: CollectionId,
@@ -79,256 +166,230 @@ pub struct CreateIndexRecord {
     pub field_paths: Vec<FieldPath>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DropIndexRecord {
     pub index_id: IndexId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct IndexReadyRecord {
     pub index_id: IndexId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VacuumRecord {
     pub collection_id: CollectionId,
     pub entries: Vec<VacuumEntry>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VacuumEntry {
     pub doc_id: DocId,
     pub removed_ts: Timestamp,
     pub index_keys: Vec<VacuumIndexKey>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct VacuumIndexKey {
     pub index_id: IndexId,
-    pub key: Vec<u8>,
+    pub key: EncodedKey,
 }
 
-#[derive(Debug, Clone)]
+// System-level records (§2.8.5)
+#[derive(Debug)]
 pub struct CreateDatabaseRecord {
     pub database_id: DatabaseId,
     pub name: String,
     pub path: String,
-    pub config: Vec<u8>,  // BSON-encoded DatabaseConfig
+    pub config: Vec<u8>, // BSON-encoded DatabaseConfig
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DropDatabaseRecord {
     pub database_id: DatabaseId,
 }
 ```
 
-### Serialization Trait
+### Serialization / Deserialization
 
 ```rust
-/// Binary serialization for WAL record payloads.
-/// All implementations follow DESIGN §2.8.4 encoding conventions.
 impl WalRecord {
-    /// Serialize the record into a byte buffer (payload only, no frame header).
-    pub fn serialize(&self, buf: &mut Vec<u8>);
-
-    /// Deserialize a record from payload bytes + record_type tag.
-    pub fn deserialize(record_type: WalRecordType, payload: &[u8]) -> Result<Self, WalError>;
-
-    /// Return the record type code.
-    pub fn record_type(&self) -> WalRecordType;
+    /// Serialize into a frame: [payload_len][crc32c][record_type][payload].
+    /// Returns the complete frame bytes including the 9-byte header.
+    pub fn serialize(&self) -> Vec<u8>;
 }
 
-/// Serialize a complete WAL frame: 9-byte header + payload.
-/// Returns the serialized bytes (frame_header || payload).
-pub fn serialize_wal_frame(record: &WalRecord) -> Vec<u8>;
+/// Deserialize a WAL record from frame bytes.
+/// Verifies CRC-32C. Returns Err on corruption.
+pub fn deserialize_record(frame: &[u8]) -> Result<WalRecord, WalError>;
 
-/// Parse one WAL frame from a byte slice. Returns (record, bytes_consumed).
-/// Verifies CRC-32C.
-pub fn deserialize_wal_frame(data: &[u8]) -> Result<(WalRecord, usize), WalError>;
-```
+/// Low-level payload serialization helpers (little-endian binary).
+mod encoding {
+    pub fn write_u8(buf: &mut Vec<u8>, v: u8);
+    pub fn write_u16(buf: &mut Vec<u8>, v: u16);
+    pub fn write_u32(buf: &mut Vec<u8>, v: u32);
+    pub fn write_u64(buf: &mut Vec<u8>, v: u64);
+    pub fn write_u128(buf: &mut Vec<u8>, v: u128);
+    pub fn write_str(buf: &mut Vec<u8>, s: &str);     // u16 len + UTF-8
+    pub fn write_blob(buf: &mut Vec<u8>, b: &[u8]);   // u32 len + bytes
+    pub fn write_key(buf: &mut Vec<u8>, k: &EncodedKey); // u16 len + bytes
+    pub fn write_field_path(buf: &mut Vec<u8>, fp: &FieldPath);
 
----
-
-## WAL Segment (`wal/segment.rs`)
-
-```rust
-/// Header of a WAL segment file.
-#[derive(Debug, Clone, Copy)]
-pub struct SegmentHeader {
-    pub magic: u32,
-    pub version: u16,
-    pub segment_id: u32,
-    pub base_lsn: Lsn,
-    pub created_at_ms: u64,
-}
-
-/// Handle to an open WAL segment file.
-pub struct WalSegment {
-    file: tokio::fs::File,
-    header: SegmentHeader,
-    write_offset: u64,  // current append position
-}
-
-impl WalSegment {
-    /// Create a new segment file at the given path with the given header.
-    /// Pre-allocates to WAL_TARGET_SEGMENT_SIZE.
-    pub async fn create(
-        path: &Path,
-        segment_id: u32,
-        base_lsn: Lsn,
-    ) -> Result<Self, WalError>;
-
-    /// Open an existing segment file for reading/appending.
-    pub async fn open(path: &Path) -> Result<Self, WalError>;
-
-    pub fn header(&self) -> &SegmentHeader;
-
-    /// Current write position as an LSN.
-    pub fn current_lsn(&self) -> Lsn;
-
-    /// Append raw bytes (already serialized WAL frames) to the segment.
-    /// Does NOT fsync — the caller batches fsyncs.
-    pub async fn append(&mut self, data: &[u8]) -> Result<(), WalError>;
-
-    /// fsync the segment file.
-    pub async fn sync(&self) -> Result<(), WalError>;
-
-    /// Whether the segment has exceeded the target size.
-    pub fn should_rollover(&self) -> bool;
-
-    /// Read bytes starting at the given file offset.
-    pub async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, WalError>;
+    pub fn read_u8(cursor: &mut &[u8]) -> Result<u8>;
+    pub fn read_u16(cursor: &mut &[u8]) -> Result<u16>;
+    pub fn read_u32(cursor: &mut &[u8]) -> Result<u32>;
+    pub fn read_u64(cursor: &mut &[u8]) -> Result<u64>;
+    pub fn read_u128(cursor: &mut &[u8]) -> Result<u128>;
+    pub fn read_str(cursor: &mut &[u8]) -> Result<String>;
+    pub fn read_blob(cursor: &mut &[u8]) -> Result<Vec<u8>>;
+    pub fn read_key(cursor: &mut &[u8]) -> Result<EncodedKey>;
+    pub fn read_field_path(cursor: &mut &[u8]) -> Result<FieldPath>;
 }
 ```
 
----
+## WAL Writer — Group Commit (§2.8.6)
 
-## WAL Writer (`wal/writer.rs`)
-
-The single-writer with group commit (DESIGN §2.8.6).
+### `writer.rs`
 
 ```rust
-/// A pending WAL write request.
-struct WriteRequest {
-    frames: Vec<u8>,                           // serialized WAL frame(s)
-    notify: tokio::sync::oneshot::Sender<Lsn>, // assigned LSN on completion
+/// A request to write one WAL record, submitted by a committer.
+pub struct WriteRequest {
+    pub record_bytes: Vec<u8>,           // pre-serialized frame
+    pub response_tx: oneshot::Sender<Lsn>, // assigned LSN sent back
 }
 
-/// The WAL writer task. Owns the active segment and handles group commit.
+/// WAL writer task — drains write queue, batches, fsyncs.
 pub struct WalWriter {
-    /// Send side for submitting write requests.
-    tx: mpsc::Sender<WriteRequest>,
-    /// Handle to the background writer task.
-    task: tokio::task::JoinHandle<()>,
-}
-
-/// Configuration for the WAL writer.
-pub struct WalWriterConfig {
-    pub wal_dir: PathBuf,
-    pub segment_target_size: u64,
+    /// Bounded mpsc channel for incoming write requests.
+    write_rx: mpsc::Receiver<WriteRequest>,
+    /// Handle for submitting writes.
+    write_tx: mpsc::Sender<WriteRequest>,
+    /// Active segment being appended to.
+    active_segment: WalSegment,
+    /// WAL directory path.
+    wal_dir: PathBuf,
+    /// Next segment ID for rollover.
+    next_segment_id: u32,
+    /// Target segment size for rollover (~64 MB).
+    target_segment_size: u64,
+    /// Current LSN (next write position).
+    current_lsn: Lsn,
 }
 
 impl WalWriter {
-    /// Start the WAL writer background task. Opens/creates the active segment.
-    pub async fn start(config: WalWriterConfig) -> Result<Self, WalError>;
+    /// Create a new WAL writer. Opens or creates the active segment.
+    pub fn new(wal_dir: &Path, config: WalConfig) -> Result<Self>;
 
-    /// Submit a WAL record for writing. Returns the assigned LSN once
-    /// the record is durably fsynced.
-    pub async fn write(&self, record: &WalRecord) -> Result<Lsn, WalError>;
+    /// Get a sender handle for submitting write requests.
+    pub fn sender(&self) -> mpsc::Sender<WriteRequest>;
 
-    /// Submit multiple records as a batch (single fsync).
-    pub async fn write_batch(&self, records: &[WalRecord]) -> Result<Vec<Lsn>, WalError>;
+    /// Run the writer loop (called as a tokio::spawn task).
+    /// Loop:
+    ///   1. recv (blocking) — wait for at least one request.
+    ///   2. try_recv (greedy drain) — collect all pending requests.
+    ///   3. Append all records to the active segment.
+    ///   4. fsync once.
+    ///   5. Notify each request with its assigned LSN.
+    ///   6. Check rollover.
+    pub async fn run(mut self, shutdown: CancellationToken);
 
-    /// Current LSN (next write position).
-    pub fn current_lsn(&self) -> Lsn;
+    /// Submit a write and wait for the assigned LSN.
+    pub async fn write(
+        sender: &mpsc::Sender<WriteRequest>,
+        record_bytes: Vec<u8>,
+    ) -> Result<Lsn>;
+}
 
-    /// Graceful shutdown — flush pending writes, fsync, close segment.
-    pub async fn shutdown(self) -> Result<(), WalError>;
+pub struct WalConfig {
+    pub target_segment_size: u64,   // default: 64 * 1024 * 1024
+    pub channel_capacity: usize,    // default: 1024
 }
 ```
 
-**Writer task loop** (internal):
+### Group Commit Flow
 
 ```
-loop {
-    // 1. Block until at least one request arrives
-    // 2. Drain all pending requests (greedy)
-    // 3. Concatenate all frames into a single buffer
-    // 4. Append to active segment
-    // 5. If segment should rollover: seal + create new segment
-    // 6. fsync
-    // 7. Notify each request with its assigned LSN
-}
+Committer tasks:
+  serialize record → send to channel → await oneshot
+
+WalWriter task (single):
+  loop {
+    batch = recv_one() + try_recv_all()
+    for req in batch:
+      lsn = current_lsn
+      segment.append(req.record_bytes)
+      current_lsn += req.record_bytes.len()
+    segment.sync()          // one fsync for entire batch
+    for (req, lsn) in zip(batch, lsns):
+      req.response_tx.send(lsn)
+    if segment.should_rollover():
+      rollover()
+  }
 ```
 
----
+## WAL Reader (§2.8.3)
 
-## WAL Reader (`wal/reader.rs`)
+### `reader.rs`
 
 ```rust
-/// Forward-scanning WAL reader. Reads records sequentially from an LSN.
+/// Forward-scanning WAL reader. Used for crash recovery and replication.
 pub struct WalReader {
-    segments: Vec<SegmentInfo>,  // sorted by base_lsn
-}
-
-/// Metadata about a segment file (without opening it).
-#[derive(Debug, Clone)]
-pub struct SegmentInfo {
-    pub path: PathBuf,
-    pub segment_id: u32,
-    pub base_lsn: Lsn,
+    segments: Vec<WalSegment>,   // sorted by base_lsn
+    current_segment_idx: usize,
+    read_offset: u64,            // within current segment
 }
 
 impl WalReader {
-    /// Discover all segments in the WAL directory.
-    pub async fn open(wal_dir: &Path) -> Result<Self, WalError>;
+    /// Open all segments in a WAL directory, starting from `start_lsn`.
+    pub fn open(wal_dir: &Path, start_lsn: Lsn) -> Result<Self>;
 
-    /// Iterate all WAL records from `start_lsn` forward.
-    /// Yields (Lsn, WalRecord) pairs. Stops on EOF or CRC mismatch.
-    pub fn scan_from(&self, start_lsn: Lsn) -> WalIterator;
+    /// Read the next WAL record. Returns None at end-of-log.
+    /// Verifies CRC-32C. Returns Err on corruption (reader stops).
+    pub fn next(&mut self) -> Result<Option<WalRecord>>;
 
-    /// Find the segment containing the given LSN.
-    pub fn segment_for_lsn(&self, lsn: Lsn) -> Option<&SegmentInfo>;
+    /// Current read position as LSN.
+    pub fn current_lsn(&self) -> Lsn;
 
-    /// Delete segments whose max LSN is below `reclaim_lsn`.
-    pub async fn reclaim_segments(&mut self, reclaim_lsn: Lsn) -> Result<u32, WalError>;
-}
-
-/// Async iterator over WAL records.
-pub struct WalIterator { /* ... */ }
-
-impl WalIterator {
-    /// Read the next record. Returns None on EOF or corruption.
-    pub async fn next(&mut self) -> Option<Result<(Lsn, WalRecord), WalError>>;
+    /// Iterator adapter.
+    pub fn iter(&mut self) -> WalRecordIterator<'_>;
 }
 ```
 
----
+### Read Algorithm
 
-## Error Type
+```
+1. Read 9-byte frame header from current offset.
+2. If payload_len == 0 → end of data in this segment.
+   - If there's a next segment → advance, continue.
+   - Else → return None (end of log).
+3. Read record_type (1 byte) + payload (payload_len bytes).
+4. Compute CRC-32C over record_type || payload. Compare with crc32c from header.
+5. If mismatch → return Err (corruption, stop replay).
+6. Deserialize payload based on record_type.
+7. Return WalRecord { lsn, record_type, payload }.
+```
+
+## Error Types
 
 ```rust
 #[derive(Debug, thiserror::Error)]
 pub enum WalError {
-    #[error("I/O error: {0}")]
+    #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("CRC mismatch at LSN {lsn}: expected {expected:#010x}, got {actual:#010x}")]
-    CrcMismatch { lsn: Lsn, expected: u32, actual: u32 },
-    #[error("Invalid record type: {0:#04x}")]
+
+    #[error("CRC mismatch at LSN {lsn:?}: expected {expected:#010x}, computed {computed:#010x}")]
+    CrcMismatch { lsn: Lsn, expected: u32, computed: u32 },
+
+    #[error("invalid record type: {0:#04x}")]
     InvalidRecordType(u8),
-    #[error("Corrupt segment header at {path}")]
-    CorruptSegmentHeader { path: PathBuf },
-    #[error("Unexpected end of data at LSN {0}")]
-    UnexpectedEof(Lsn),
-    #[error("Deserialization error: {0}")]
-    Deserialize(String),
+
+    #[error("truncated record at LSN {0:?}")]
+    TruncatedRecord(Lsn),
+
+    #[error("invalid segment header: {0}")]
+    InvalidSegmentHeader(String),
+
+    #[error("payload too large: {0} bytes")]
+    PayloadTooLarge(u32),
 }
-```
-
-## Dependencies
-
-```toml
-tokio = { version = "1", features = ["fs", "sync", "rt"] }
-crc32fast = "1"
-thiserror = "2"
 ```

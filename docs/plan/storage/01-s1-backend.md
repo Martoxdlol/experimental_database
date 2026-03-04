@@ -61,7 +61,27 @@ pub trait WalStorage: Send + Sync {
     fn read_from(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
 
     /// Discard all data before `offset` (segment reclamation).
+    ///
+    /// **WAL Retention Policy**: This trait does not enforce retention semantics.
+    /// Callers (StorageEngine, replication layer) are responsible for computing
+    /// the safe truncation point based on:
+    /// - Oldest active transaction (for MVCC recovery)
+    /// - Replication lag (for followers to catch up)
+    /// - Snapshot checkpoints (for incremental restore)
+    ///
+    /// Do not call this with an offset that would discard data needed for recovery.
     fn truncate_before(&self, offset: u64) -> Result<()>;
+
+    /// Returns the LSN of the oldest retained WAL segment.
+    ///
+    /// Used by retention policy logic to check if truncation is necessary.
+    /// Returns `None` if no segments exist.
+    fn oldest_lsn(&self) -> Option<u64>;
+
+    /// Returns the total size of all retained WAL segments in bytes.
+    ///
+    /// Used by retention policy to monitor WAL growth and decide when to truncate.
+    fn retained_size(&self) -> u64;
 
     /// Total bytes written so far.
     fn size(&self) -> u64;
@@ -155,7 +175,9 @@ impl MemoryWalStorage {
 3. **append()**: Lock inner mutex. Write to active segment file. If segment exceeds target size after write, roll over to new segment. Return logical offset (= write_offset before append). Advance write_offset by data.len().
 4. **sync()**: Lock inner mutex. `active_segment.sync_data()`.
 5. **read_from()**: Find segment containing offset (binary search on base_lsn). Read from that segment at file offset `32 + (offset - segment.base_lsn)`. If read crosses segment boundary, continue into next segment.
-6. **truncate_before()**: Delete segment files whose highest LSN < offset.
+6. **oldest_lsn()**: Return the `base_lsn` of the first segment in the list, or `None` if no segments.
+7. **retained_size()**: Sum `file_size` of all segments in the list.
+8. **truncate_before()**: Delete segment files whose highest LSN is below the given offset. Segments are retained as long as the caller does not request truncation—segments are not automatically aged out. This allows replication followers to use old segments for catch-up, and allows recovery from old checkpoint points.
 
 **Segment rollover**: After an append, if current segment file size > segment_size: create new segment, write header, switch active segment.
 
@@ -172,8 +194,10 @@ impl MemoryWalStorage {
 1. **append()**: `log.write().extend_from_slice(data)`. Return previous length as offset.
 2. **sync()**: No-op.
 3. **read_from()**: Slice from the log vector.
-4. **truncate_before()**: Real truncation — drops all data before the given LSN. Implementation: find the split point in the log vector, drain `0..split_point`, and adjust internal offsets so that subsequent `read_from()` calls with old offsets still map correctly. This keeps memory bounded if the caller periodically reclaims old WAL data.
-5. **is_durable()**: `false`.
+4. **oldest_lsn()**: Return 0 if log is non-empty, `None` otherwise.
+5. **retained_size()**: Return `log.read().len()`.
+6. **truncate_before()**: Real truncation — drops all data before the given offset. Implementation: find the split point in the log vector, drain `0..split_point`, and adjust internal offsets so that subsequent `read_from()` calls with old offsets still map correctly. This keeps memory bounded if the caller periodically reclaims old WAL data.
+7. **is_durable()**: `false`.
 
 ## Error Handling
 

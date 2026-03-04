@@ -65,10 +65,11 @@ pub struct FileHeader {
     pub next_index_id: U64<LittleEndian>,
     pub checkpoint_lsn: U64<LittleEndian>,      // Lsn
     pub visible_ts: U64<LittleEndian>,          // latest visible timestamp
+    pub generation: U64<LittleEndian>,          // Cluster generation counter. Incremented when a node starts fresh (no local data). Used by replication to distinguish reconnection from replacement.
     pub created_at: U64<LittleEndian>,          // millis since epoch
 }
 // Layout is packed (zerocopy LE wrapper types have alignment 1).
-// Total size: 4+4+4+8+4+4+4+4+8+8+8+8+8 = 76 bytes.
+// Total size: 4+4+4+8+4+4+4+4+8+8+8+8+8+8 = 84 bytes.
 // Remainder of page 0 is zeroed (reserved for future fields).
 
 impl FileHeader {

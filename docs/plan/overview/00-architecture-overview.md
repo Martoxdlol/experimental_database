@@ -4,13 +4,17 @@
 
 ```
 ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-  Layer 7: API & Protocol          ◄── OPTIONAL
+  Layer 8: API & Protocol          ◄── OPTIONAL
   (frame format, messages, session, auth, transports)
 └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
 ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
-  Layer 6: Replication             ◄── OPTIONAL
+  Layer 7: Replication Transport   ◄── OPTIONAL
   (WAL streaming, promotion, 3-tier recovery, snapshot)
 └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
+├─────────────────────────────────────────────────────────┤
+│  Layer 6: Database Instance                             │
+│  (lifecycle, collections, indexes, transactions,        │
+│   catalog cache, replication hook trait, config)        │
 ├─────────────────────────────────────────────────────────┤
 │  Layer 5: Transaction Manager                           │
 │  (timestamps, OCC, commit log, subscriptions, commit)   │
@@ -28,30 +32,34 @@
 ├─────────────────────────────────────────────────────────┤
 │  Layer 1: Core Types & Encoding                         │
 │  (DocId, Scalar, FieldPath, Filter, BSON/JSON, ULID)    │
-├─────────────────────────────────────────────────────────┤
-│  Integration: Database, SystemDatabase, CatalogCache    │
-│  (instance lifecycle, config, in-memory dual-indexed    │
-│   catalog by name AND id)                               │
 └─────────────────────────────────────────────────────────┘
 ```
 
-## Embedded vs Network Usage
+## Embedded-First Design
 
-The database is designed as an **embedded library first**. The `Database` struct (Integration layer) is the primary API boundary — it provides full functionality without any networking:
+The database is designed as an **embedded library first**. The `Database` struct (Layer 6) is the primary API boundary — it provides full functionality without any networking:
 
 ```rust
-// Embedded usage — no server, no network, no Layer 6 or 7
-let db = Database::open("./mydata", config).await?;
+// Embedded usage — no server, no network, no Layer 7 or 8
+let db = Database::open("./mydata", config, None).await?;
 db.create_collection("users")?;
 
-let tx = db.begin_mutation()?;
-tx.insert("users", doc)?;
-tx.commit().await?;
+let mut tx = db.begin_mutation()?;
+let id = tx.insert("users", json!({"name": "Alice"}))?;
+tx.commit(CommitOptions::default()).await?;
+
+let tx = db.begin_readonly();
+let results = tx.query("users", "_created_at", &[], None, None, Some(10))?;
+db.close().await?;
 ```
 
-**Layer 7 (API & Protocol)** is an optional wrapper that exposes the `Database` API over TCP/TLS/WebSocket/QUIC. It adds framing, sessions, and auth but no business logic.
+**Layer 6 (Database)** is the core public API. Everything below (L1–L5) is internal machinery. Everything above (L7, L8) is optional.
 
-**Layer 6 (Replication)** is also optional — only needed for multi-node deployments. A single-node embedded database uses Layers 1–5 + Integration only.
+**Layer 7 (Replication)** is optional — implements the `ReplicationHook` trait defined by L6. Only needed for multi-node deployments.
+
+**Layer 8 (API & Protocol)** is optional — wraps `Database` with networking, framing, sessions, and auth. Only needed for remote access.
+
+A single-node embedded database uses **Layers 1–6 only**.
 
 ## Critical Layer Boundary Rule
 
@@ -104,44 +112,43 @@ StorageEngine::recover() → Result<()>  // DWB restore + WAL replay
 | L3 | `docstore/` | `primary_index.rs`, `secondary_index.rs`, `key_encoding.rs`, `version_resolution.rs`, `array_indexing.rs`, `index_builder.rs` |
 | L4 | `query/` | `planner.rs`, `range_encoder.rs`, `scan.rs`, `post_filter.rs`, `merge.rs` |
 | L5 | `tx/` | `timestamp.rs`, `read_set.rs`, `write_set.rs`, `commit_log.rs`, `occ.rs`, `subscriptions.rs`, `commit.rs` |
-| L6 | `replication/` | `primary_server.rs`, `replica_client.rs`, `promotion.rs`, `snapshot.rs`, `recovery_tiers.rs` |
-| L7 | `api/` | `frame.rs`, `messages.rs`, `session.rs`, `auth.rs`, `transport.rs` |
-| Integration | `lib.rs` | `database.rs`, `system_database.rs`, `catalog_cache.rs`, `config.rs` |
+| L6 | `database/` | `database.rs`, `catalog_cache.rs`, `system_database.rs`, `config.rs`, `replication_hook.rs` |
+| L7 | `replication/` | `primary_server.rs`, `replica_client.rs`, `promotion.rs`, `snapshot.rs`, `recovery_tiers.rs` |
+| L8 | `api/` | `frame.rs`, `messages.rs`, `session.rs`, `auth.rs`, `transport.rs` |
 
 ## Cross-Layer Data Flow
 
 | From → To | Interface | Data Exchanged |
 |-----------|-----------|---------------|
-| L7 → Integration | `Database` | all client operations (begin, insert, query, commit, etc.) |
+| L8 → L6 | `Database`, `SystemDatabase` | all client operations (begin, insert, query, commit, etc.) |
+| L6 → L5 | `CommitHandle`, `TsAllocator` | commit requests, timestamp allocation |
+| L6 → L3 | `PrimaryIndex`, `SecondaryIndex` | index handle management |
+| L6 → L2 | `StorageEngine` | lifecycle, catalog B-tree access |
 | L5 → L4 | `QueryEngine` | read set intervals from executed queries |
 | L5 → L3 | `DocumentStore` | write set application at commit |
 | L4 → L3 | `PrimaryIndex`, `SecondaryIndex` | scan/get with MVCC resolution |
 | L3 → L2 | `StorageEngine`, `BTreeHandle` | raw byte key/value ops |
-| L6 → L2 | `StorageEngine` | WAL streaming, checkpoint |
-| L6 → L5 | `ReplicationHook` (implements trait) | L6 implements L5's replication trait |
-| Integration → L2 | `StorageEngine` | lifecycle, catalog B-tree access |
-| Integration → All | `CatalogCache` | collection/index metadata lookups |
+| L7 → L6 | `Database`, `ReplicationHook` (implements trait) | WAL streaming, replication |
+| L7 → L2 | `StorageEngine` (via `Database::storage()`) | WAL read for streaming |
 
 ## Dependency Direction
 
 ```
-L7 ──→ Integration ──→ L5 → L4 → L3 → L2 → L1
-           │               ↑
-           │           L5 defines trait:
-           │           ReplicationHook
-           │               ▲
-           └──→ L6 ────────┘ (implements trait)
-               L6 also → L2 (WAL read/write)
+L8 (API) ──→ L6 (Database) ──→ L5 → L4 → L3 → L2 → L1
+                  │    ▲
+                  │    │ implements ReplicationHook trait
+                  │    │
+L7 (Replication) ─┘    │
+L7 also → L2 (WAL read/write)
 ```
 
 - **L1–L5** form a strict bottom-up chain: each depends only on layers below
-- **Integration** (`Database`, `CatalogCache`) composes L2–L5 into a usable unit
-- **L7** (API/Protocol) depends on Integration — wraps `Database` with networking
-- **L6** (Replication) implements the `ReplicationHook` trait defined in L5 — **no cycle**
-- **Integration wires them together**: constructs `CommitCoordinator` with L6's `ReplicationHook` impl (or `NoReplication` for embedded single-node)
+- **L6** (`Database`) composes L2–L5 into a usable embedded database. Defines the `ReplicationHook` trait.
+- **L7** (Replication) implements the `ReplicationHook` trait from L6 — **no cycle**. Also accesses L2 for WAL streaming via `Database::storage()`.
+- **L8** (API/Protocol) depends on L6 — wraps `Database` with networking, auth, sessions.
 
 **Cycle avoidance via dependency inversion:**
-- L5 does NOT depend on L6. It defines `trait ReplicationHook` with `replicate_and_wait()`
-- L6 implements `ReplicationHook` (L6 → L5 trait, not L5 → L6)
-- Integration injects L6's impl into L5 at construction time
-- For embedded usage without replication: `NoReplication` (no-op impl) is injected instead
+- L6 defines `trait ReplicationHook` with `replicate_and_wait()`
+- L7 implements `ReplicationHook` (L7 → L6 trait, not L6 → L7)
+- L6 receives the hook at `Database::open()` construction time
+- For embedded usage without replication: `NoReplication` (no-op impl in L6) is used by default

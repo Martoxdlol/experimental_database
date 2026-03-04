@@ -25,10 +25,11 @@ All locks are acquired in this strict order. Never acquire a higher-numbered loc
 | L3 | `DocStoreError` | Wraps StorageError + domain errors (doc not found, tombstone) |
 | L4 | `QueryError` | Invalid range, index not ready, limit exceeded |
 | L5 | `TxError` | Conflict, timeout, read limit exceeded |
-| L6 | `ReplicationError` | Connection failures, WAL gaps |
-| L7 | `ProtocolError` → error codes | Maps internal errors to wire error codes (section 7.9) |
+| L6 | `DatabaseError` | Wraps lower-layer errors, adds lifecycle errors (not open, replica readonly) |
+| L7 | `ReplicationError` | Connection failures, WAL gaps, snapshot failures |
+| L8 | `ProtocolError` → error codes | Maps internal errors to wire error codes |
 
-All errors use `anyhow::Result` internally. L7 maps to structured error codes at the protocol boundary.
+All errors use `anyhow::Result` internally. L8 maps to structured error codes at the protocol boundary.
 
 ## Checksum Strategy
 
@@ -50,8 +51,8 @@ CRC-32C is hardware-accelerated via SSE 4.2 / ARM CRC instructions. ~1% CPU over
 | Checkpoint | Background tokio task | Yes (DWB + scatter-write) | Brief writer lock for snapshot |
 | Vacuum | Background tokio task | Yes (removes entries) | Submits through writer channel |
 | Index Build | Background tokio task | Yes (inserts entries) | Submits through writer channel |
-| Replication Server | Dedicated tokio task | No (read-only WAL streaming) | Notified via broadcast channel |
-| Replica Client | Dedicated tokio task | Yes (applies WAL records) | Submits through writer channel |
+| Replication Server (L7) | Dedicated tokio task | No (read-only WAL streaming) | Notified via broadcast channel |
+| Replica Client (L7) | Dedicated tokio task | Yes (applies WAL records) | Submits through writer channel |
 
 **All page modifications funnel through the single writer** (except checkpoint's DWB/scatter-write, which is safe due to LSN-based mark-clean checking).
 
@@ -63,31 +64,31 @@ CRC-32C is hardware-accelerated via SSE 4.2 / ARM CRC instructions. ~1% CPU over
 | Page size | Per database | 8 KB | `page_size` (immutable after creation) |
 | Max document size | Per database | 16 MB | `max_doc_size` |
 | WAL segment size | Per database | 64 MB | `wal_segment_size` |
-| Max message size | Server-wide | 16 MB | `max_message_size` |
-| Transaction idle timeout | Server-wide | 30s | `tx_idle_timeout` |
-| Transaction max lifetime | Server-wide | 5 min | `tx_max_lifetime` |
-| Read set max intervals | Server-wide | 4,096 | `max_intervals` |
-| Read set max scanned bytes | Server-wide | 64 MB | `max_scanned_bytes` |
-| Read set max scanned docs | Server-wide | 100,000 | `max_scanned_docs` |
-| WAL retention for replication | Server-wide | 1 GB | `wal_retention_max_size` |
-| WAL retention max age | Server-wide | 24h | `wal_retention_max_age` |
+| Max message size | Server-wide (L8) | 16 MB | `max_message_size` |
+| Transaction idle timeout | Per database | 30s | `tx_idle_timeout` |
+| Transaction max lifetime | Per database | 5 min | `tx_max_lifetime` |
+| Read set max intervals | Per database | 4,096 | `max_intervals` |
+| Read set max scanned bytes | Per database | 64 MB | `max_scanned_bytes` |
+| Read set max scanned docs | Per database | 100,000 | `max_scanned_docs` |
+| WAL retention for replication | Per database | 1 GB | `wal_retention_max_size` |
+| WAL retention max age | Per database | 24h | `wal_retention_max_age` |
 
 ## Dependency Graph (Crate-Level)
 
 ```
-                ┌─────────┐
-                │  tokio   │  async runtime
-                └────┬────┘
-                     │
-  ┌──────────────────┼──────────────────┐
-  │                  │                  │
-  ▼                  ▼                  ▼
-parking_lot      crc32fast           bson
-(sync locks)     (checksums)      (encoding)
-                     │
-                     ▼
-               serde_json
-              (JSON support)
+                +----------+
+                |  tokio    |  async runtime
+                +-----+----+
+                      |
+  +-------------------+-------------------+
+  |                   |                   |
+  v                   v                   v
+parking_lot       crc32fast            bson
+(sync locks)      (checksums)       (encoding)
+                      |
+                      v
+                serde_json
+               (JSON support)
 ```
 
 External dependencies:
@@ -97,7 +98,7 @@ External dependencies:
 - `bson` — BSON encoding/decoding
 - `serde_json` — JSON encoding/decoding
 - `anyhow` — error handling
-- `jsonwebtoken` — JWT validation (L7 only)
+- `jsonwebtoken` — JWT validation (L8 only)
 
 ## No-Steal, Force Policy
 

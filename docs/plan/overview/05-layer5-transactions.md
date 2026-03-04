@@ -232,27 +232,16 @@ pub enum CommitResult {
     },
 }
 
-/// Trait for replication hook — defined in L5, implemented in L6.
-/// This breaks the L5 → L6 dependency via dependency inversion.
-/// Integration wires L6's implementation into L5 at construction time.
-/// When no replication is needed (embedded single-node), a no-op impl is used.
-pub trait ReplicationHook: Send + Sync {
-    /// Replicate a committed WAL record to replicas and wait for acks
-    async fn replicate_and_wait(&self, lsn: Lsn, record: &[u8]) -> Result<()>;
-}
-
-/// No-op implementation for embedded/single-node usage
-pub struct NoReplication;
-impl ReplicationHook for NoReplication {
-    async fn replicate_and_wait(&self, _lsn: Lsn, _record: &[u8]) -> Result<()> { Ok(()) }
-}
+/// NOTE: The ReplicationHook trait is defined in L6 (database/replication_hook.rs).
+/// CommitCoordinator receives it as an injected dependency from L6.
+/// L5 does NOT define the trait — it only consumes it.
 
 pub struct CommitCoordinator {
     ts_allocator: TsAllocator,
     commit_log: RwLock<CommitLog>,
     subscriptions: RwLock<SubscriptionRegistry>,
     wal_writer: WalWriter,
-    replication: Box<dyn ReplicationHook>,  // injected by Integration
+    replication: Box<dyn ReplicationHook>,  // injected by L6 (Database)
     commit_rx: mpsc::Receiver<(CommitRequest, oneshot::Sender<CommitResult>)>,
 }
 
@@ -266,7 +255,7 @@ impl CommitCoordinator {
     //   4. Apply mutations to page store (via L3)
     //   5. Update commit log
     //   6. Invalidate subscriptions
-    //   7-8. self.replication.replicate_and_wait() — calls L6 if wired, no-op otherwise
+    //   7-8. self.replication.replicate_and_wait() — calls L7 if wired, no-op otherwise
     //   9. Advance latest_committed_ts
     //   10. Notify client
 }
@@ -285,11 +274,11 @@ impl CommitHandle {
 
 | Interface | Used By | Purpose |
 |-----------|---------|---------|
-| `TsAllocator` | L5 internal, Integration | Timestamp management |
-| `ReadSet`, `ReadInterval` | L4 (produces), L5 (validates), L6 (replication) | Conflict surface |
+| `TsAllocator` | L5 internal, L6 (Database) | Timestamp management |
+| `ReadSet`, `ReadInterval` | L4 (produces), L5 (validates), L7 (replication) | Conflict surface |
 | `WriteSet`, `MutationEntry` | L4 (read-your-writes), L5 (commit) | Buffered mutations |
-| `CommitHandle::commit` | L7 (session), L6 (promotion) | Submit commit request |
-| `CommitResult` | L7 (session response) | Success/conflict reporting |
-| `SubscriptionRegistry` | L5 internal, Integration | Subscription management |
-| `InvalidationEvent` | L7 (push notification to client) | Subscription invalidation |
+| `CommitHandle::commit` | L6 (Database), L8 (session) | Submit commit request |
+| `CommitResult` | L6 (transaction API), L8 (session response) | Success/conflict reporting |
+| `SubscriptionRegistry` | L5 internal, L6 (Database) | Subscription management |
+| `InvalidationEvent` | L6 (callback), L8 (push to client) | Subscription invalidation |
 | `CommitLog` | L5 internal | OCC validation data |

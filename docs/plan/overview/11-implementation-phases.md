@@ -50,7 +50,7 @@ Bottom-up build order. Each phase produces a testable deliverable.
 - B-tree: split correctness (leaf + internal), merge/redistribute
 - B-tree: scan forward + backward with bounds
 - WAL: write records, read back, verify CRC, segment rollover
-- WAL: group commit (multiple concurrent appends → single fsync)
+- WAL: group commit (multiple concurrent appends -> single fsync)
 - Heap: store + load small/medium/large blobs, overflow chain traversal
 - DWB: write pages, simulate torn write, recover
 
@@ -66,8 +66,8 @@ Bottom-up build order. Each phase produces a testable deliverable.
 
 **Tests:**
 - Checkpoint: dirty pages flushed through DWB, WAL record written
-- Recovery: crash after DWB write → torn pages restored, WAL replayed
-- Recovery: crash during WAL write → partial record detected via CRC
+- Recovery: crash after DWB write -> torn pages restored, WAL replayed
+- Recovery: crash during WAL write -> partial record detected via CRC
 - Vacuum: remove entries, pages freed
 - Catalog B-tree: insert/get/scan collection and index entries
 
@@ -121,75 +121,80 @@ Bottom-up build order. Each phase produces a testable deliverable.
 - `tx/commit_log.rs` — CommitLog
 - `tx/occ.rs` — OCC validation
 - `tx/subscriptions.rs` — SubscriptionRegistry
-- `tx/commit.rs` — CommitCoordinator (single-writer loop)
+- `tx/commit.rs` — CommitCoordinator (single-writer loop), ReplicationHook trait
 
 **Tests:**
 - OCC: detect conflict when read interval overlaps concurrent write
 - OCC: no false conflict when intervals don't overlap
 - OCC: phantom detection (new key enters read interval)
 - Subscriptions: register, invalidate on overlapping commit, collect query_ids
-- Subscriptions: subscribe chain (invalidation → new tx → updated read set)
+- Subscriptions: subscribe chain (invalidation -> new tx -> updated read set)
 - Commit protocol: end-to-end commit with WAL + page store + commit log
 - Read set: interval merging, limit-aware tightening
 
 **Full ACID transactions with OCC and subscriptions.**
 
-## Phase 8: Integration (Database + Catalog + System)
+## Phase 8: Database Instance (Layer 6)
 
 **Deliverables:**
-- `catalog_cache.rs` — CatalogCache (dual-indexed by name AND id)
-- `database.rs` — Database instance (open, close, create/drop collection/index)
-- `system_database.rs` — SystemDatabase (database registry)
-- `config.rs` — All configuration structs
+- `database/database.rs` — Database struct (open, close, embedded API)
+- `database/catalog_cache.rs` — CatalogCache (dual-indexed by name AND id)
+- `database/system_database.rs` — SystemDatabase (database registry)
+- `database/config.rs` — DatabaseConfig, TransactionConfig
+- `database/replication_hook.rs` — ReplicationHook trait, NoReplication
 
 **Tests:**
 - CatalogCache: lookup by name and by id, add/remove collections and indexes
 - Database: open with recovery, create collection, insert + query, close
 - Database: create index, background build completes, query uses index
+- Database: embedded usage end-to-end (no networking)
+- Database: begin_readonly, begin_mutation, commit, rollback
+- Database: ReplicationHook called during commit (mock implementation)
 - SystemDatabase: create/drop/list databases
 - End-to-end: multiple databases, each with collections and indexes
-- Startup/shutdown: clean shutdown + restart
+- Startup/shutdown: clean shutdown + restart preserves data
 
-**System is usable as an embedded library.**
+**System is usable as an embedded library. Primary milestone.**
 
-## Phase 9: API & Protocol (Layer 7)
+## Phase 9: Replication (Layer 7) — Optional
+
+**Deliverables:**
+- `replication/primary_server.rs` — PrimaryReplicator (implements ReplicationHook)
+- `replication/replica_client.rs` — ReplicaClient
+- `replication/promotion.rs` — Transaction promotion
+- `replication/snapshot.rs` — Full snapshot transfer
+- `replication/recovery_tiers.rs` — Recovery tier selection
+
+**Tests:**
+- PrimaryReplicator implements ReplicationHook correctly
+- WAL streaming: primary commit -> replica receives and applies
+- Read isolation: replica reads at applied_ts
+- Subscription: replica-local subscription invalidated on WAL receive
+- Promotion: write on replica -> forwarded to primary -> committed
+- Tier 1: replica disconnect -> reconnect -> incremental catch-up
+- Tier 3: full snapshot transfer -> replica operational
+- Reconnection: exponential backoff on connection failure
+
+**Full distributed system: primary + replicas with synchronous replication.**
+
+## Phase 10: API & Protocol (Layer 8) — Optional
 
 **Deliverables:**
 - `api/frame.rs` — Frame format (JSON text + binary auto-detect)
 - `api/messages.rs` — All message types, parse/serialize
 - `api/session.rs` — Session state machine
 - `api/auth.rs` — JWT validation
-- `api/transport.rs` — TCP/TLS/WebSocket listeners
+- `api/transport.rs` — TCP/TLS/WebSocket listeners, ServerConfig
 
 **Tests:**
 - Frame: JSON text roundtrip, binary frame roundtrip, auto-detect
 - Messages: parse all client message types, serialize all server message types
-- Session: auth → begin → insert → query → commit lifecycle
+- Session: auth -> begin -> insert -> query -> commit lifecycle
 - Session: pipelining (multiple messages before response)
 - Session: subscription invalidation push
-- Auth: valid JWT → ok, expired → error, wrong issuer → error
+- Auth: valid JWT -> ok, expired -> error, wrong issuer -> error
 
 **Server is accessible over the network.**
-
-## Phase 10: Replication (Layer 6)
-
-**Deliverables:**
-- `replication/primary_server.rs` — WAL streaming server
-- `replication/replica_client.rs` — WAL streaming client
-- `replication/promotion.rs` — Transaction promotion
-- `replication/snapshot.rs` — Full snapshot transfer
-- `replication/recovery_tiers.rs` — Recovery tier selection
-
-**Tests:**
-- WAL streaming: primary commit → replica receives and applies
-- Read isolation: replica reads at applied_ts
-- Subscription: replica-local subscription invalidated on WAL receive
-- Promotion: write on replica → forwarded to primary → committed
-- Tier 1: replica disconnect → reconnect → incremental catch-up
-- Tier 3: full snapshot transfer → replica operational
-- Reconnection: exponential backoff on connection failure
-
-**Full distributed system: primary + replicas with synchronous replication.**
 
 ## Phase 11: Hardening & Polish
 

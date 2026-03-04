@@ -218,6 +218,60 @@ Instead of periodically scanning the entire primary B-tree to find reclaimable o
 
 **Fallback**: a full B-tree scan can still be used as a safety net (e.g., on startup or periodically at low frequency) to catch any candidates missed by the incremental approach.
 
+### Rollback Vacuum (Un-replicated Commit Cleanup)
+
+This is a specialized vacuum that removes entries written by commits that were never replicated (ts > visible_ts). It is the ONLY undo mechanism in the system.
+
+**When triggered:**
+- **Live rollback**: When the primary loses quorum during `replicate_and_wait()`, the current transaction's write set is still in memory. The commit coordinator can immediately undo it by deleting the exact keys that were just materialized (step 4 of the commit protocol). No WAL scan needed — the write set + index deltas provide exact keys.
+- **Startup cleanup**: On recovery, if any commits exist with `ts > visible_ts` (from the FileHeader), they must be removed. This uses the WAL to identify exactly what to undo.
+
+**WAL-driven startup cleanup (no full scan):**
+1. After WAL replay completes, check: does the latest committed ts in memory exceed `visible_ts` from FileHeader?
+2. If yes, scan WAL records where `commit_ts > visible_ts`:
+   - Each `TxCommit` record contains the collection_id, doc_id, commit_ts, and index deltas
+   - For each: delete primary key `doc_id || inv_ts(commit_ts)` from the primary B-tree
+   - For each index delta with `new_key`: delete secondary key from the secondary B-tree
+   - For each index delta with `old_key = None` (was an insert, no previous version): nothing else needed
+   - For each index delta with `old_key = Some(...)` (was a replace/delete): the previous version is still in the B-tree and becomes "current" again — no action needed
+3. Write a `WAL_RECORD_ROLLBACK_VACUUM` record listing the rolled-back transactions
+4. The pending vacuum queue should also discard any candidates from rolled-back commits
+
+**Efficiency:**
+- Live rollback: O(write_set_size) — deletes exactly the keys from the failed commit, using in-memory write set
+- Startup cleanup: O(WAL_records_after_visible_ts) — reads only the WAL tail, no B-tree scan
+- Both are proportional to the amount of un-replicated work, not database size
+
+**Correctness:**
+- Un-replicated data was NEVER visible to any reader (visible_ts fence prevented it)
+- Removing it is semantically equivalent to the commit never happening
+- After rollback vacuum, the database state is identical to what replicas see
+
+```rust
+pub struct RollbackVacuum {
+    primary_indexes: HashMap<CollectionId, Arc<PrimaryIndex>>,
+    secondary_indexes: HashMap<IndexId, Arc<SecondaryIndex>>,
+}
+
+impl RollbackVacuum {
+    /// Live rollback: undo a single failed commit using its in-memory write set
+    pub fn rollback_commit(
+        &self,
+        commit_ts: Ts,
+        write_set: &WriteSet,
+        index_deltas: &[IndexDelta],
+    ) -> Result<()>;
+
+    /// Startup cleanup: undo all commits with ts > visible_ts using WAL
+    pub fn rollback_from_wal(
+        &self,
+        visible_ts: Ts,
+        wal_reader: &WalReader,
+        checkpoint_lsn: Lsn,
+    ) -> Result<u64>;  // returns number of rolled-back commits
+}
+```
+
 ## Interfaces Exposed to Higher Layers
 
 | Interface | Used By | Purpose |
@@ -231,3 +285,5 @@ Instead of periodically scanning the entire primary B-tree to find reclaimable o
 | `compute_index_entries` | L5 (index delta computation) | Index key generation |
 | `IndexBuilder::build` | Integration (background task) | Index backfill |
 | `key_encoding::encode_scalar` | L4 (range encoder) | Query range to byte interval |
+| `RollbackVacuum::rollback_commit` | L5 (commit coordinator) | Live rollback of failed commit |
+| `RollbackVacuum::rollback_from_wal` | L6 (startup/recovery) | Startup cleanup of un-replicated commits |

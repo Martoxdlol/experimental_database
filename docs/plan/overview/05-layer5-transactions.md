@@ -232,6 +232,10 @@ pub enum CommitResult {
         new_tx_id: Option<TxId>,   // if subscribe: true
         new_ts: Option<Ts>,
     },
+    QuorumLost {
+        /// The commit was materialized then rolled back. Client should retry
+        /// when cluster recovers.
+    },
 }
 
 /// NOTE: The ReplicationHook trait is defined in L6 (database/replication_hook.rs).
@@ -263,6 +267,12 @@ impl CommitCoordinator {
     //      a. self.replication.replicate_and_wait(lsn, record)
     //      b. subscriptions.check_invalidation(index_writes)
     //   7. AWAIT replication (6a)
+    //      ON SUCCESS: continue to step 8
+    //      ON FAILURE (quorum lost):
+    //        a. Rollback this commit: delete materialized keys using write_set + index_deltas
+    //        b. Remove this commit from commit_log
+    //        c. Enter hold state (reject new commits)
+    //        d. Return CommitResult::QuorumLost to client
     //   8. Write WAL_RECORD_VISIBLE_TS(commit_ts) + fsync
     //   9. Advance visible_ts = commit_ts (in-memory)
     //  10. Respond to committing client
@@ -314,7 +324,7 @@ With `visible_ts`, step 2 cannot happen until replication of `ts=101` is confirm
 
 **Recovery behavior:**
 
-On startup, `visible_ts` is set to the last `WAL_RECORD_VISIBLE_TS` found during WAL replay. Any commits that exist locally beyond `visible_ts` were written to WAL but not yet replicated — they remain locally present but invisible to new readers until they are re-replicated and `visible_ts` advances again.
+On startup, `visible_ts` is set to the last `WAL_RECORD_VISIBLE_TS` found during WAL replay. Any commits that exist locally beyond `visible_ts` were written to WAL but not yet replicated — they remain locally present but invisible to new readers until they are re-replicated and `visible_ts` advances again. After WAL replay, if committed transactions exist beyond visible_ts, the rollback vacuum (see Layer 3) removes their materialized entries. This ensures the database state matches what replicas have.
 
 **Vacuum interaction:**
 

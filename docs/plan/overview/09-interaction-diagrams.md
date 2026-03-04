@@ -36,6 +36,8 @@ Caller          Database(L6)   CommitCoord(L5)   WAL(L2)     DocStore(L3)  Repli
   |                 |                |<----------------------------------------|   |             |
   |                 |                |               |              |   ack         |             |
   |                 |                |               |              |              |             |
+  |                 |       === SUCCESS PATH ===      |              |              |             |
+  |                 |                |               |              |              |             |
   |                 |          8. PERSIST VISIBLE_TS   |              |              |             |
   |                 |                |--append+fsync->|              |              |             |
   |                 |                |   VISIBLE_TS   |              |              |             |
@@ -49,9 +51,27 @@ Caller          Database(L6)   CommitCoord(L5)   WAL(L2)     DocStore(L3)  Repli
   |<--ok(commit_ts)-|                |               |              |              |             |
   |                 |                |               |              |              |             |
   |                 |         11. PUSH INVALIDATION (fire-and-forget to subscriber sessions)    |
+  |                 |                |               |              |              |             |
+  |                 |       === FAILURE PATH (quorum lost at step 7) ===                       |
+  |                 |                |               |              |              |             |
+  |                 |          7f. ROLLBACK MATERIALIZE              |              |             |
+  |                 |                |--------delete_keys(write_set+index_deltas)->|             |
+  |                 |                |<-------------------------------|              |             |
+  |                 |                |               |              |              |             |
+  |                 |          8f. REMOVE FROM COMMIT LOG            |              |             |
+  |                 |          commit_log.remove()    |              |              |             |
+  |                 |                |               |              |              |             |
+  |                 |          9f. ENTER HOLD STATE   |              |              |             |
+  |                 |          (block new mutations)  |              |              |             |
+  |                 |                |               |              |              |             |
+  |                 |         10f. RESPOND            |              |              |             |
+  |                 |<--QuorumLost---|               |              |              |             |
+  |<--err(QuorumLost)|               |              |              |              |             |
 ```
 
 Note: Steps 6a (replicate) and 6b (check invalidation) run concurrently. Without replication (NoReplication), 6a is a no-op. Step 11 pushes invalidation events to subscriber sessions asynchronously — the committing client does NOT wait for other clients to receive their subscription notifications.
+
+Note: On quorum loss, the rollback uses the in-memory write_set + index_deltas (still available in the commit coordinator) to delete the exact B-tree keys that were just inserted in step 4. No WAL scan needed for live rollback.
 
 ## 2. Point Read (Get by ID) — Embedded Usage
 

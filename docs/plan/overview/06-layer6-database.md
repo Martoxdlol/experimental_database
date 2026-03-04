@@ -64,7 +64,8 @@ impl Database {
     /// the latest replicated/committed timestamp, not ts_allocator.latest())
     pub fn begin_readonly(&self) -> ReadonlyTransaction;
 
-    /// Begin a read-write transaction
+    /// Begin a read-write transaction.
+    /// Returns error if replication hook reports no quorum or hold state.
     pub fn begin_mutation(&self) -> Result<MutationTransaction>;
 
     // --- Collection Management ---
@@ -169,6 +170,13 @@ pub trait ReplicationHook: Send + Sync {
     /// `lsn` — the log sequence number of the committed record
     /// `record` — the raw WAL record bytes
     async fn replicate_and_wait(&self, lsn: Lsn, record: &[u8]) -> Result<()>;
+
+    /// Whether the cluster currently has quorum.
+    /// Called before accepting new commit requests.
+    fn has_quorum(&self) -> bool { true }  // default: always (for NoReplication)
+
+    /// Whether the replicator is in hold state (quorum lost during commit).
+    fn is_holding(&self) -> bool { false }  // default: never (for NoReplication)
 }
 
 /// No-op implementation for embedded/single-node usage (default)
@@ -355,11 +363,12 @@ tx.commit(CommitOptions::default()).await?;
 1. StorageEngine::open() — includes DWB restore + WAL replay internally
 2. Scan catalog B-tree → build CatalogCache
 3. Open primary + secondary index B-tree handles
-4. Create CommitCoordinator with ReplicationHook (or NoReplication)
-5. Start CommitCoordinator task
-6. Start checkpoint background task
-7. Start vacuum background task
-8. Ready ✓
+4. Rollback vacuum: if committed ts > visible_ts, clean up un-replicated entries via WAL scan
+5. Create CommitCoordinator with ReplicationHook (or NoReplication)
+6. Start CommitCoordinator task
+7. Start checkpoint background task
+8. Start vacuum background task
+9. Ready ✓
 ```
 
 ## Shutdown Sequence
@@ -372,6 +381,8 @@ tx.commit(CommitOptions::default()).await?;
 5. Close storage engine (flush buffer pool)
 6. Done
 ```
+
+Note: Hold state is preserved across restart via `visible_ts` in the FileHeader. If the database shuts down while in hold state (quorum lost during commit), the persisted `visible_ts` will be behind the committed ts. On next startup, the rollback vacuum step (step 4) detects this gap and cleans up the un-replicated entries.
 
 ## Catalog Consistency Invariant
 

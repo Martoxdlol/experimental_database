@@ -48,6 +48,13 @@ impl Database {
         replication: Option<Box<dyn ReplicationHook>>,
     ) -> Result<Self>;
 
+    /// Open an ephemeral in-memory database (no files, no durability)
+    /// Useful for testing, temporary data, caching layers
+    pub async fn open_in_memory(
+        config: DatabaseConfig,
+        replication: Option<Box<dyn ReplicationHook>>,
+    ) -> Result<Self>;
+
     /// Close the database (flush, checkpoint, shutdown tasks)
     pub async fn close(&mut self) -> Result<()>;
 
@@ -307,10 +314,10 @@ pub struct TransactionConfig {
 }
 ```
 
-## Embedded Usage Example
+## Embedded Usage Examples
 
 ```rust
-// No server, no network, no auth — just a database
+// File-backed (durable) — data persists across restarts
 let db = Database::open("./mydata", DatabaseConfig::default(), None).await?;
 
 db.create_collection("users")?;
@@ -324,6 +331,17 @@ let tx = db.begin_readonly();
 let results = tx.query("users", "_created_at", &[], None, None, Some(10))?;
 
 db.close().await?;
+```
+
+```rust
+// In-memory (ephemeral) — no files, no I/O, data lost on close
+let db = Database::open_in_memory(DatabaseConfig::default(), None).await?;
+
+db.create_collection("cache")?;
+let mut tx = db.begin_mutation()?;
+tx.insert("cache", json!({"key": "session_123", "data": "..."}))?;
+tx.commit(CommitOptions::default()).await?;
+// Same API — everything works, just no disk persistence
 ```
 
 ## Startup Sequence (Embedded)

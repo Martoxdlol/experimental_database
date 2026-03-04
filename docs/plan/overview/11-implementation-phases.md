@@ -24,18 +24,21 @@ Bottom-up build order. Each phase produces a testable deliverable.
 ## Phase 2: Storage Engine Foundation (Layer 2 — Part 1)
 
 **Deliverables:**
+- `storage/backend.rs` — `PageStorage` and `WalStorage` traits, `FilePageStorage`, `MemoryPageStorage`, `FileWalStorage`, `MemoryWalStorage`
 - `storage/page.rs` — SlottedPage read/write/checksum
-- `storage/buffer_pool.rs` — BufferPool with clock eviction, SharedPageGuard, ExclusivePageGuard
+- `storage/buffer_pool.rs` — BufferPool with clock eviction, SharedPageGuard, ExclusivePageGuard (takes `Arc<dyn PageStorage>`)
 - `storage/free_list.rs` — FreeList allocate/deallocate
-- `storage/engine.rs` — StorageEngine skeleton (open, new_page, file header)
+- `storage/engine.rs` — StorageEngine skeleton (open, open_in_memory, open_with_backend, file header)
 
 **Tests:**
+- PageStorage: FilePageStorage read/write roundtrip, MemoryPageStorage read/write roundtrip
 - SlottedPage: insert slots, delete slots, compact, checksum verify
-- BufferPool: fetch/pin/unpin, clock eviction, cache miss reads from disk
+- BufferPool: fetch/pin/unpin, clock eviction, cache miss reads from backend
+- BufferPool: works identically with file and memory backends
 - FreeList: allocate/deallocate roundtrip
 - FileHeader: read/write/checksum
 
-**Layer 2 facade is usable at this point for page-level operations.**
+**Layer 2 facade is usable at this point for page-level operations. Both file and memory backends work.**
 
 ## Phase 3: B-Tree & WAL (Layer 2 — Part 2)
 
@@ -147,7 +150,8 @@ Bottom-up build order. Each phase produces a testable deliverable.
 - CatalogCache: lookup by name and by id, add/remove collections and indexes
 - Database: open with recovery, create collection, insert + query, close
 - Database: create index, background build completes, query uses index
-- Database: embedded usage end-to-end (no networking)
+- Database: embedded usage end-to-end (no networking), both file-backed and in-memory
+- Database: open_in_memory creates ephemeral database, same API as file-backed
 - Database: begin_readonly, begin_mutation, commit, rollback
 - Database: ReplicationHook called during commit (mock implementation)
 - SystemDatabase: create/drop/list databases

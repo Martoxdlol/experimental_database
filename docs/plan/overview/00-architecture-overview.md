@@ -103,6 +103,20 @@ StorageEngine::recover() → Result<()>  // DWB restore + WAL replay
 
 **If any method requires importing a type from Layer 3+ (DocId, Ts, Document, Filter, etc.), the boundary is WRONG.**
 
+### Storage Backend Abstraction
+
+Layer 2 is **backend-agnostic**. All physical I/O goes through two traits:
+- `PageStorage` — read/write/sync pages
+- `WalStorage` — append/read/sync WAL records
+
+Built-in implementations:
+- `FilePageStorage` + `FileWalStorage` — durable, crash-safe, filesystem-backed
+- `MemoryPageStorage` + `MemoryWalStorage` — ephemeral, zero I/O, in-memory only
+
+The in-memory backend skips DWB (no torn writes), checkpoint (nothing to flush), and recovery (nothing to recover). All other engine code (B-tree, heap, free list, slotted pages) works identically regardless of backend.
+
+This enables `Database::open_in_memory()` at L6 for testing, temporary data, and caching use cases.
+
 ## Module Map
 
 | Layer | Package | Key Files |

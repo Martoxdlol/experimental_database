@@ -2,15 +2,70 @@
 
 **Layer purpose:** Generic storage primitives with **no domain knowledge**. Operates on bytes, pages, and raw keys/values. Can be used as a standalone embedded storage library independent of any document/MVCC/index semantics.
 
+## Storage Backend Traits
+
+The storage engine is **backend-agnostic**. All physical I/O is behind two traits, enabling both durable (filesystem) and ephemeral (in-memory) storage with the same engine code.
+
+```rust
+/// Page-level I/O backend. Implementations handle actual storage.
+pub trait PageStorage: Send + Sync {
+    fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> Result<()>;
+    fn write_page(&self, page_id: PageId, buf: &[u8]) -> Result<()>;
+    fn sync(&self) -> Result<()>;
+    fn page_count(&self) -> u64;
+    fn extend(&self, new_count: u64) -> Result<()>;
+}
+
+/// WAL I/O backend. Implementations handle log persistence.
+pub trait WalStorage: Send + Sync {
+    fn append(&self, data: &[u8]) -> Result<u64>;       // returns offset
+    fn sync(&self) -> Result<()>;
+    fn read_from(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
+    fn truncate_before(&self, offset: u64) -> Result<()>;
+    fn size(&self) -> u64;
+}
+
+/// File-backed storage (durable, crash-safe)
+pub struct FilePageStorage { file: File, page_size: usize }
+pub struct FileWalStorage { dir: PathBuf, segment_size: usize }
+
+/// In-memory storage (ephemeral, zero I/O)
+/// No fsync, no DWB, no crash recovery — data lives only in RAM.
+pub struct MemoryPageStorage { pages: RwLock<Vec<Vec<u8>>>, page_size: usize }
+pub struct MemoryWalStorage { log: RwLock<Vec<u8>> }
+```
+
+**Design rules:**
+- `BufferPool` takes `Arc<dyn PageStorage>` instead of `File`
+- `WalWriter` takes `Arc<dyn WalStorage>` instead of a path
+- `DoubleWriteBuffer` is skipped entirely for in-memory backends (no torn writes possible)
+- Checkpoint is a no-op for in-memory backends (nothing to flush)
+- Recovery is a no-op for in-memory backends (nothing to recover)
+- All other engine code (B-tree, heap, free list, slotted pages) works identically regardless of backend
+
 ## Public Facade
 
 ```rust
 pub struct StorageEngine { /* ... */ }
 
 impl StorageEngine {
-    // Lifecycle
+    // Lifecycle — file-backed (durable)
     pub fn open(path: &Path, config: StorageConfig) -> Result<Self>;
+
+    // Lifecycle — in-memory (ephemeral)
+    pub fn open_in_memory(config: StorageConfig) -> Result<Self>;
+
+    // Lifecycle — custom backend
+    pub fn open_with_backend(
+        page_storage: Arc<dyn PageStorage>,
+        wal_storage: Arc<dyn WalStorage>,
+        config: StorageConfig,
+    ) -> Result<Self>;
+
     pub fn close(&mut self) -> Result<()>;
+
+    /// Returns true if this engine uses durable (file-backed) storage
+    pub fn is_durable(&self) -> bool;
 
     // B-tree management
     pub fn create_btree(&self) -> Result<BTreeHandle>;
@@ -26,8 +81,8 @@ impl StorageEngine {
     pub fn read_wal_from(&self, lsn: Lsn) -> WalIterator;
 
     // Maintenance
-    pub fn checkpoint(&self) -> Result<()>;
-    pub fn recover(&mut self) -> Result<()>;
+    pub fn checkpoint(&self) -> Result<()>;  // no-op for in-memory
+    pub fn recover(&mut self) -> Result<()>; // no-op for in-memory
 
     // Internal access (for integration layer)
     pub fn buffer_pool(&self) -> &BufferPool;
@@ -107,7 +162,7 @@ pub struct BufferPool {
     page_table: RwLock<HashMap<PageId, FrameId>>,
     frames: Vec<FrameSlot>,
     clock_hand: AtomicU32,
-    data_file: File,
+    page_storage: Arc<dyn PageStorage>,  // backend-agnostic
     page_size: usize,
 }
 
@@ -139,7 +194,7 @@ impl ExclusivePageGuard<'_> {
 }
 
 impl BufferPool {
-    pub fn new(config: BufferPoolConfig, data_file: File) -> Self;
+    pub fn new(config: BufferPoolConfig, page_storage: Arc<dyn PageStorage>) -> Self;
     pub fn fetch_page_shared(&self, page_id: PageId) -> Result<SharedPageGuard>;
     pub fn fetch_page_exclusive(&self, page_id: PageId) -> Result<ExclusivePageGuard>;
     pub fn new_page(&self) -> Result<ExclusivePageGuard>;
@@ -211,14 +266,14 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
-    pub fn new(wal_dir: &Path, config: WalConfig) -> Result<Self>;
+    pub fn new(storage: Arc<dyn WalStorage>, config: WalConfig) -> Result<Self>;
     pub async fn append(&self, record_type: u8, payload: &[u8]) -> Result<Lsn>;
     pub fn append_raw_frame(&self, raw: &[u8]) -> Result<Lsn>;  // for replication
 }
 
 pub struct WalReader { /* ... */ }
 impl WalReader {
-    pub fn open(wal_dir: &Path) -> Result<Self>;
+    pub fn open(storage: Arc<dyn WalStorage>) -> Result<Self>;
     pub fn read_from(&self, lsn: Lsn) -> WalIterator;
     pub fn latest_lsn(&self) -> Lsn;
 }
@@ -274,18 +329,19 @@ impl FreeList {
 
 ### `dwb.rs` — Double-Write Buffer
 
-**WHY HERE:** Torn-write protection for the page store. Operates on raw page bytes.
+**WHY HERE:** Torn-write protection for the page store. Operates on raw page bytes. **Only used with file-backed storage** — in-memory backends skip DWB entirely (no torn writes possible).
 
 ```rust
 pub struct DoubleWriteBuffer {
-    path: PathBuf,
+    page_storage: Arc<dyn PageStorage>,  // writes restored pages to backend
+    dwb_path: PathBuf,                   // DWB file is always on disk
     page_size: usize,
 }
 
 impl DoubleWriteBuffer {
-    pub fn new(path: &Path, page_size: usize) -> Self;
+    pub fn new(path: &Path, page_storage: Arc<dyn PageStorage>, page_size: usize) -> Self;
     pub fn write_pages(&self, pages: &[(PageId, &[u8])]) -> Result<()>;  // sequential write + fsync
-    pub fn recover(&self, data_file: &File) -> Result<u32>;  // returns pages restored
+    pub fn recover(&self) -> Result<u32>;  // returns pages restored
     pub fn truncate(&self) -> Result<()>;
     pub fn is_empty(&self) -> Result<bool>;
 }
@@ -425,13 +481,15 @@ pub struct FileHeader {
 
 | Interface | Used By | Purpose |
 |-----------|---------|---------|
-| `StorageEngine` | L3, Integration | Full storage facade |
+| `StorageEngine` | L3, L6 (Database) | Full storage facade |
 | `BTreeHandle` | L3 (PrimaryIndex, SecondaryIndex) | Raw byte B-tree ops |
 | `ScanIterator` | L3, L4 | Range scan results |
 | `HeapRef`, `heap_store/load/free` | L3 (large doc storage) | External blob storage |
-| `WalWriter`, `WalReader`, `WalRecord` | L5 (commit), L6 (replication) | Durable logging |
-| `Lsn` | L5, L6 | WAL position tracking |
+| `WalWriter`, `WalReader`, `WalRecord` | L5 (commit), L7 (replication) | Durable logging |
+| `Lsn` | L5, L7 | WAL position tracking |
+| `PageStorage`, `WalStorage` traits | L2 internal, custom backends | Backend abstraction |
+| `FilePageStorage`, `MemoryPageStorage` | L2 (built-in backends) | Concrete implementations |
 | `BufferPool` | Checkpoint, Recovery | Page management |
-| `FileHeader` | Integration | Metadata (catalog root, ID allocators) |
-| `CollectionEntry`, `IndexEntry` | Integration (CatalogCache) | Catalog B-tree data |
-| `Checkpoint` | Integration (background task) | Maintenance |
+| `FileHeader` | L6 (Database) | Metadata (catalog root, ID allocators) |
+| `CollectionEntry`, `IndexEntry` | L6 (CatalogCache) | Catalog B-tree data |
+| `Checkpoint` | L6 (background task) | Maintenance |

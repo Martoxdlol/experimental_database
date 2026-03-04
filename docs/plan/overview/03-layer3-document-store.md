@@ -196,6 +196,24 @@ impl IndexBuilder {
 }
 ```
 
+## Vacuum Strategy: WAL-Driven Candidate Tracking
+
+Instead of periodically scanning the entire primary B-tree to find reclaimable old versions (O(total entries)), use the **write path as a source of vacuum candidates**:
+
+1. **On each commit**: when a `TxCommit` contains a Replace or Delete mutation, the *previous* version at `(doc_id, old_ts)` becomes a future vacuum candidate. Push it (along with its old secondary index keys from the IndexDelta) into a **pending vacuum queue**.
+2. **Periodically**: check `oldest_active_read_ts` from L5 (TxManager).
+3. **Drain eligible entries**: any pending entry where `old_ts` is older than the most recent version visible at `oldest_active_read_ts` is safe to remove.
+4. **Execute**: write a `Vacuum` WAL record (0x08) with the entries, then call Layer 2's `VacuumTask.remove_entries()` to perform the actual B-tree key deletions.
+
+**Advantages over B-tree scan**:
+- Work proportional to write rate, not database size — a 100 GB database with 1 write/sec does minimal vacuum work
+- Candidates arrive incrementally from the commit path — no separate scan phase
+- Lower latency to reclaim old versions
+
+**Queue persistence**: the pending queue is rebuilt on startup by replaying the WAL from the last checkpoint. Each `TxCommit` with Replace/Delete re-populates candidates; each `Vacuum` record removes them. Alternatively, the queue can be a simple in-memory structure (rebuilt from WAL on recovery).
+
+**Fallback**: a full B-tree scan can still be used as a safety net (e.g., on startup or periodically at low frequency) to catch any candidates missed by the incremental approach.
+
 ## Interfaces Exposed to Higher Layers
 
 | Interface | Used By | Purpose |

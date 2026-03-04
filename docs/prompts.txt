@@ -54,4 +54,64 @@ For each module placement decision, briefly note WHY it belongs in that layer (o
 -------------------------------------------------------------------------------------------
 
 
-/ralph-loop:ralph-loop "Based on DESIGN.md, and on docs/plan/overview/*.md, create a storage engine implementation plan. Do it in docs/plan/storage/*.md. To do this ensure to follow all the requirements. Include process diagrams and detailed implementation steps. The storage engine itself will have its own layers, keep the layers organized and correctly structured." --completion-promise "DONE" --max-iterations 20
+/ralph-loop:ralph-loop "Based on docs/DESIGN.md and docs/plan/overview/*.md (especially 02-layer2-storage-engine.md), create a detailed storage engine implementation plan in docs/plan/storage/*.md.
+
+The storage engine is Layer 2 in the architecture — a GENERIC storage library with NO domain knowledge (no DocId, Ts, Document, Filter, MVCC, or any Layer 3+ types).
+
+REQUIREMENTS:
+
+1. BACKEND ABSTRACTION (do this first):
+   - PageStorage trait and WalStorage trait (read/write/sync pages and WAL)
+   - FilePageStorage, FileWalStorage — durable filesystem implementations
+   - MemoryPageStorage, MemoryWalStorage — ephemeral in-memory implementations
+   - StorageEngine::open(path), open_in_memory(), open_with_backend(custom) entry points
+   - In-memory backends skip DWB, checkpoint, and recovery (no-ops)
+
+2. SUB-LAYER ORGANIZATION within Layer 2 (bottom-up build order, one file per sub-layer):
+   - S1: Backend traits + implementations (PageStorage, WalStorage)
+   - S2: Page format (SlottedPage, PageHeader, PageType, checksum)
+   - S3: Buffer pool (page cache with clock eviction, SharedPageGuard, ExclusivePageGuard, takes Arc<dyn PageStorage>)
+   - S4: Free list (page allocation/deallocation)
+   - S5: WAL (WalWriter with group commit, WalReader, segment management, takes Arc<dyn WalStorage>)
+   - S6: B+ tree (generic on raw byte keys/values with memcmp ordering, insert/get/delete/scan, split/merge, uses buffer pool)
+   - S7: Heap (large value storage with overflow chains)
+   - S8: Double-write buffer (torn-write protection, file-backed only)
+   - S9: Checkpoint (flush dirty pages through DWB, WAL record)
+   - S10: Recovery (DWB restore + WAL replay via WalRecordHandler trait callback)
+   - S11: Vacuum (page-level entry removal from B-trees)
+   - S12: Catalog B-tree schema (key format for collection/index entries, serialize/deserialize, no MVCC)
+   - S13: StorageEngine facade (composes all sub-layers, public API)
+
+3. For EACH sub-layer:
+   - Rust types (structs, enums, traits) with method signatures
+   - Dependencies on other sub-layers (which sub-layers it uses)
+   - Detailed implementation steps (not just 'implement X', but HOW — algorithms, data structures, edge cases)
+   - Error handling (what can fail, how to report)
+   - Tests (specific test cases with expected behavior)
+
+4. ASCII DIAGRAMS for these internal flows:
+   - Page read path: buffer pool miss → PageStorage::read_page → frame → guard
+   - Page write path: ExclusivePageGuard drop → mark dirty → checkpoint flush
+   - B-tree insert with split: leaf full → split leaf → propagate to parent → possible root split
+   - B-tree scan: seek to lower bound → iterate leaf chain → yield entries
+   - WAL write path: append request → group commit batching → WalStorage::append → fsync → return LSN
+   - Checkpoint flow: snapshot dirty set → DWB write → scatter-write to PageStorage → mark clean → WAL checkpoint record
+   - Recovery flow: read meta → DWB recover → open pages → WAL replay from checkpoint_lsn
+   - Free list allocate: pop from list or extend file
+
+5. LATCH PROTOCOL:
+   - Page table RwLock → Frame RwLock ordering (strict hierarchy)
+   - Multiple frame locks in ascending page_id order
+   - Never hold frame lock across I/O or await points
+   - B-tree latch coupling (crab protocol) for concurrent access
+
+6. PUBLIC FACADE must match overview spec exactly:
+   - StorageEngine::open/open_in_memory/open_with_backend/close
+   - StorageEngine::create_btree/open_btree → BTreeHandle
+   - BTreeHandle::get/insert/delete/scan — raw &[u8] only
+   - StorageEngine::heap_store/load/free
+   - StorageEngine::append_wal/read_wal_from
+   - StorageEngine::checkpoint/recover
+   - NO types from Layer 3+ anywhere in the public API
+
+7. IMPLEMENTATION ORDER: specify which sub-layers to build first and test independently before composing. Each sub-layer should be testable in isolation where possible." --completion-promise "DONE" --max-iterations 20

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(*)",
+      "Write(*)",
+      "Bash(*)",
+      "WebFetch(domain:*)",
+      "Skill(ralph-loop:ralph-loop)"
+    ]
+  }
+}

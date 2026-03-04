@@ -1,3 +1,18 @@
+//! Slotted page format.
+//!
+//! Every page in the data file uses the same 32-byte header followed by a
+//! slot directory and cell data region. The slot directory grows forward from
+//! the header; cells are allocated backward from the end of the page.
+//!
+//! ```text
+//! ┌──────────────┬───────────────┬───────────────┬──────────────┐
+//! │ Header (32B) │ Slot dir →    │  Free space   │  ← Cell data │
+//! └──────────────┴───────────────┴───────────────┴──────────────┘
+//! ```
+//!
+//! Each slot entry is 4 bytes: `(offset: u16, length: u16)`.
+//! CRC-32C checksums cover the entire page (except the checksum field itself).
+
 use crate::types::*;
 
 /// In-memory representation of the 32-byte page header.

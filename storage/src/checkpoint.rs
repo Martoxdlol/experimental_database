@@ -1,3 +1,19 @@
+//! Fuzzy checkpoint with double-write buffer (DWB).
+//!
+//! A checkpoint flushes dirty pages from the buffer pool to the data file,
+//! advancing the recovery start point. The double-write buffer protects
+//! against torn writes: pages are first written sequentially to the DWB file,
+//! then scattered to their final positions in `data.db`.
+//!
+//! ## Checkpoint steps
+//!
+//! 1. Snapshot dirty frames (in-memory, no I/O)
+//! 2. Write snapshot to DWB (`data.dwb`)
+//! 3. Scatter-write pages to data file
+//! 4. `fsync` data file
+//! 5. Clear DWB
+//! 6. Update file header (checkpoint LSN, page count)
+
 use std::path::Path;
 
 use crate::types::*;

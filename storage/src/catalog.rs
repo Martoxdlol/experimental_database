@@ -1,3 +1,9 @@
+//! In-memory collection and index metadata catalog.
+//!
+//! The [`CatalogCache`] provides O(1) lookup of collections (by name or ID)
+//! and indexes. It is owned by the writer task and published to readers via
+//! [`SharedCatalog`], which uses `ArcSwap` for lock-free snapshot reads.
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::types::*;

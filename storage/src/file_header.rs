@@ -1,3 +1,10 @@
+//! Database file header (page 0) with shadow copy for crash safety.
+//!
+//! The file header stores essential database metadata: page size, page count,
+//! free list head, catalog root page, and checkpoint LSN. A shadow copy is
+//! kept at the last page of the file so that if either copy is corrupted by
+//! a torn write, the other can be used to recover.
+
 use crate::types::*;
 use crate::buffer_pool::{BufferPoolError, ExclusivePageGuard, SharedPageGuard, PageIO};
 

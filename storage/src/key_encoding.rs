@@ -1,3 +1,17 @@
+//! Order-preserving, self-delimiting key encoding.
+//!
+//! Encodes typed scalar values into byte strings where `memcmp` ordering
+//! matches the logical value ordering. Each encoded value is prefixed with
+//! a type tag byte that also determines cross-type sort order:
+//!
+//! ```text
+//! undefined (0x00) < null (0x01) < int64 (0x02) < float64 (0x03)
+//!   < boolean (0x04) < string (0x05) < bytes (0x06) < array (0x07)
+//! ```
+//!
+//! Integers use XOR-flip encoding; floats use IEEE 754 total-order encoding;
+//! strings use null-byte escaping (`0x00 → 0x00 0x01`, terminated by `0x00 0x00`).
+
 use crate::types::*;
 
 pub mod type_tag {
@@ -83,11 +97,7 @@ pub fn encode_secondary_key(
 }
 
 /// Encode a created_at index key.
-pub fn encode_created_at_key(
-    created_at: i64,
-    doc_id: DocId,
-    commit_ts: Timestamp,
-) -> EncodedKey {
+pub fn encode_created_at_key(created_at: i64, doc_id: DocId, commit_ts: Timestamp) -> EncodedKey {
     let mut buf = Vec::new();
     encode_int64(&mut buf, created_at);
     buf.extend_from_slice(&doc_id.to_bytes());
@@ -188,7 +198,9 @@ pub fn decode_primary_key(key: &EncodedKey) -> Result<(DocId, Timestamp), KeyDec
 }
 
 /// Decode a secondary key's suffix: extract (doc_id, commit_ts) from the last 24 bytes.
-pub fn decode_secondary_key_suffix(key: &EncodedKey) -> Result<(DocId, Timestamp), KeyDecodingError> {
+pub fn decode_secondary_key_suffix(
+    key: &EncodedKey,
+) -> Result<(DocId, Timestamp), KeyDecodingError> {
     if key.0.len() < PRIMARY_KEY_SIZE {
         return Err(KeyDecodingError::UnexpectedEnd);
     }
@@ -352,9 +364,7 @@ fn bson_to_scalar(val: &bson::Bson) -> ScalarValue {
         bson::Bson::Double(f) => ScalarValue::Float64(*f),
         bson::Bson::String(s) => ScalarValue::String(s.clone()),
         bson::Bson::Binary(b) => ScalarValue::Bytes(b.bytes.clone()),
-        bson::Bson::Array(arr) => {
-            ScalarValue::Array(arr.iter().map(bson_to_scalar).collect())
-        }
+        bson::Bson::Array(arr) => ScalarValue::Array(arr.iter().map(bson_to_scalar).collect()),
         _ => ScalarValue::Undefined,
     }
 }

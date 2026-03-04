@@ -1,3 +1,18 @@
+//! Buffer pool — an in-memory page cache with clock eviction.
+//!
+//! Pages are cached in fixed-size frames. Each frame has its own `parking_lot::RwLock`
+//! for fine-grained concurrency: multiple readers can hold shared locks on different
+//! frames simultaneously, while writers take exclusive locks.
+//!
+//! I/O uses positional reads/writes (`pread`/`pwrite` on Unix) so there is no
+//! file-level mutex. The clock algorithm (second-chance replacement) evicts
+//! unpinned, unreferenced frames when the pool is full.
+//!
+//! ## Page I/O backends
+//!
+//! - [`FilePageIO`]: production file-backed I/O with `pread`/`pwrite`
+//! - [`MemPageIO`]: in-memory backend for unit tests
+
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

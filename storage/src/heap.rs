@@ -1,3 +1,14 @@
+//! External heap for large documents.
+//!
+//! Documents that exceed the external threshold (default: `page_size / 2`)
+//! are stored outside the B-tree in heap pages. If a document is too large
+//! for a single heap page, it spills into a chain of overflow pages linked
+//! via the `prev_or_ptr` header field.
+//!
+//! A [`HeapFreeSpaceMap`] tracks available space per heap page for best-fit
+//! allocation. The B-tree leaf cell stores a [`HeapRef`](crate::types::HeapRef)
+//! (page_id + slot_id) instead of the inline document body.
+
 use std::collections::BTreeMap;
 use crate::types::*;
 use crate::buffer_pool::{BufferPool, BufferPoolError};

@@ -1,3 +1,9 @@
+//! Core type definitions and constants for the storage engine.
+//!
+//! All fundamental newtypes (`PageId`, `Lsn`, `DocId`, `Timestamp`, etc.),
+//! enum discriminants (`PageType`, `WalRecordType`, `OpType`), and
+//! format constants (`PAGE_HEADER_SIZE`, `PRIMARY_KEY_SIZE`, etc.) live here.
+
 use std::fmt;
 
 /// Page identifier — index into the data file. Page 0 = file header.

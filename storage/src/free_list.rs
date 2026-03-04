@@ -1,3 +1,10 @@
+//! Free page allocator.
+//!
+//! Maintains a singly-linked list of deallocated pages. The next-pointer is
+//! stored in each free page's `prev_or_ptr` header field, forming an intrusive
+//! linked list that requires no additional storage. Accessed exclusively by
+//! the single writer task — no locking needed.
+
 use crate::buffer_pool::{BufferPool, BufferPoolError};
 use crate::types::*;
 

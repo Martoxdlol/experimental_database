@@ -1,3 +1,16 @@
+//! Crash recovery: DWB repair + WAL replay.
+//!
+//! On startup, recovery runs two phases:
+//!
+//! 1. **DWB repair**: if a `data.dwb` file exists, each page's checksum is
+//!    verified in `data.db`. Pages with mismatched checksums (torn writes)
+//!    are restored from the DWB copy.
+//!
+//! 2. **WAL replay**: starting from the last checkpoint LSN (stored in
+//!    `meta.json`), all WAL records are replayed forward, re-applying
+//!    committed transactions, DDL operations, and vacuum entries to the
+//!    B-tree and catalog.
+
 use std::path::Path;
 
 use crate::types::*;

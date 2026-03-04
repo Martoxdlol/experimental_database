@@ -1,3 +1,39 @@
+//! Top-level storage engine facade.
+//!
+//! [`StorageEngine`] is the main entry point. It opens (or creates) a database
+//! directory, runs crash recovery, starts the WAL writer and the single writer
+//! task, and exposes an async API for DDL and DML operations.
+//!
+//! ## Concurrency model
+//!
+//! - **Reads** use [`StorageEngine::catalog()`] (lock-free ArcSwap snapshot)
+//!   and [`StorageEngine::pool()`] (shared page guards) — safe from any thread.
+//! - **Writes** are sent as [`CommitRequest`] messages to the writer task via
+//!   an mpsc channel. The writer task applies mutations sequentially, then
+//!   publishes a new catalog snapshot for readers.
+//!
+//! ## Usage
+//!
+//! ```rust,no_run
+//! use storage::engine::{StorageEngine, DatabaseConfig};
+//! use storage::catalog::CollectionConfig;
+//!
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! let engine = StorageEngine::open("my_db".as_ref(), DatabaseConfig::default()).await?;
+//!
+//! // Create a collection
+//! let col = engine.create_collection("users", CollectionConfig::default()).await?;
+//!
+//! // Read catalog
+//! let catalog = engine.catalog();
+//! assert!(catalog.get_collection_by_name("users").is_some());
+//!
+//! // Graceful shutdown (triggers final checkpoint)
+//! engine.shutdown().await?;
+//! # Ok(())
+//! # }
+//! ```
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

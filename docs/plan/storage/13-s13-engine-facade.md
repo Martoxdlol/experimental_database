@@ -69,10 +69,11 @@ pub struct FileHeader {
 // Remainder of page 0 is zeroed (reserved for future fields).
 
 impl FileHeader {
-    pub fn serialize(&self) -> Vec<u8>;
-    pub fn deserialize(data: &[u8]) -> Result<Self>;
     pub fn verify(&self) -> Result<()>;  // check magic + version
 }
+// Note: FileHeader derives zerocopy's FromBytes + IntoBytes, so it can be
+// read/written directly via those traits (e.g. read_from_bytes / as_bytes).
+// No serialize()/deserialize() methods are needed.
 
 /// The main storage engine.
 pub struct StorageEngine {
@@ -97,10 +98,14 @@ pub struct StorageEngine {
     path: Option<PathBuf>,  // None for in-memory
 }
 
-/// A handle to a B-tree, bound to a StorageEngine.
+/// A handle to a B-tree, bound to the specific components it needs.
+/// Holds references to the free list and buffer pool directly, avoiding
+/// an Arc<StorageEngine> cycle (StorageEngine owns BTreeHandles indirectly
+/// through the catalog, so a back-Arc would create a reference cycle).
 pub struct BTreeHandle {
     btree: BTree,
-    engine: Arc<StorageEngine>,
+    free_list: Arc<Mutex<FreeList>>,
+    buffer_pool: Arc<BufferPool>,
 }
 
 impl StorageEngine {
@@ -161,13 +166,6 @@ impl StorageEngine {
 
     /// Run a checkpoint. No-op for non-durable engines (except WAL record).
     pub async fn checkpoint(&self) -> Result<()>;
-
-    /// Run recovery. Called internally by open(). Exposed for testing.
-    pub fn recover(
-        path: &Path,
-        config: StorageConfig,
-        handler: &mut dyn WalRecordHandler,
-    ) -> Result<Self>;
 
     /// Vacuum entries from B-trees.
     pub fn vacuum(&self, entries: &[VacuumEntry]) -> Result<usize>;
@@ -272,19 +270,41 @@ Like open_in_memory() but with user-provided backends. Checks `page_storage.is_d
 5. page_storage.sync()
 ```
 
+### Recovery
+
+Recovery is **not** a public API method. It runs automatically inside `open()` (step 4) when an existing database is detected. There is no `StorageEngine::recover()` — callers simply call `open()` and recovery happens transparently.
+
+For testing crash recovery, tests should:
+1. Open an engine and write data (without a clean `close()`).
+2. Drop the engine (simulating a crash).
+3. Call `open()` again on the same path — recovery runs automatically.
+
+### Auto-Checkpoint
+
+The `checkpoint_wal_threshold` and `checkpoint_interval` fields in `StorageConfig` control a background checkpoint task that is spawned inside `open()` for durable engines.
+
+The background task works as follows:
+- It sleeps for `checkpoint_interval` (default 300s), then wakes and checks whether a checkpoint is needed.
+- It also wakes early if the WAL size exceeds `checkpoint_wal_threshold` (default 64 MB). The WAL writer notifies the task when this threshold is crossed.
+- On wake, it calls `self.checkpoint()` to flush dirty pages and advance the checkpoint LSN.
+- The task is a `tokio::spawn`ed future that holds an `Arc<StorageEngine>` (or a weak reference) and listens on a shutdown channel.
+- `close()` sends a shutdown signal to the task and awaits its completion before proceeding with the final checkpoint and flush.
+
+For in-memory engines, no background checkpoint task is spawned (checkpointing is a no-op).
+
 ### BTreeHandle Operations
 
-BTreeHandle wraps a BTree and provides access to the engine's free list for insert/delete:
+BTreeHandle wraps a BTree and holds `Arc` references to the free list and buffer pool directly (not to the entire `StorageEngine`). This avoids a reference cycle since `StorageEngine` owns the catalog which indirectly owns `BTreeHandle`s.
 
 ```rust
 impl BTreeHandle {
     pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let mut free_list = self.engine.free_list.lock();
+        let mut free_list = self.free_list.lock().unwrap();
         self.btree.insert(key, value, &mut free_list)
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        let mut free_list = self.engine.free_list.lock();
+        let mut free_list = self.free_list.lock().unwrap();
         self.btree.delete(key, &mut free_list)
     }
 
@@ -316,7 +336,9 @@ In addition to the in-file header, a `meta.json` sidecar file stores:
 }
 ```
 
-Written atomically: write to `meta.json.tmp`, fsync, rename to `meta.json`. Used during recovery to find the checkpoint_lsn without reading page 0 (which might be corrupt).
+Written atomically: write to `meta.json.tmp`, fsync, rename to `meta.json`.
+
+**Precedence on open():** `meta.json` is read **first** to obtain `checkpoint_lsn` (it survives even if page 0 is corrupt, since it is a separate file written atomically). If `meta.json` does not exist (new database, or upgrading from an older version that did not write it), fall back to reading `checkpoint_lsn` from page 0's `FileHeader`. After recovery completes, both `meta.json` and page 0 are written so they stay in sync going forward.
 
 ## Error Handling
 

@@ -43,12 +43,16 @@ pub struct BufferPool {
 /// One slot in the frame array. Each has its own RwLock.
 struct FrameSlot {
     lock: parking_lot::RwLock<FrameData>,
+
+    /// Pin count lives OUTSIDE the RwLock so both SharedPageGuard (which holds
+    /// only a read guard) and ExclusivePageGuard can atomically decrement it
+    /// on Drop without needing write access to the frame.
+    pin_count: AtomicU32,
 }
 
 struct FrameData {
     data: Vec<u8>,             // [u8; page_size] — the page buffer
     page_id: Option<PageId>,   // None if frame is unused
-    pin_count: u32,            // number of active guards
     dirty: bool,               // modified since last flush
     ref_bit: bool,             // clock algorithm reference bit
 }
@@ -64,7 +68,7 @@ impl<'a> SharedPageGuard<'a> {
     pub fn data(&self) -> &[u8];
     pub fn page_id(&self) -> PageId;
 }
-// Drop: decrement pin_count, release read lock
+// Drop: atomically decrement pool.frames[frame_id].pin_count, release read lock
 
 /// RAII exclusive page guard. Only one writer per frame.
 pub struct ExclusivePageGuard<'a> {
@@ -80,7 +84,8 @@ impl<'a> ExclusivePageGuard<'a> {
     pub fn page_id(&self) -> PageId;
     pub fn mark_dirty(&mut self);  // explicit dirty marking
 }
-// Drop: if modified, set dirty = true. Decrement pin_count, release write lock.
+// Drop: if modified, set dirty = true. Atomically decrement
+// pool.frames[frame_id].pin_count, release write lock.
 
 impl BufferPool {
     pub fn new(config: BufferPoolConfig, page_storage: Arc<dyn PageStorage>) -> Self;
@@ -139,12 +144,13 @@ impl BufferPool {
     │ Acquire frame     │    │ evict if needed    │
     │ .read()           │    │ page_storage       │
     │ Set ref_bit=true  │    │   .read_page()     │
-    │ pin_count += 1    │    │ into temp buf      │
-    │ Return guard      │    │ page_table.write() │
-    └───────────────────┘    │ insert mapping     │
-                             │ Copy to frame      │
+    │ pin_count.fetch_  │    │ into temp buf      │
+    │   add(1, AcqRel)  │    │ page_table.write() │
+    │ Return guard      │    │ insert mapping     │
+    └───────────────────┘    │ Copy to frame      │
                              │ Acquire .read()    │
-                             │ pin_count = 1      │
+                             │ pin_count.store(   │
+                             │   1, Release)      │
                              │ Return guard       │
                              └───────────────────┘
 ```
@@ -155,7 +161,7 @@ impl BufferPool {
 2. Read page from backend into a **temporary buffer** (no latch held during I/O).
 3. Call `find_victim()` to get a free frame_id.
 4. Acquire `page_table.write()`. Check again if page_id was loaded by another thread (double-check). If so, use that frame. Otherwise insert `(page_id, frame_id)`.
-5. Acquire `frames[frame_id].lock.write()`. Copy temp buffer into frame data. Set `page_id = Some(page_id)`, `pin_count = 1`, `dirty = false`, `ref_bit = true`.
+5. Acquire `frames[frame_id].lock.write()`. Copy temp buffer into frame data. Set `page_id = Some(page_id)`, `dirty = false`, `ref_bit = true`. Atomically store `frames[frame_id].pin_count = 1` (Release ordering).
 6. Downgrade to read lock (or release write + acquire read). Return SharedPageGuard.
 
 **Key**: No latch is held during the `page_storage.read_page()` call (step 2). This prevents blocking other threads on I/O.
@@ -164,12 +170,12 @@ impl BufferPool {
 
 1. Start at `clock_hand.fetch_add(1) % frame_count`.
 2. Scan frames in a circle:
-   a. Try to acquire `frame.lock.try_write()`. If fails (frame in use), skip.
-   b. If `pin_count > 0`, skip (frame is pinned).
+   a. If `frame.pin_count.load(Acquire) > 0`, skip (frame is pinned — no need to acquire the lock).
+   b. Try to acquire `frame.lock.try_write()`. If fails (frame in use), skip.
    c. If `dirty`, skip (dirty frames are NOT evicted — checkpoint flushes them).
    d. If `ref_bit`, clear it, skip (second chance).
    e. Otherwise: this frame is the victim. Remove its old mapping from page_table. Return frame_id.
-3. If full circle with no victim found: all frames are dirty or pinned. Signal "need checkpoint" and retry after a brief yield.
+3. If full circle with no victim found: all frames are dirty or pinned. Return `Err(BufferPoolFull)`. The caller (or an upper layer) should trigger an emergency checkpoint to flush dirty pages and retry.
 
 **Dirty frames are never evicted**: All page writes to the backend go through the double-write buffer during checkpoint. No unprotected writes. This means a full buffer pool of dirty pages triggers an emergency checkpoint.
 
@@ -205,7 +211,7 @@ Same as fetch_page_shared() but acquire write lock on the frame instead of read 
 | Error | Cause | Handling |
 |-------|-------|----------|
 | I/O error on read | Backend read_page fails | Propagate |
-| No victim available | All frames dirty + pinned | Trigger emergency checkpoint, retry |
+| `BufferPoolFull` | All frames dirty + pinned, no victim available | Return error to caller; caller triggers emergency checkpoint and retries |
 | Page already loaded | Concurrent fetch race | Use the existing frame (double-check pattern) |
 
 ## Tests

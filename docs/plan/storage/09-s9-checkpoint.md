@@ -9,7 +9,6 @@ Flush dirty buffer pool pages to the data file through the DWB, write a checkpoi
 - **S3 (Buffer Pool)**: dirty_pages() snapshot, mark_clean()
 - **S5 (WAL)**: WalWriter to write checkpoint record
 - **S8 (DWB)**: write_pages() for torn-write protection
-- **S13 (Engine)**: updates FileHeader.checkpoint_lsn
 
 ## Rust Types
 
@@ -78,10 +77,16 @@ impl Checkpoint {
 │         wal_writer.append(0x02, &payload)                   │
 ├─────────────────────────────────────────────────────────────┤
 │ Step 6: Return checkpoint_lsn                               │
-│         Caller (StorageEngine) updates FileHeader and        │
-│         meta.json with the new checkpoint_lsn.              │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+> **Post-Checkpoint Steps (caller responsibility)**
+>
+> `Checkpoint::run()` returns `Result<Lsn>`. The caller (StorageEngine, S13) is responsible for:
+> 1. Updating `FileHeader.checkpoint_lsn` in the data file header page.
+> 2. Updating `meta.json` with the new checkpoint LSN.
+>
+> This keeps S9 free of any dependency on S13 and avoids a circular dependency.
 
 ### Checkpoint Flow Diagram
 

@@ -107,7 +107,7 @@ StorageEngine::read_wal_from(lsn: Lsn) → WalIterator
 
 // Maintenance
 StorageEngine::checkpoint() → Result<()>
-StorageEngine::recover() → Result<()>
+// Note: recovery runs automatically inside open() — there is no public recover() method.
 ```
 
 ## Code Documentation Requirement

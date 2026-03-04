@@ -13,6 +13,7 @@ Append-only durable log for crash recovery. Records are opaque byte payloads wit
 ```rust
 use crate::storage::backend::WalStorage;
 use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot}; // NOTE: tokio channels, not std
 
 /// Log Sequence Number — byte offset in the logical WAL stream.
 pub type Lsn = u64;
@@ -21,6 +22,23 @@ pub type Lsn = u64;
 /// Layout: payload_len(u32 LE) + crc32c(u32 LE) + record_type(u8)
 /// Serialized manually with from_le_bytes()/to_le_bytes() (hot path, simple format).
 const WAL_FRAME_HEADER_SIZE: usize = 9;
+
+/// Maximum WAL record payload size. Records exceeding this are treated
+/// as corrupt during iteration. 64 MB is generous for any legitimate record.
+const MAX_WAL_RECORD_SIZE: usize = 64 * 1024 * 1024;
+
+// ─── WAL Record Type Constants ───
+// Defined here as a central registry. The WAL itself treats these as opaque
+// byte tags — the SEMANTICS are defined by higher layers (catalog, storage
+// engine, etc.) that produce and consume these records.
+pub const WAL_RECORD_TX_COMMIT: u8 = 0x01;
+pub const WAL_RECORD_CHECKPOINT: u8 = 0x02;
+pub const WAL_RECORD_CREATE_COLLECTION: u8 = 0x03;
+pub const WAL_RECORD_DROP_COLLECTION: u8 = 0x04;
+pub const WAL_RECORD_CREATE_INDEX: u8 = 0x05;
+pub const WAL_RECORD_DROP_INDEX: u8 = 0x06;
+pub const WAL_RECORD_PAGE_WRITE: u8 = 0x07;
+pub const WAL_RECORD_VACUUM: u8 = 0x08;
 
 /// WAL segment file header: 32 bytes.
 /// Serialized manually with from_le_bytes()/to_le_bytes() (written once per segment).
@@ -31,6 +49,7 @@ pub struct SegmentHeader {
     pub segment_id: u32,     // u32 LE
     pub base_lsn: Lsn,      // u64 LE
     pub created_at_ms: u64,  // u64 LE
+    pub _padding: u32,       // u32 LE, reserved (zero). Brings total to 32 bytes.
 }
 
 /// A deserialized WAL record.
@@ -56,11 +75,19 @@ pub struct WalWriter {
     current_lsn: Arc<AtomicU64>,
 }
 
-struct WalWriteRequest {
-    record_type: u8,
-    payload: Vec<u8>,
-    /// Sender for the assigned LSN (notification after fsync).
-    response: oneshot::Sender<Result<Lsn>>,
+enum WalWriteRequest {
+    /// Normal record: writer serializes the frame header + payload.
+    Record {
+        record_type: u8,
+        payload: Vec<u8>,
+        response: oneshot::Sender<Result<Lsn>>,
+    },
+    /// Pre-encoded raw frame (for replication). Data includes the 9-byte
+    /// header + payload. Writer appends it to the batch buffer as-is.
+    RawFrame {
+        data: Vec<u8>,
+        response: oneshot::Sender<Result<Lsn>>,
+    },
 }
 
 impl WalWriter {
@@ -100,12 +127,14 @@ impl WalReader {
 }
 
 /// Iterator over WAL records.
-pub struct WalIterator<'a> {
-    reader: &'a WalReader,
+/// Owns an Arc<dyn WalStorage> so it is self-contained and can be
+/// returned from functions without lifetime issues.
+pub struct WalIterator {
+    storage: Arc<dyn WalStorage>,
     current_lsn: Lsn,
 }
 
-impl<'a> Iterator for WalIterator<'a> {
+impl Iterator for WalIterator {
     type Item = Result<WalRecord>;
     // Reads next record, verifies CRC, advances position.
     // Returns None at end-of-log or on first corrupt record.
@@ -139,9 +168,15 @@ Next record's LSN = current LSN + 9 + payload_len.
 │  2. Drain: while rx.try_recv() → collect more    │
 │  3. Serialize batch:                              │
 │     For each request:                             │
-│       - Compute CRC-32C(record_type || payload)  │
-│       - Write frame header + payload to buffer   │
-│       - Assign LSN = current write position      │
+│       match request {                             │
+│         Record { .. } =>                          │
+│           - Compute CRC-32C(record_type||payload)│
+│           - Write frame header + payload to buf  │
+│           - Assign LSN = current write position  │
+│         RawFrame { data, .. } =>                  │
+│           - Append data to buffer as-is          │
+│           - Assign LSN = current write position  │
+│       }                                           │
 │  4. WalStorage::append(entire batch buffer)      │
 │  5. WalStorage::sync()         ← single fsync!  │
 │  6. For each request:                             │
@@ -160,14 +195,14 @@ Next record's LSN = current LSN + 9 + payload_len.
 
 1. Serialize the record into frame bytes: `payload_len(u32) || crc32c(u32) || record_type(u8) || payload`.
 2. Create a oneshot channel `(tx, rx)`.
-3. Send `WalWriteRequest { record_type, payload, response: tx }` to the writer channel.
+3. Send `WalWriteRequest::Record { record_type, payload, response: tx }` to the writer channel.
 4. Await `rx.recv()` → returns the assigned LSN.
 
 ### append_raw_frame()
 
 1. Validate the frame: read payload_len from first 4 bytes, verify total length matches.
 2. Optionally verify CRC.
-3. Send to the writer channel with a special variant indicating "raw frame, already encoded."
+3. Send `WalWriteRequest::RawFrame { data: raw.to_vec(), response: tx }` to the writer channel.
 4. The writer task appends it to the batch buffer as-is.
 
 ### WalIterator
@@ -176,6 +211,7 @@ Next record's LSN = current LSN + 9 + payload_len.
 2. Read 9 bytes from `WalStorage::read_from(current_lsn)`.
 3. Parse `payload_len`, `crc32c`, `record_type`.
 4. If `payload_len == 0`: end of log. Return None.
+4.5. If `payload_len > MAX_WAL_RECORD_SIZE` (64 MB): treat as corrupt/end-of-log. Return None.
 5. Read `payload_len` bytes from offset `current_lsn + 9`.
 6. Compute CRC-32C(`record_type || payload`). Compare with stored crc32c.
 7. If mismatch: corrupt record. Return None (stop iteration — partial write from crash).
@@ -223,6 +259,7 @@ For `MemoryWalStorage`, there are no segments — it's a single contiguous byte 
 | I/O error on sync | fsync failure | Propagate — CRITICAL, database should halt |
 | CRC mismatch on read | Corrupt or partial record (crash) | Stop iteration, return None |
 | payload_len = 0 | End of log (zero-fill from pre-allocation) | Stop iteration, return None |
+| payload_len > 64 MB | Corrupt record (implausible size) | Stop iteration, return None |
 | Channel closed | Writer task crashed | Return error on append |
 
 ## Tests

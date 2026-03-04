@@ -72,9 +72,13 @@ impl<'a> SlottedPage<'a> {
     pub fn init(buf: &'a mut [u8], page_id: PageId, page_type: PageType) -> Self;
 
     /// Wrap an existing page buffer (no validation).
+    /// Precondition: `buf.len()` must equal `page_size`. This is a programming
+    /// error if violated — enforced with `debug_assert_eq!(buf.len(), page_size)`.
     pub fn from_buf(buf: &'a mut [u8]) -> Self;
 
     /// Read-only wrapper for shared access.
+    /// Precondition: `buf.len()` must equal `page_size`. This is a programming
+    /// error if violated — enforced with `debug_assert_eq!(buf.len(), page_size)`.
     pub fn from_buf_ref(buf: &'a [u8]) -> SlottedPageRef<'a>;
 
     // ─── Header access ───
@@ -198,17 +202,12 @@ Offset page_size:              End of page
 
 ### compact()
 
+Compaction only moves cell data to eliminate gaps between live cells. Tombstone directory entries are preserved so that slot indices remain stable. This is required because HeapRef uses `(page_id, slot_id)` and external references must survive compaction.
+
 1. Allocate a temporary buffer (or work in-place from the end).
-2. Walk all live slots (length > 0) in order.
-3. Move each slot's cell data to be contiguous from the end of the page.
-4. Update each slot entry's offset.
-5. Remove tombstone slots from the directory (shift remaining entries).
-6. Update `free_space_start` and `free_space_end`.
-7. Update `num_slots`.
-
-**Note**: Compaction changes slot indices! External references (like B-tree child pointers stored by slot index) must NOT rely on stable slot indices across compaction. In practice, B-tree nodes use key-based lookup, not slot indices, so this is safe. However, HeapRef uses (page_id, slot_id) — heap pages must handle this differently (see S7). In the current design, we do NOT compact heap pages. Compaction is only used for B-tree pages where slots are re-identified by key lookup.
-
-**Alternative**: Keep slot indices stable during compaction by only moving cell data without removing tombstone directory entries. This is simpler and avoids the index stability problem. **Use this approach**: compact only moves cell data, does not remove tombstone directory entries. Reclaimable space = cell gaps only.
+2. Walk all slots in order. For live slots (length > 0), move cell data to be contiguous from the end of the page and update the slot entry's offset. Tombstone entries (length = 0) are left in the directory unchanged.
+3. Update `free_space_end` to reflect the new contiguous cell region.
+4. `free_space_start` and `num_slots` are unchanged (tombstone directory entries are kept).
 
 ### compute_checksum()
 

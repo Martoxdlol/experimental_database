@@ -78,6 +78,10 @@ A free page uses the standard page layout with `page_type = Free`. The `prev_or_
 3. Mark dirty, drop guard.
 4. Update `self.head = page_id`.
 
+### Invariants
+
+- **Page 0 is always the file header and must never be placed on the free list.** The sentinel value `0` means "empty list." This means `deallocate(0)` is a programming error and should panic or return an error in debug builds.
+
 ### Concurrency
 
 The free list is accessed **only by the single writer** (Section 5.10 of DESIGN.md). No concurrent access control needed within the free list itself. The writer serializes all allocations and deallocations.

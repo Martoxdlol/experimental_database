@@ -161,15 +161,14 @@ Each database has TWO catalog B-trees:
 1. **By-ID B-tree**: primary lookup. Key = entity_type + entity_id. Value = full serialized entry.
 2. **By-Name B-tree**: secondary lookup for name → id. Key = entity_type + name + 0x00. Value = entity_id.
 
-The file header (page 0) stores the root page of the by-ID B-tree. The root page of the by-Name B-tree is stored as a special entry in the by-ID B-tree with entity_type = 0xFF, entity_id = 0.
+The file header (page 0) stores the root pages of both B-trees: `catalog_root_page` for the by-ID B-tree and `catalog_name_root_page` for the by-Name B-tree (see S13 FileHeader).
 
 ### Startup Flow
 
-1. Read file header → `catalog_root_page` (by-ID B-tree root).
+1. Read file header → `catalog_root_page` (by-ID B-tree root) and `catalog_name_root_page` (by-Name B-tree root).
 2. Open by-ID B-tree.
-3. Look up special entry `[0xFF, 0x00...0x00]` → get by-Name B-tree root page.
-4. Open by-Name B-tree.
-5. Scan both trees to populate in-memory CatalogCache (Layer 6).
+3. Open by-Name B-tree.
+4. Scan both trees to populate in-memory CatalogCache (Layer 6).
 
 ### Create Collection Flow
 

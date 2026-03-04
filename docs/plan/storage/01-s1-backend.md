@@ -172,7 +172,7 @@ impl MemoryWalStorage {
 1. **append()**: `log.write().extend_from_slice(data)`. Return previous length as offset.
 2. **sync()**: No-op.
 3. **read_from()**: Slice from the log vector.
-4. **truncate_before()**: Could be no-op (memory is cheap) or trim prefix.
+4. **truncate_before()**: Real truncation — drops all data before the given LSN. Implementation: find the split point in the log vector, drain `0..split_point`, and adjust internal offsets so that subsequent `read_from()` calls with old offsets still map correctly. This keeps memory bounded if the caller periodically reclaims old WAL data.
 5. **is_durable()**: `false`.
 
 ## Error Handling

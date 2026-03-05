@@ -7,7 +7,7 @@ edition = "2024"
 zerocopy = { version = "0.8", features = ["derive"] }
 crc32fast = "1"
 parking_lot = "0.12"
-tokio = { version = "1", features = ["sync", "rt", "time", "io-util"] }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "io-util"] }
 thiserror = "2"
 
 [dev-dependencies]

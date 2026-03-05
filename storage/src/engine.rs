@@ -318,6 +318,19 @@ impl StorageEngine {
             page_storage.read_page(0, &mut buf)?;
             let file_header = read_file_header(&buf)?;
             file_header.verify()?;
+
+            // Validate page_size matches the stored value.
+            let stored_page_size = file_header.page_size.get() as usize;
+            if stored_page_size != config.page_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "page size mismatch: file has {}, config has {}",
+                        stored_page_size, config.page_size
+                    ),
+                ));
+            }
+
             let checkpoint_lsn = file_header.checkpoint_lsn.get();
 
             // Run recovery.
@@ -420,6 +433,17 @@ impl StorageEngine {
         // Run final checkpoint if durable.
         if self.is_durable {
             self.checkpoint().await?;
+        }
+
+        // Update file header with current free list head and page count
+        // before writing to disk.
+        {
+            let free_list_head = self.free_list.lock().head();
+            let page_count = self.page_storage.page_count();
+            self.update_file_header(|fh| {
+                fh.free_list_head = U32::new(free_list_head);
+                fh.page_count = U64::new(page_count);
+            })?;
         }
 
         // Write final file header to page 0.

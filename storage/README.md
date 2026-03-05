@@ -342,50 +342,92 @@ assert_eq!(removed, 1);
 
 ### Catalog B-Tree (Collection/Index Metadata)
 
-The engine pre-creates two catalog B-trees on page 0's file header:
-- **ID catalog**: keyed by `(entity_type, entity_id)` — stores serialized `CollectionEntry` or `IndexEntry`
-- **Name catalog**: keyed by `(entity_type, name)` — maps names to IDs
+There is no `list_btrees()` API — B-tree discovery is hierarchical through the catalog. Each B-tree is identified solely by its root `PageId`. The only roots stored in a fixed location are the two catalog B-trees in the file header. All other B-trees (collection data, indexes) are discovered by looking them up in the catalog.
+
+The engine pre-creates two catalog B-trees whose root pages are persisted in the file header:
+
+| File header field | Key format | Value | Role |
+|---|---|---|---|
+| `catalog_root_page` | `entity_type \|\| entity_id` | Full serialized `CollectionEntry` / `IndexEntry` | **Primary index** — lookup by numeric ID |
+| `catalog_name_root_page` | `entity_type \|\| name` | `entity_id` (8 bytes) | **Secondary index** — lookup by name, returns ID |
+
+The name index stores only the entity ID, acting as a pointer back to the full entry in the ID catalog. The lookup flow is: **name → id → full entry → root page → open B-tree**.
+
+#### Registering a collection and index
 
 ```rust
 use storage::catalog_btree::{
-    self, CatalogEntityType, CatalogIndexState, CollectionEntry, IndexEntry,
+    self, CatalogEntityType, CatalogIndexState, CollectionEntry, IndexEntry, IndexType,
 };
 
 let fh = engine.file_header();
 let catalog = engine.open_btree(fh.catalog_root_page.get());
 let name_idx = engine.open_btree(fh.catalog_name_root_page.get());
 
-// Insert a collection entry.
+// Register a collection (in both ID and name catalogs).
 let col = CollectionEntry {
     collection_id: 1,
     name: "users".to_string(),
-    primary_root_page: 42,  // root page of the collection's primary B-tree
+    primary_root_page: data_btree.root_page(),
     doc_count: 0,
 };
 
-let key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, col.collection_id);
-let val = catalog_btree::serialize_collection(&col);
-catalog.insert(&key, &val).unwrap();
+let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, col.collection_id);
+catalog.insert(&id_key, &catalog_btree::serialize_collection(&col)).unwrap();
 
-// Insert name → ID mapping.
 let name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, &col.name);
-let name_val = catalog_btree::serialize_name_value(col.collection_id);
-name_idx.insert(&name_key, &name_val).unwrap();
+name_idx.insert(&name_key, &catalog_btree::serialize_name_value(col.collection_id)).unwrap();
 
-// Look up by name.
-let found = name_idx.get(&name_key).unwrap().unwrap();
-let id = catalog_btree::deserialize_name_value(&found);
-assert_eq!(id, 1);
+// Register an index (same pattern — insert into both catalogs).
+let idx = IndexEntry {
+    index_id: 1,
+    collection_id: 1,
+    name: "users_tags_gin".to_string(),
+    field_paths: vec![vec!["tags".to_string()]],
+    root_page: posting_btree.root_page(),
+    state: CatalogIndexState::Ready,
+    index_type: IndexType::Gin,
+    aux_root_pages: vec![pending_btree.root_page(), docterm_btree.root_page()],
+    config: vec![],
+};
 
-// Look up by ID.
-let found = catalog.get(&key).unwrap().unwrap();
-let entry = catalog_btree::deserialize_collection(&found).unwrap();
-assert_eq!(entry.name, "users");
+let idx_id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx.index_id);
+catalog.insert(&idx_id_key, &catalog_btree::serialize_index(&idx)).unwrap();
 
-// Scan all collections by prefix.
+let idx_name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Index, &idx.name);
+name_idx.insert(&idx_name_key, &catalog_btree::serialize_name_value(idx.index_id)).unwrap();
+```
+
+#### Looking up by name after reopen
+
+```rust
+// After engine.close() + reopen:
+let fh = engine.file_header();
+let catalog = engine.open_btree(fh.catalog_root_page.get());
+let name_idx = engine.open_btree(fh.catalog_name_root_page.get());
+
+// name → id
+let lookup = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, "users");
+let id_bytes = name_idx.get(&lookup).unwrap().expect("not found");
+let collection_id = catalog_btree::deserialize_name_value(&id_bytes);
+
+// id → full entry
+let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, collection_id);
+let col_bytes = catalog.get(&id_key).unwrap().expect("not found");
+let col = catalog_btree::deserialize_collection(&col_bytes).unwrap();
+
+// full entry → open data B-tree
+let data_btree = engine.open_btree(col.primary_root_page);
+let val = data_btree.get(b"some_key").unwrap();
+```
+
+#### Enumerating all collections or indexes
+
+```rust
 use std::ops::Bound;
 use storage::btree::ScanDirection;
 
+// Scan all collections (prefix 0x01 in the ID catalog).
 let prefix = catalog_btree::collection_id_scan_prefix();
 let collections: Vec<_> = catalog
     .scan(
@@ -394,6 +436,18 @@ let collections: Vec<_> = catalog
         ScanDirection::Forward,
     )
     .take_while(|r| r.as_ref().map(|(k, _)| k[0] == prefix[0]).unwrap_or(true))
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+
+// Scan all indexes (prefix 0x02).
+let idx_prefix = catalog_btree::index_id_scan_prefix();
+let indexes: Vec<_> = catalog
+    .scan(
+        Bound::Included(idx_prefix.as_slice()),
+        Bound::Unbounded,
+        ScanDirection::Forward,
+    )
+    .take_while(|r| r.as_ref().map(|(k, _)| k[0] == idx_prefix[0]).unwrap_or(true))
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
 ```

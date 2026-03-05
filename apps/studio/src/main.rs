@@ -1,8 +1,10 @@
-//! exdb-studio — Web-based database management UI
-//!
-//! Serves a React SPA frontend and proxies API requests to the
-//! database engine. Browse collections, run queries, manage indexes.
+mod app;
+mod components;
+mod engine;
+mod modules;
+mod state;
+mod theme;
 
 fn main() {
-    println!("exdb-studio: not yet implemented");
+    dioxus::launch(app::App);
 }

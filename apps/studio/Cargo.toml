@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-exdb = { workspace = true }
-exdb-wire = { workspace = true }
+exdb-storage = { workspace = true }
+dioxus = { version = "0.7", features = ["desktop"] }
 tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zerocopy = { workspace = true }
+parking_lot = { workspace = true }
+rfd = "0.15"

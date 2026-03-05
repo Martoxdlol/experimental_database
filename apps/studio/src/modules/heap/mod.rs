@@ -121,8 +121,8 @@ pub fn HeapModule() -> Element {
 #[component]
 fn LoadBlobForm() -> Element {
     let mut state = use_context::<AppState>();
-    let mut page_input: Signal<String> = use_signal(|| String::new());
-    let mut slot_input: Signal<String> = use_signal(|| String::new());
+    let mut page_input: Signal<String> = use_signal(String::new);
+    let mut slot_input: Signal<String> = use_signal(String::new);
     let mut blob_data: Signal<Option<Vec<u8>>> = use_signal(|| None);
 
     rsx! {

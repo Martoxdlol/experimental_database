@@ -21,9 +21,9 @@ pub fn ConsoleModule() -> Element {
 
     let mut target: Signal<String> = use_signal(|| "storage".to_string());
     let mut method: Signal<String> = use_signal(|| "file_header".to_string());
-    let mut param1: Signal<String> = use_signal(|| String::new());
-    let mut param2: Signal<String> = use_signal(|| String::new());
-    let mut history: Signal<Vec<ConsoleLine>> = use_signal(|| Vec::new());
+    let mut param1: Signal<String> = use_signal(String::new);
+    let mut param2: Signal<String> = use_signal(String::new);
+    let mut history: Signal<Vec<ConsoleLine>> = use_signal(Vec::new);
 
     let methods_for_target = match target.read().as_str() {
         "storage" => vec![
@@ -322,7 +322,7 @@ fn parse_hex(s: &str) -> Option<Vec<u8>> {
     if s.is_empty() {
         return Some(Vec::new());
     }
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

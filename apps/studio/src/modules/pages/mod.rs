@@ -17,7 +17,7 @@ pub fn PagesModule() -> Element {
     let mut selected_page: Signal<Option<u32>> = use_signal(|| None);
     let mut selected_slot: Signal<Option<u16>> = use_signal(|| None);
     let mut type_filter: Signal<String> = use_signal(|| "All".to_string());
-    let mut search_filter: Signal<String> = use_signal(|| String::new());
+    let mut search_filter: Signal<String> = use_signal(String::new);
 
     // Load page list
     let page_list = use_resource(move || {
@@ -32,8 +32,8 @@ pub fn PagesModule() -> Element {
 
     // Load selected page detail
     let _page_detail = use_memo(move || {
-        let sel = *selected_page.read();
-        sel
+        
+        *selected_page.read()
     });
 
     rsx! {

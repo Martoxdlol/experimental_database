@@ -102,7 +102,7 @@ pub fn FreeListModule() -> Element {
 #[component]
 fn DeallocateForm() -> Element {
     let mut state = use_context::<AppState>();
-    let mut page_input: Signal<String> = use_signal(|| String::new());
+    let mut page_input: Signal<String> = use_signal(String::new);
 
     rsx! {
         div { style: "display: flex; gap: 8px; align-items: center;",

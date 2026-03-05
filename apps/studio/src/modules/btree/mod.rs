@@ -12,7 +12,7 @@ pub fn BTreeModule() -> Element {
         return rsx! { div { class: "empty-state", "No database open" } };
     };
 
-    let mut root_input: Signal<String> = use_signal(|| String::new());
+    let mut root_input: Signal<String> = use_signal(String::new);
     let mut selected_root: Signal<Option<u32>> = use_signal(|| None);
 
     // Build tree selector from catalog
@@ -83,11 +83,10 @@ pub fn BTreeModule() -> Element {
                             value: "{root_input.read()}",
                             oninput: move |e| root_input.set(e.value()),
                             onkeydown: move |e| {
-                                if e.key() == Key::Enter {
-                                    if let Ok(root) = root_input.read().parse::<u32>() {
+                                if e.key() == Key::Enter
+                                    && let Ok(root) = root_input.read().parse::<u32>() {
                                         selected_root.set(Some(root));
                                     }
-                                }
                             },
                         }
                         button {
@@ -220,8 +219,8 @@ fn BTreeView(root_page: u32, write_enabled: bool) -> Element {
 #[component]
 fn InsertKvForm(root_page: u32) -> Element {
     let mut state = use_context::<AppState>();
-    let mut key_hex: Signal<String> = use_signal(|| String::new());
-    let mut value_hex: Signal<String> = use_signal(|| String::new());
+    let mut key_hex: Signal<String> = use_signal(String::new);
+    let mut value_hex: Signal<String> = use_signal(String::new);
 
     rsx! {
         div { class: "card",
@@ -290,7 +289,7 @@ fn hex_short(data: &[u8]) -> String {
 
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.replace(' ', "");
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

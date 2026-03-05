@@ -33,7 +33,7 @@ pub fn OverviewModule() -> Element {
 
     // Editing state
     let mut editing_field: Signal<Option<String>> = use_signal(|| None);
-    let mut edit_value: Signal<String> = use_signal(|| String::new());
+    let mut edit_value: Signal<String> = use_signal(String::new);
 
     rsx! {
         div { class: "main-content",

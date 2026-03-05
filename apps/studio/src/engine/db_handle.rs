@@ -245,7 +245,7 @@ impl DbHandle {
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.insert_slot(data)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))
+            .map_err(|e| io::Error::other(format!("{e:?}")))
     }
 
     pub fn update_slot(&self, page_id: u32, slot: u16, data: &[u8]) -> io::Result<()> {
@@ -253,7 +253,7 @@ impl DbHandle {
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.update_slot(slot, data)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:?}")))
+            .map_err(|e| io::Error::other(format!("{e:?}")))
     }
 
     pub fn delete_slot(&self, page_id: u32, slot: u16) -> io::Result<()> {
@@ -525,8 +525,8 @@ impl DbHandle {
 
         for entry in iter {
             let (_, value) = entry?;
-            if let Ok(ie) = catalog_btree::deserialize_index(&value) {
-                if ie.collection_id == collection_id {
+            if let Ok(ie) = catalog_btree::deserialize_index(&value)
+                && ie.collection_id == collection_id {
                     indexes.push(IndexInfo {
                         id: ie.index_id,
                         name: ie.name,
@@ -539,7 +539,6 @@ impl DbHandle {
                         field_paths: ie.field_paths,
                     });
                 }
-            }
         }
 
         Ok(indexes)

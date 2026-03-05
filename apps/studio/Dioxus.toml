@@ -1,0 +1,8 @@
+[application]
+name = "exdb-studio"
+default_platform = "desktop"
+
+[bundle]
+identifier = "com.exdb.studio"
+publisher = "exdb"
+icon = ["assets/icon.png"]

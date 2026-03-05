@@ -16,6 +16,16 @@ fn main() {
     if let Ok(icon) = make_icon() {
         cfg = cfg.with_icon(icon);
     }
+    cfg = cfg.with_custom_head(r#"<script>
+new MutationObserver(()=>{
+document.querySelectorAll('input,textarea').forEach(el=>{
+el.setAttribute('autocorrect','off');
+el.setAttribute('autocapitalize','off');
+el.setAttribute('autocomplete','off');
+el.setAttribute('spellcheck','false');
+});
+}).observe(document.body||document.documentElement,{childList:true,subtree:true});
+</script>"#.into());
     LaunchBuilder::desktop()
         .with_cfg(cfg)
         .launch(app::App);

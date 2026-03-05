@@ -1,15 +1,52 @@
 #!/usr/bin/env bash
 #
-# bundle-macos.sh — Build exdb-studio and package it as a macOS .dmg
+# bundle-macos.sh — Build exdb-studio and package it as a macOS .app + .dmg
+#
+# Preferred method: uses `dx bundle` (Dioxus CLI).
+# Fallback: manual .app bundle + hdiutil if dx is not installed.
 #
 # Usage:
 #   ./apps/studio/bundle-macos.sh            # release build
 #   ./apps/studio/bundle-macos.sh --debug    # debug build (faster, larger)
 #
+# Prerequisites (preferred):
+#   cargo install dioxus-cli
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$REPO_ROOT"
+
+PROFILE="release"
+if [[ "${1:-}" == "--debug" ]]; then
+    PROFILE="debug"
+fi
+
+# ─── Try dx bundle (the Dioxus-preferred way) ───────────────────────────
+if command -v dx &>/dev/null; then
+    echo "==> Using dx bundle ($PROFILE)..."
+    DX_FLAGS=""
+    if [[ "$PROFILE" == "debug" ]]; then
+        DX_FLAGS="--skip-optimizations"
+    fi
+    (cd apps/studio && dx bundle --desktop \
+        --package-types macos \
+        --package-types dmg \
+        $DX_FLAGS)
+
+    echo ""
+    echo "Done! Output in target/dx/exdb-studio/bundle/"
+    find target/dx/exdb-studio/bundle -name '*.app' -o -name '*.dmg' 2>/dev/null | while read -r f; do
+        echo "  $f ($(du -sh "$f" | cut -f1))"
+    done
+    exit 0
+fi
+
+# ─── Fallback: manual bundle ────────────────────────────────────────────
+echo "dx CLI not found — using manual bundle."
+echo "  (Install with: cargo install dioxus-cli)"
+echo ""
 
 APP_NAME="exdb studio"
 BUNDLE_ID="com.exdb.studio"
@@ -17,11 +54,9 @@ BINARY_NAME="exdb-studio"
 VERSION="0.1.0"
 DMG_NAME="exdb-studio-${VERSION}-$(uname -m)"
 
-PROFILE="release"
-CARGO_FLAGS="--release"
-if [[ "${1:-}" == "--debug" ]]; then
-    PROFILE="debug"
-    CARGO_FLAGS=""
+CARGO_FLAGS=""
+if [[ "$PROFILE" == "release" ]]; then
+    CARGO_FLAGS="--release"
 fi
 
 BUILD_DIR="$REPO_ROOT/target/bundle"
@@ -42,10 +77,8 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
-# Copy binary
 cp "$BINARY" "$APP_DIR/Contents/MacOS/$BINARY_NAME"
 
-# Info.plist
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -78,119 +111,94 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# Generate .icns icon using the built-in sips + iconutil toolchain.
-# We render a simple database cylinder icon via a tiny Python script
-# that writes raw RGBA PNGs (no third-party deps needed).
+# Generate .icns from the asset icon or from scratch
 echo "==> Generating app icon..."
 ICONSET_DIR="$BUILD_DIR/AppIcon.iconset"
 rm -rf "$ICONSET_DIR"
 mkdir -p "$ICONSET_DIR"
 
-python3 - "$ICONSET_DIR" <<'PYEOF'
+ASSET_ICON="$SCRIPT_DIR/assets/icon.png"
+if [[ -f "$ASSET_ICON" ]]; then
+    # Use sips to resize the asset icon into all required sizes
+    SIZES=("16x16" "32x32" "128x128" "256x256" "512x512")
+    for s in "${SIZES[@]}"; do
+        w="${s%x*}"
+        w2=$((w * 2))
+        sips -z "$w" "$w" "$ASSET_ICON" --out "$ICONSET_DIR/icon_${s}.png" &>/dev/null
+        sips -z "$w2" "$w2" "$ASSET_ICON" --out "$ICONSET_DIR/icon_${s}@2x.png" &>/dev/null
+    done
+else
+    # Generate from scratch with Python
+    python3 - "$ICONSET_DIR" <<'PYEOF'
 import struct, sys, os, zlib
-
 out_dir = sys.argv[1]
 
 def make_icon_rgba(size):
-    """Render a database cylinder icon at the given pixel size."""
     pixels = bytearray(size * size * 4)
     cx = size / 2.0
-    # Scale geometry proportionally
     s = size / 32.0
-    cy_top = 9.0 * s
-    cy_bot = 23.0 * s
-    rx = 12.0 * s
-    ry_top = 5.0 * s
-    ry_bot = 5.0 * s
+    cy_top, cy_bot = 9.0*s, 23.0*s
+    rx, ry_top, ry_bot = 12.0*s, 5.0*s, 5.0*s
     col = (0x7a, 0xa2, 0xf7)
-
     for y in range(size):
         for x in range(size):
-            fx = x + 0.5
-            fy = y + 0.5
-            dx = (fx - cx) / rx
-
-            in_top = dx * dx + ((fy - cy_top) / ry_top) ** 2 <= 1.0
-            in_bot = dx * dx + ((fy - cy_bot) / ry_bot) ** 2 <= 1.0
-            in_body = abs(dx) <= 1.0 and cy_top <= fy <= cy_bot
-            # Middle ring highlight
-            ry_mid = 4.0 * s
-            cy_mid = 16.0 * s
-            mid_val = dx * dx + ((fy - cy_mid) / ry_mid) ** 2
-            on_mid_ring = in_body and 0.85 <= mid_val <= 1.0
-
-            if in_top:
-                a = 255
-            elif on_mid_ring:
-                a = 220
-            elif in_body:
-                a = 160
-            elif in_bot:
-                a = 120
-            else:
-                a = 0
-
+            fx, fy = x+0.5, y+0.5
+            dx = (fx-cx)/rx
+            in_top = dx*dx+((fy-cy_top)/ry_top)**2 <= 1.0
+            in_bot = dx*dx+((fy-cy_bot)/ry_bot)**2 <= 1.0
+            in_body = abs(dx)<=1.0 and cy_top<=fy<=cy_bot
+            ry_mid, cy_mid = 4.0*s, 16.0*s
+            mid_val = dx*dx+((fy-cy_mid)/ry_mid)**2
+            on_mid = in_body and 0.85<=mid_val<=1.0
+            a = 255 if in_top else (220 if on_mid else (160 if in_body else (120 if in_bot else 0)))
             if a > 0:
-                i = (y * size + x) * 4
-                pixels[i] = col[0]
-                pixels[i+1] = col[1]
-                pixels[i+2] = col[2]
-                pixels[i+3] = a
+                i = (y*size+x)*4
+                pixels[i], pixels[i+1], pixels[i+2], pixels[i+3] = *col, a
     return bytes(pixels)
 
-def write_png(path, width, height, rgba):
-    """Write a minimal RGBA PNG (no dependencies)."""
+def write_png(path, w, h, rgba):
     def chunk(tag, data):
-        c = tag + data
-        return struct.pack('>I', len(data)) + c + struct.pack('>I', zlib.crc32(c) & 0xffffffff)
-
-    header = struct.pack('>IIBBBBB', width, height, 8, 6, 0, 0, 0)
-    raw = b''
-    for y in range(height):
-        raw += b'\x00'  # filter: none
-        raw += rgba[y * width * 4 : (y + 1) * width * 4]
-    compressed = zlib.compress(raw)
-
-    with open(path, 'wb') as f:
+        c = tag+data
+        return struct.pack('>I',len(data))+c+struct.pack('>I',zlib.crc32(c)&0xffffffff)
+    hdr = struct.pack('>IIBBBBB',w,h,8,6,0,0,0)
+    raw = b''.join(b'\x00'+rgba[y*w*4:(y+1)*w*4] for y in range(h))
+    with open(path,'wb') as f:
         f.write(b'\x89PNG\r\n\x1a\n')
-        f.write(chunk(b'IHDR', header))
-        f.write(chunk(b'IDAT', compressed))
-        f.write(chunk(b'IEND', b''))
+        f.write(chunk(b'IHDR',hdr))
+        f.write(chunk(b'IDAT',zlib.compress(raw)))
+        f.write(chunk(b'IEND',b''))
 
-# macOS iconutil expects these exact filenames
-icon_sizes = [
-    (16,   'icon_16x16.png'),
-    (32,   'icon_16x16@2x.png'),
-    (32,   'icon_32x32.png'),
-    (64,   'icon_32x32@2x.png'),
-    (128,  'icon_128x128.png'),
-    (256,  'icon_128x128@2x.png'),
-    (256,  'icon_256x256.png'),
-    (512,  'icon_256x256@2x.png'),
-    (512,  'icon_512x512.png'),
-    (1024, 'icon_512x512@2x.png'),
-]
-
-for size, filename in icon_sizes:
-    rgba = make_icon_rgba(size)
-    write_png(os.path.join(out_dir, filename), size, size, rgba)
-    print(f'  {filename} ({size}x{size})')
+for size, name in [(16,'icon_16x16.png'),(32,'icon_16x16@2x.png'),(32,'icon_32x32.png'),
+    (64,'icon_32x32@2x.png'),(128,'icon_128x128.png'),(256,'icon_128x128@2x.png'),
+    (256,'icon_256x256.png'),(512,'icon_256x256@2x.png'),(512,'icon_512x512.png'),
+    (1024,'icon_512x512@2x.png')]:
+    write_png(os.path.join(out_dir,name),size,size,make_icon_rgba(size))
 PYEOF
+fi
 
 iconutil -c icns "$ICONSET_DIR" -o "$APP_DIR/Contents/Resources/AppIcon.icns"
 rm -rf "$ICONSET_DIR"
 echo "  AppIcon.icns created"
 
-# Create DMG
+# Create DMG with Applications symlink for drag-to-install
 echo "==> Creating DMG..."
 rm -f "$DMG_PATH"
+
+STAGING="$BUILD_DIR/dmg-staging"
+rm -rf "$STAGING"
+mkdir -p "$STAGING"
+cp -a "$APP_DIR" "$STAGING/"
+ln -s /Applications "$STAGING/Applications"
+
 hdiutil create \
     -volname "$APP_NAME" \
-    -srcfolder "$APP_DIR" \
+    -srcfolder "$STAGING" \
     -ov \
     -format UDZO \
     "$DMG_PATH" \
     2>/dev/null
+
+rm -rf "$STAGING"
 
 echo ""
 echo "Done! Output:"

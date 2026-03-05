@@ -45,7 +45,7 @@ impl FreeList {
             // Pop from head
             let old_head = self.head;
             let guard = self.buffer_pool.fetch_page_exclusive(old_head)?;
-            let page = SlottedPage::from_buf_ref(guard.data());
+            let page = SlottedPage::from_buf_ref(guard.data())?;
             let next_free = page.prev_or_ptr();
             drop(page);
             drop(guard);
@@ -62,10 +62,10 @@ impl FreeList {
     pub fn deallocate(&mut self, page_id: PageId) -> io::Result<()> {
         debug_assert!(page_id != 0, "page 0 must never be placed on the free list");
         if page_id == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot deallocate page 0",
-            ));
+            return Err(crate::error::StorageError::InternalBug(
+                "cannot deallocate page 0".into(),
+            )
+            .into());
         }
 
         let mut guard = self.buffer_pool.fetch_page_exclusive(page_id)?;
@@ -93,7 +93,7 @@ impl FreeList {
         while current != 0 {
             count += 1;
             let guard = self.buffer_pool.fetch_page_shared(current)?;
-            let page = SlottedPage::from_buf_ref(guard.data());
+            let page = SlottedPage::from_buf_ref(guard.data())?;
             current = page.prev_or_ptr();
         }
         Ok(count)

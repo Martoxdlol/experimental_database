@@ -57,17 +57,17 @@ pub enum PageType {
 }
 
 impl PageType {
-    /// Convert a raw `u8` to a `PageType`, panicking on invalid values.
-    fn from_u8(v: u8) -> Self {
+    /// Convert a raw `u8` to a `PageType`, returning `None` on invalid values.
+    pub fn from_u8(v: u8) -> Option<Self> {
         match v {
-            0x01 => PageType::BTreeInternal,
-            0x02 => PageType::BTreeLeaf,
-            0x03 => PageType::Heap,
-            0x04 => PageType::Overflow,
-            0x05 => PageType::Free,
-            0x06 => PageType::FileHeader,
-            0x07 => PageType::FileHeaderShadow,
-            _ => panic!("invalid page type: {:#04x}", v),
+            0x01 => Some(PageType::BTreeInternal),
+            0x02 => Some(PageType::BTreeLeaf),
+            0x03 => Some(PageType::Heap),
+            0x04 => Some(PageType::Overflow),
+            0x05 => Some(PageType::Free),
+            0x06 => Some(PageType::FileHeader),
+            0x07 => Some(PageType::FileHeaderShadow),
+            _ => None,
         }
     }
 }
@@ -186,22 +186,20 @@ impl<'a> SlottedPage<'a> {
         page
     }
 
-    /// Wrap an existing page buffer (no validation).
-    ///
-    /// # Panics
-    ///
-    /// Debug-asserts that the buffer is at least `PAGE_HEADER_SIZE` bytes.
-    pub fn from_buf(buf: &'a mut [u8]) -> Self {
-        debug_assert!(
-            buf.len() >= PAGE_HEADER_SIZE,
-            "page buffer too small: {}",
-            buf.len()
-        );
-        SlottedPage { buf }
+    /// Wrap an existing page buffer, validating that it is large enough.
+    pub fn from_buf(buf: &'a mut [u8]) -> std::io::Result<Self> {
+        if buf.len() < PAGE_HEADER_SIZE {
+            return Err(crate::error::StorageError::CorruptPageHeader {
+                size: buf.len(),
+                required: PAGE_HEADER_SIZE,
+            }
+            .into());
+        }
+        Ok(SlottedPage { buf })
     }
 
     /// Create a read-only wrapper for shared access.
-    pub fn from_buf_ref(buf: &'a [u8]) -> SlottedPageRef<'a> {
+    pub fn from_buf_ref(buf: &'a [u8]) -> std::io::Result<SlottedPageRef<'a>> {
         SlottedPageRef::from_buf(buf)
     }
 
@@ -222,8 +220,14 @@ impl<'a> SlottedPage<'a> {
         self.header().page_id.get()
     }
 
-    /// Return the page type.
+    /// Return the page type. Panics if the stored byte is invalid.
     pub fn page_type(&self) -> PageType {
+        PageType::from_u8(self.header().page_type)
+            .expect("invalid page type byte in header")
+    }
+
+    /// Return the page type, or `None` if the stored byte is invalid.
+    pub fn try_page_type(&self) -> Option<PageType> {
         PageType::from_u8(self.header().page_type)
     }
 
@@ -543,14 +547,16 @@ pub struct SlottedPageRef<'a> {
 }
 
 impl<'a> SlottedPageRef<'a> {
-    /// Wrap a byte buffer as a read-only slotted page.
-    pub fn from_buf(buf: &'a [u8]) -> Self {
-        debug_assert!(
-            buf.len() >= PAGE_HEADER_SIZE,
-            "page buffer too small: {}",
-            buf.len()
-        );
-        SlottedPageRef { buf }
+    /// Wrap a byte buffer as a read-only slotted page, validating size.
+    pub fn from_buf(buf: &'a [u8]) -> std::io::Result<Self> {
+        if buf.len() < PAGE_HEADER_SIZE {
+            return Err(crate::error::StorageError::CorruptPageHeader {
+                size: buf.len(),
+                required: PAGE_HEADER_SIZE,
+            }
+            .into());
+        }
+        Ok(SlottedPageRef { buf })
     }
 
     /// Read the page header.
@@ -563,8 +569,14 @@ impl<'a> SlottedPageRef<'a> {
         self.header().page_id.get()
     }
 
-    /// Return the page type.
+    /// Return the page type. Panics if the stored byte is invalid.
     pub fn page_type(&self) -> PageType {
+        PageType::from_u8(self.header().page_type)
+            .expect("invalid page type byte in header")
+    }
+
+    /// Return the page type, or `None` if the stored byte is invalid.
+    pub fn try_page_type(&self) -> Option<PageType> {
         PageType::from_u8(self.header().page_type)
     }
 
@@ -818,7 +830,7 @@ mod tests {
         let last = buf.len() - 1;
         buf[last] ^= 0xFF;
 
-        let page = SlottedPage::from_buf(&mut buf);
+        let page = SlottedPage::from_buf(&mut buf).unwrap();
         assert!(!page.verify_checksum());
     }
 
@@ -916,7 +928,7 @@ mod tests {
         }
 
         // Now use read-only reference.
-        let page_ref = SlottedPageRef::from_buf(&buf);
+        let page_ref = SlottedPageRef::from_buf(&buf).unwrap();
         assert_eq!(page_ref.page_id(), 50);
         assert_eq!(page_ref.page_type(), PageType::Heap);
         assert_eq!(page_ref.num_slots(), 3);
@@ -945,5 +957,62 @@ mod tests {
 
         page.set_lsn(0);
         assert_eq!(page.lsn(), 0);
+    }
+
+    // 15. PageType::from_u8 with invalid value should NOT panic.
+    // BUG: from_u8 panics on invalid values (e.g. 0x00 from zeroed/corrupt page).
+    #[test]
+    fn test_page_type_from_u8_invalid_does_not_panic() {
+        // Invalid bytes should not panic — use catch_unwind to prove it.
+        let invalid_bytes: &[u8] = &[0x00, 0x08, 0x10, 0xFF];
+        for &b in invalid_bytes {
+            let result = std::panic::catch_unwind(|| PageType::from_u8(b));
+            assert!(
+                result.is_ok(),
+                "from_u8({:#04x}) should not panic",
+                b,
+            );
+        }
+    }
+
+    // 16. from_buf with undersized buffer returns Err
+    #[test]
+    fn test_from_buf_undersized_buffer() {
+        let mut tiny = vec![0u8; 16]; // less than PAGE_HEADER_SIZE (32)
+        assert!(SlottedPage::from_buf(&mut tiny).is_err());
+        assert!(SlottedPageRef::from_buf(&tiny).is_err());
+
+        // Empty buffer
+        let mut empty: Vec<u8> = vec![];
+        assert!(SlottedPage::from_buf(&mut empty).is_err());
+        assert!(SlottedPageRef::from_buf(&empty).is_err());
+
+        // Exactly PAGE_HEADER_SIZE - 1
+        let mut almost = vec![0u8; PAGE_HEADER_SIZE - 1];
+        assert!(SlottedPage::from_buf(&mut almost).is_err());
+        assert!(SlottedPageRef::from_buf(&almost).is_err());
+
+        // Exactly PAGE_HEADER_SIZE should succeed
+        let mut exact = vec![0u8; PAGE_HEADER_SIZE];
+        assert!(SlottedPage::from_buf(&mut exact).is_ok());
+        assert!(SlottedPageRef::from_buf(&exact).is_ok());
+    }
+
+    // 17. try_page_type() on a corrupt page returns None instead of panicking.
+    #[test]
+    fn test_corrupt_page_type_does_not_panic() {
+        let mut buf = new_buf();
+        SlottedPage::init(&mut buf, 1, PageType::BTreeLeaf);
+
+        // Corrupt the page_type byte (offset 4).
+        buf[4] = 0xFF;
+
+        let page_ref = SlottedPageRef::from_buf(&buf).unwrap();
+        // try_page_type() should return None for corrupt bytes.
+        assert_eq!(page_ref.try_page_type(), None);
+
+        // Also verify the mutable variant.
+        let page = SlottedPage::from_buf(&mut buf).unwrap();
+        assert_eq!(page.try_page_type(), None);
     }
 }

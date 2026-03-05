@@ -8,6 +8,9 @@
 // Explicit drop() calls document when page access ends before guard release.
 #![allow(clippy::drop_non_drop)]
 
+pub mod error;
+pub mod util;
+
 pub mod backend;
 pub mod page;
 pub mod buffer_pool;

@@ -202,13 +202,11 @@ impl DoubleWriteBuffer {
 
         // Verify page_size matches.
         if header.page_size as usize != self.page_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "DWB page_size mismatch: DWB has {}, expected {}",
-                    header.page_size, self.page_size
-                ),
-            ));
+            return Err(crate::error::StorageError::Corruption(format!(
+                "DWB page_size mismatch: DWB has {}, expected {}",
+                header.page_size, self.page_size
+            ))
+            .into());
         }
 
         // Step 3: Process each entry.
@@ -229,7 +227,7 @@ impl DoubleWriteBuffer {
             let dwb_page_data = &entry_buf[DWB_ENTRY_PREFIX_SIZE..];
 
             // Verify DWB page checksum via SlottedPageRef.
-            let dwb_page_ref = SlottedPageRef::from_buf(dwb_page_data);
+            let dwb_page_ref = SlottedPageRef::from_buf(dwb_page_data)?;
             if !dwb_page_ref.verify_checksum() {
                 // DWB page itself is corrupt (crash during DWB write). Skip.
                 continue;
@@ -239,7 +237,7 @@ impl DoubleWriteBuffer {
             let mut storage_page = vec![0u8; self.page_size];
             match self.page_storage.read_page(page_id, &mut storage_page) {
                 Ok(()) => {
-                    let storage_ref = SlottedPageRef::from_buf(&storage_page);
+                    let storage_ref = SlottedPageRef::from_buf(&storage_page)?;
                     if !storage_ref.verify_checksum() {
                         // Torn write detected -- restore from DWB.
                         self.page_storage.write_page(page_id, dwb_page_data)?;

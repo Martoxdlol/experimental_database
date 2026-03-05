@@ -388,7 +388,7 @@ async fn test_catalog_btree_persistence() {
         let name_key =
             catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, "users");
         let name_val = name_idx.get(&name_key).unwrap().unwrap();
-        let resolved_id = catalog_btree::deserialize_name_value(&name_val);
+        let resolved_id = catalog_btree::deserialize_name_value(&name_val).unwrap();
         assert_eq!(resolved_id, 1);
 
         // Verify index entry.
@@ -1870,7 +1870,7 @@ async fn test_crash_mid_checkpoint_dwb_recovery() {
     for i in 0..10u32 {
         let mut buf = vec![0u8; page_size];
         page_storage.read_page(i, &mut buf).unwrap();
-        let page_ref = SlottedPageRef::from_buf(&buf);
+        let page_ref = SlottedPageRef::from_buf(&buf).unwrap();
         assert!(
             page_ref.verify_checksum(),
             "page {} should have valid checksum after DWB recovery",

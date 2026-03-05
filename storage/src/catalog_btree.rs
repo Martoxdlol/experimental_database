@@ -25,10 +25,10 @@ impl CatalogEntityType {
         match val {
             0x01 => Ok(CatalogEntityType::Collection),
             0x02 => Ok(CatalogEntityType::Index),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            _ => Err(crate::error::StorageError::Corruption(
                 format!("unknown catalog entity type: 0x{:02x}", val),
-            )),
+            )
+            .into()),
         }
     }
 }
@@ -50,10 +50,10 @@ impl CatalogIndexState {
             0x01 => Ok(CatalogIndexState::Building),
             0x02 => Ok(CatalogIndexState::Ready),
             0x03 => Ok(CatalogIndexState::Dropping),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            _ => Err(crate::error::StorageError::Corruption(
                 format!("unknown catalog index state: 0x{:02x}", val),
-            )),
+            )
+            .into()),
         }
     }
 }
@@ -81,10 +81,10 @@ impl IndexType {
             0x02 => Ok(IndexType::Gin),
             0x03 => Ok(IndexType::FullText),
             0x04 => Ok(IndexType::Vector),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            _ => Err(crate::error::StorageError::Corruption(
                 format!("unknown index type: 0x{:02x}", val),
-            )),
+            )
+            .into()),
         }
     }
 }
@@ -164,40 +164,37 @@ pub fn serialize_collection(entry: &CollectionEntry) -> Vec<u8> {
 pub fn deserialize_collection(data: &[u8]) -> io::Result<CollectionEntry> {
     // Minimum size: 8 (collection_id) + 2 (name_len) + 0 (name) + 4 (root) + 8 (doc_count) = 22
     if data.len() < 22 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "collection entry too short",
-        ));
+        return Err(
+            crate::error::StorageError::Corruption("collection entry too short".into()).into(),
+        );
     }
 
     let mut offset = 0;
 
-    let collection_id = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    let collection_id = crate::util::read_u64_le(data, offset)?;
     offset += 8;
 
-    let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+    let name_len = crate::util::read_u16_le(data, offset)? as usize;
     offset += 2;
 
     if data.len() < offset + name_len + 4 + 8 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "collection entry truncated at name",
-        ));
+        return Err(
+            crate::error::StorageError::Corruption("collection entry truncated at name".into())
+                .into(),
+        );
     }
 
     let name = String::from_utf8(data[offset..offset + name_len].to_vec()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "collection name is not valid UTF-8",
-        )
+        io::Error::from(crate::error::StorageError::Corruption(
+            "collection name is not valid UTF-8".into(),
+        ))
     })?;
     offset += name_len;
 
-    let primary_root_page =
-        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+    let primary_root_page = crate::util::read_u32_le(data, offset)?;
     offset += 4;
 
-    let doc_count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    let doc_count = crate::util::read_u64_le(data, offset)?;
 
     Ok(CollectionEntry {
         collection_id,
@@ -254,46 +251,45 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
     // Minimum: 8 (index_id) + 8 (collection_id) + 1 (index_type) + 2 (name_len)
     //        + 1 (field_count) + 4 (root_page) + 1 (state) + 1 (aux_count) + 2 (config_len) = 28
     if data.len() < 28 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "index entry too short",
-        ));
+        return Err(
+            crate::error::StorageError::Corruption("index entry too short".into()).into(),
+        );
     }
 
     let mut offset = 0;
 
-    let index_id = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    let index_id = crate::util::read_u64_le(data, offset)?;
     offset += 8;
 
-    let collection_id = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    let collection_id = crate::util::read_u64_le(data, offset)?;
     offset += 8;
 
     let index_type = IndexType::from_u8(data[offset])?;
     offset += 1;
 
-    let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+    let name_len = crate::util::read_u16_le(data, offset)? as usize;
     offset += 2;
 
     if offset + name_len > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "index entry truncated at name",
-        ));
+        return Err(
+            crate::error::StorageError::Corruption("index entry truncated at name".into()).into(),
+        );
     }
 
     let name = String::from_utf8(data[offset..offset + name_len].to_vec()).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "index name is not valid UTF-8",
-        )
+        io::Error::from(crate::error::StorageError::Corruption(
+            "index name is not valid UTF-8".into(),
+        ))
     })?;
     offset += name_len;
 
     if offset >= data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "index entry truncated at field_count",
-        ));
+        return Err(
+            crate::error::StorageError::Corruption(
+                "index entry truncated at field_count".into(),
+            )
+            .into(),
+        );
     }
 
     let field_count = data[offset] as usize;
@@ -302,10 +298,12 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
     let mut field_paths = Vec::with_capacity(field_count);
     for _ in 0..field_count {
         if offset >= data.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "index entry truncated at segment_count",
-            ));
+            return Err(
+                crate::error::StorageError::Corruption(
+                    "index entry truncated at segment_count".into(),
+                )
+                .into(),
+            );
         }
         let segment_count = data[offset] as usize;
         offset += 1;
@@ -313,27 +311,29 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
         let mut segments = Vec::with_capacity(segment_count);
         for _ in 0..segment_count {
             if offset + 2 > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "index entry truncated at seg_len",
-                ));
+                return Err(
+                    crate::error::StorageError::Corruption(
+                        "index entry truncated at seg_len".into(),
+                    )
+                    .into(),
+                );
             }
-            let seg_len =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+            let seg_len = crate::util::read_u16_le(data, offset)? as usize;
             offset += 2;
 
             if offset + seg_len > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "index entry truncated at segment data",
-                ));
+                return Err(
+                    crate::error::StorageError::Corruption(
+                        "index entry truncated at segment data".into(),
+                    )
+                    .into(),
+                );
             }
             let segment =
                 String::from_utf8(data[offset..offset + seg_len].to_vec()).map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "index field path segment is not valid UTF-8",
-                    )
+                    io::Error::from(crate::error::StorageError::Corruption(
+                        "index field path segment is not valid UTF-8".into(),
+                    ))
                 })?;
             offset += seg_len;
             segments.push(segment);
@@ -342,54 +342,64 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
     }
 
     if offset + 4 + 1 > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "index entry truncated at root_page/state",
-        ));
+        return Err(
+            crate::error::StorageError::Corruption(
+                "index entry truncated at root_page/state".into(),
+            )
+            .into(),
+        );
     }
 
-    let root_page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+    let root_page = crate::util::read_u32_le(data, offset)?;
     offset += 4;
 
     let state = CatalogIndexState::from_u8(data[offset])?;
     offset += 1;
 
     if offset >= data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "index entry truncated at aux_count",
-        ));
+        return Err(
+            crate::error::StorageError::Corruption(
+                "index entry truncated at aux_count".into(),
+            )
+            .into(),
+        );
     }
     let aux_count = data[offset] as usize;
     offset += 1;
 
     if offset + aux_count * 4 > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "index entry truncated at aux_root_pages",
-        ));
+        return Err(
+            crate::error::StorageError::Corruption(
+                "index entry truncated at aux_root_pages".into(),
+            )
+            .into(),
+        );
     }
     let mut aux_root_pages = Vec::with_capacity(aux_count);
     for _ in 0..aux_count {
-        let page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        let page = crate::util::read_u32_le(data, offset)?;
         offset += 4;
         aux_root_pages.push(page);
     }
 
     if offset + 2 > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "index entry truncated at config_len",
-        ));
+        return Err(
+            crate::error::StorageError::Corruption(
+                "index entry truncated at config_len".into(),
+            )
+            .into(),
+        );
     }
-    let config_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+    let config_len = crate::util::read_u16_le(data, offset)? as usize;
     offset += 2;
 
     if offset + config_len > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "index entry truncated at config",
-        ));
+        return Err(
+            crate::error::StorageError::Corruption(
+                "index entry truncated at config".into(),
+            )
+            .into(),
+        );
     }
     let config = data[offset..offset + config_len].to_vec();
 
@@ -413,8 +423,8 @@ pub fn serialize_name_value(entity_id: u64) -> [u8; 8] {
 }
 
 /// Deserialize a name -> entity_id mapping from bytes.
-pub fn deserialize_name_value(data: &[u8]) -> u64 {
-    u64::from_be_bytes(data[0..8].try_into().unwrap())
+pub fn deserialize_name_value(data: &[u8]) -> io::Result<u64> {
+    crate::util::read_u64_be(data, 0)
 }
 
 // ─── Scan Helpers ───
@@ -602,7 +612,7 @@ mod tests {
             .get(&name_key)
             .unwrap()
             .expect("should find by name");
-        let found_id = deserialize_name_value(&found_name_value);
+        let found_id = deserialize_name_value(&found_name_value).unwrap();
         assert_eq!(found_id, entry.collection_id);
     }
 
@@ -777,7 +787,7 @@ mod tests {
     fn name_value_roundtrip() {
         for id in [0u64, 1, 42, u64::MAX, 0xDEAD_BEEF_CAFE_BABEu64] {
             let encoded = serialize_name_value(id);
-            let decoded = deserialize_name_value(&encoded);
+            let decoded = deserialize_name_value(&encoded).unwrap();
             assert_eq!(decoded, id);
         }
     }
@@ -967,5 +977,47 @@ mod tests {
         let key2 = make_catalog_id_key(CatalogEntityType::Index, 2);
         let found2 = deserialize_index(&id_btree.get(&key2).unwrap().unwrap()).unwrap();
         assert_eq!(found2, gin_idx);
+    }
+
+    // ─── Truncated deserialization tests ─────────────────────────────
+
+    #[test]
+    fn deserialize_collection_truncated() {
+        // Empty
+        assert!(deserialize_collection(&[]).is_err());
+        // Too short (< 22 minimum)
+        assert!(deserialize_collection(&[0u8; 21]).is_err());
+        // Valid header but name_len points past end
+        let mut data = vec![0u8; 22];
+        // Set name_len = 100 at offset 8
+        data[8] = 100;
+        data[9] = 0;
+        assert!(deserialize_collection(&data).is_err());
+    }
+
+    #[test]
+    fn deserialize_index_truncated() {
+        // Empty
+        assert!(deserialize_index(&[]).is_err());
+        // Too short (< 28 minimum)
+        assert!(deserialize_index(&[0u8; 27]).is_err());
+        // Valid header but name_len points past end
+        let mut data = vec![0u8; 28];
+        // index_type at offset 16 must be valid (1 = BTree)
+        data[16] = 1;
+        // name_len = 200 at offset 17
+        data[17] = 200;
+        data[18] = 0;
+        assert!(deserialize_index(&data).is_err());
+    }
+
+    #[test]
+    fn deserialize_name_value_truncated() {
+        // Empty
+        assert!(deserialize_name_value(&[]).is_err());
+        // Too short for u64
+        assert!(deserialize_name_value(&[0u8; 7]).is_err());
+        // Exactly 8 bytes should succeed
+        assert!(deserialize_name_value(&[0u8; 8]).is_ok());
     }
 }

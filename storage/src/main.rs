@@ -187,7 +187,7 @@ async fn main() -> std::io::Result<()> {
     let id_bytes = name_idx2
         .get(&lookup_key)?
         .expect("collection 'users' not found in name index");
-    let collection_id = catalog_btree::deserialize_name_value(&id_bytes);
+    let collection_id = catalog_btree::deserialize_name_value(&id_bytes)?;
     println!(
         "Looked up 'users' by name -> collection_id={}",
         collection_id
@@ -216,7 +216,7 @@ async fn main() -> std::io::Result<()> {
     let idx_id_bytes = name_idx2
         .get(&idx_lookup)?
         .expect("index not found by name");
-    let idx_id = catalog_btree::deserialize_name_value(&idx_id_bytes);
+    let idx_id = catalog_btree::deserialize_name_value(&idx_id_bytes)?;
     let idx_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx_id);
     let idx_bytes = catalog2.get(&idx_key)?.expect("index entry not found");
     let idx2 = catalog_btree::deserialize_index(&idx_bytes)?;

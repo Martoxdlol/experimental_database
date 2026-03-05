@@ -107,8 +107,9 @@ impl Recovery {
         let mut header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
         let n = wal_storage.read_from(checkpoint_lsn, &mut header_buf)?;
         if n >= WAL_FRAME_HEADER_SIZE {
-            let payload_len =
-                u32::from_le_bytes(header_buf[0..4].try_into().unwrap()) as usize;
+            let payload_len = u32::from_le_bytes(
+                [header_buf[0], header_buf[1], header_buf[2], header_buf[3]],
+            ) as usize;
             if payload_len > 0 && payload_len <= MAX_WAL_RECORD_SIZE {
                 return Ok(true);
             }
@@ -135,10 +136,12 @@ impl Recovery {
                 break;
             }
 
-            let payload_len =
-                u32::from_le_bytes(header_buf[0..4].try_into().unwrap()) as usize;
-            let stored_crc =
-                u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+            let payload_len = u32::from_le_bytes(
+                [header_buf[0], header_buf[1], header_buf[2], header_buf[3]],
+            ) as usize;
+            let stored_crc = u32::from_le_bytes(
+                [header_buf[4], header_buf[5], header_buf[6], header_buf[7]],
+            );
             let record_type = header_buf[8];
 
             // End-of-log sentinel.
@@ -224,11 +227,11 @@ impl Recovery {
             return Ok(0);
         }
 
-        let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-        let _version = u16::from_le_bytes(header_buf[4..6].try_into().unwrap());
-        let dwb_page_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap());
-        let page_count = u32::from_le_bytes(header_buf[8..12].try_into().unwrap());
-        let stored_checksum = u32::from_le_bytes(header_buf[12..16].try_into().unwrap());
+        let magic = u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let _version = u16::from_le_bytes([header_buf[4], header_buf[5]]);
+        let dwb_page_size = u16::from_le_bytes([header_buf[6], header_buf[7]]);
+        let page_count = u32::from_le_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]]);
+        let stored_checksum = u32::from_le_bytes([header_buf[12], header_buf[13], header_buf[14], header_buf[15]]);
 
         // Verify magic.
         if magic != DWB_MAGIC {
@@ -245,13 +248,11 @@ impl Recovery {
 
         // Verify page size.
         if dwb_page_size as usize != page_size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "DWB page_size mismatch: DWB has {}, expected {}",
-                    dwb_page_size, page_size
-                ),
-            ));
+            return Err(crate::error::StorageError::Corruption(format!(
+                "DWB page_size mismatch: DWB has {}, expected {}",
+                dwb_page_size, page_size
+            ))
+            .into());
         }
 
         let mut restored = 0u32;
@@ -265,11 +266,11 @@ impl Recovery {
                 break;
             }
 
-            let page_id = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap());
+            let page_id = crate::util::read_u32_le(&entry_buf, 0)?;
             let dwb_page_data = &entry_buf[DWB_ENTRY_PREFIX_SIZE..];
 
             // Verify DWB page checksum.
-            let dwb_ref = SlottedPageRef::from_buf(dwb_page_data);
+            let dwb_ref = SlottedPageRef::from_buf(dwb_page_data)?;
             if !dwb_ref.verify_checksum() {
                 // DWB page itself is corrupt. Skip.
                 continue;
@@ -279,7 +280,7 @@ impl Recovery {
             let mut storage_page = vec![0u8; page_size];
             match page_storage.read_page(page_id, &mut storage_page) {
                 Ok(()) => {
-                    let storage_ref = SlottedPageRef::from_buf(&storage_page);
+                    let storage_ref = SlottedPageRef::from_buf(&storage_page)?;
                     if !storage_ref.verify_checksum() {
                         // Torn write -- restore from DWB.
                         page_storage.write_page(page_id, dwb_page_data)?;

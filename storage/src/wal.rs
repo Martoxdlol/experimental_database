@@ -248,16 +248,11 @@ impl WalWriter {
                 response: response_tx,
             })
             .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer task has shut down")
-            })?;
+            .map_err(|_| io::Error::from(crate::error::StorageError::WalShutDown))?;
 
-        response_rx.await.map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "WAL writer task dropped the response",
-            )
-        })?
+        response_rx
+            .await
+            .map_err(|_| io::Error::from(crate::error::StorageError::WalShutDown))?
     }
 
     /// Append a pre-encoded raw WAL frame (for replication).
@@ -267,25 +262,21 @@ impl WalWriter {
     pub async fn append_raw_frame(&self, raw: &[u8]) -> io::Result<Lsn> {
         // Basic validation: must have at least a header.
         if raw.len() < WAL_FRAME_HEADER_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "raw frame too short: must be at least 9 bytes",
-            ));
+            return Err(crate::error::StorageError::InvalidConfig(
+                "raw frame too short: must be at least 9 bytes".into()
+            ).into());
         }
 
         // Validate that payload_len matches the actual data length.
-        let payload_len = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+        let payload_len = crate::util::read_u32_le(raw, 0)? as usize;
         if raw.len() != WAL_FRAME_HEADER_SIZE + payload_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "raw frame length mismatch: header says {} payload bytes, \
-                     but frame is {} bytes (expected {})",
-                    payload_len,
-                    raw.len(),
-                    WAL_FRAME_HEADER_SIZE + payload_len,
-                ),
-            ));
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "raw frame length mismatch: header says {} payload bytes, \
+                 but frame is {} bytes (expected {})",
+                payload_len,
+                raw.len(),
+                WAL_FRAME_HEADER_SIZE + payload_len,
+            )).into());
         }
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -295,16 +286,11 @@ impl WalWriter {
                 response: response_tx,
             })
             .await
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::BrokenPipe, "WAL writer task has shut down")
-            })?;
+            .map_err(|_| io::Error::from(crate::error::StorageError::WalShutDown))?;
 
-        response_rx.await.map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "WAL writer task dropped the response",
-            )
-        })?
+        response_rx
+            .await
+            .map_err(|_| io::Error::from(crate::error::StorageError::WalShutDown))?
     }
 
     /// Current write position (LSN of next record to be written).
@@ -399,9 +385,9 @@ impl Iterator for WalIterator {
         }
 
         // Step 2: Parse header fields.
-        let payload_len =
-            u32::from_le_bytes(header_buf[0..4].try_into().unwrap()) as usize;
-        let stored_crc = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
+        // header_buf is exactly WAL_FRAME_HEADER_SIZE (9) bytes and n >= 9, so these reads are safe.
+        let payload_len = u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]) as usize;
+        let stored_crc = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
         let record_type = header_buf[8];
 
         // Step 3: Check for end-of-log sentinel (payload_len == 0).

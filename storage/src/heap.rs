@@ -109,13 +109,10 @@ impl Heap {
         // Check max blob size
         let max_blob = first_chunk_capacity + MAX_OVERFLOW_CHAIN * overflow_page_capacity;
         if total_length > max_blob {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "blob too large: {} bytes exceeds maximum {} bytes",
-                    total_length, max_blob
-                ),
-            ));
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "blob too large: {} bytes exceeds maximum {} bytes",
+                total_length, max_blob
+            )).into());
         }
 
         // Determine how much data goes in the first chunk
@@ -153,16 +150,16 @@ impl Heap {
         let mut guard = self.buffer_pool.fetch_page_exclusive(heap_page_id)?;
         let slot_id = {
             let buf = guard.data_mut();
-            let mut page = SlottedPage::from_buf(buf);
-            page.insert_slot(&slot_payload).map_err(|_| {
-                io::Error::other("page full during heap insert")
+            let mut page = SlottedPage::from_buf(buf)?;
+            page.insert_slot(&slot_payload).map_err(|_| -> io::Error {
+                crate::error::StorageError::InternalBug("page full during heap insert".into()).into()
             })?
         };
         guard.mark_dirty();
 
         // Update free space map
         {
-            let free = SlottedPageRef::from_buf(guard.data()).free_space();
+            let free = SlottedPageRef::from_buf(guard.data())?.free_space();
             self.free_space_map.insert(heap_page_id, free);
         }
 
@@ -177,42 +174,31 @@ impl Heap {
     /// Load a blob by reference. Reassembles overflow chains.
     pub fn load(&self, href: HeapRef) -> io::Result<Vec<u8>> {
         let guard = self.buffer_pool.fetch_page_shared(href.page_id)?;
-        let page = SlottedPageRef::from_buf(guard.data());
+        let page = SlottedPageRef::from_buf(guard.data())?;
 
         if href.slot_id >= page.num_slots() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "slot {} out of range (num_slots {}) on page {}",
-                    href.slot_id,
-                    page.num_slots(),
-                    href.page_id,
-                ),
-            ));
+            return Err(crate::error::StorageError::Corruption(format!(
+                "slot {} out of range (num_slots {}) on page {}",
+                href.slot_id,
+                page.num_slots(),
+                href.page_id,
+            )).into());
         }
 
         let slot_data = page.slot_data(href.slot_id);
         if slot_data.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "slot {} on page {} is deleted (tombstone)",
-                    href.slot_id, href.page_id,
-                ),
-            ));
+            return Err(crate::error::StorageError::Corruption(format!(
+                "slot {} on page {} is deleted (tombstone)",
+                href.slot_id, href.page_id,
+            )).into());
         }
 
         if slot_data.len() < HEAP_SLOT_HEADER_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "slot {} on page {} too small for heap header ({} < {})",
-                    href.slot_id,
-                    href.page_id,
-                    slot_data.len(),
-                    HEAP_SLOT_HEADER_SIZE,
-                ),
-            ));
+            return Err(crate::error::StorageError::DataTruncated {
+                offset: 0,
+                needed: HEAP_SLOT_HEADER_SIZE,
+                available: slot_data.len(),
+            }.into());
         }
 
         // Parse heap slot header
@@ -237,21 +223,19 @@ impl Heap {
             while next_page != 0 {
                 chain_count += 1;
                 if chain_count > MAX_OVERFLOW_CHAIN {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "overflow chain exceeds maximum length",
-                    ));
+                    return Err(crate::error::StorageError::Corruption(
+                        "overflow chain exceeds maximum length".into()
+                    ).into());
                 }
 
                 let ov_guard = self.buffer_pool.fetch_page_shared(next_page)?;
-                let ov_page = SlottedPageRef::from_buf(ov_guard.data());
+                let ov_page = SlottedPageRef::from_buf(ov_guard.data())?;
 
                 // Validate page type
                 if ov_page.page_type() != PageType::Overflow {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("expected overflow page at {}, got {:?}", next_page, ov_page.page_type()),
-                    ));
+                    return Err(crate::error::StorageError::Corruption(format!(
+                        "expected overflow page at {}, got {:?}", next_page, ov_page.page_type()
+                    )).into());
                 }
 
                 // next_overflow_page is stored in prev_or_ptr
@@ -260,10 +244,11 @@ impl Heap {
                 // Read data_length (u32 LE) at PAGE_HEADER_SIZE offset
                 let buf = ov_guard.data();
                 if buf.len() < PAGE_HEADER_SIZE + OVERFLOW_DATA_LEN_SIZE {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "overflow page too small for data_length field",
-                    ));
+                    return Err(crate::error::StorageError::DataTruncated {
+                        offset: PAGE_HEADER_SIZE,
+                        needed: OVERFLOW_DATA_LEN_SIZE,
+                        available: buf.len().saturating_sub(PAGE_HEADER_SIZE),
+                    }.into());
                 }
                 let data_len = u32::from_le_bytes([
                     buf[PAGE_HEADER_SIZE],
@@ -275,13 +260,10 @@ impl Heap {
                 let data_start = PAGE_HEADER_SIZE + OVERFLOW_DATA_LEN_SIZE;
                 let data_end = data_start + data_len;
                 if data_end > buf.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "overflow page {} data_length {} exceeds page bounds",
-                            next_page, data_len
-                        ),
-                    ));
+                    return Err(crate::error::StorageError::Corruption(format!(
+                        "overflow page {} data_length {} exceeds page bounds",
+                        next_page, data_len
+                    )).into());
                 }
 
                 result.extend_from_slice(&buf[data_start..data_end]);
@@ -292,14 +274,11 @@ impl Heap {
 
         // Verify total bytes
         if result.len() != total_length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "blob length mismatch: expected {}, got {}",
-                    total_length,
-                    result.len()
-                ),
-            ));
+            return Err(crate::error::StorageError::Corruption(format!(
+                "blob length mismatch: expected {}, got {}",
+                total_length,
+                result.len()
+            )).into());
         }
 
         Ok(result)
@@ -310,36 +289,31 @@ impl Heap {
         // Read the slot to find overflow chain info
         let (flags, overflow_page) = {
             let guard = self.buffer_pool.fetch_page_shared(href.page_id)?;
-            let page = SlottedPageRef::from_buf(guard.data());
+            let page = SlottedPageRef::from_buf(guard.data())?;
 
             if href.slot_id >= page.num_slots() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "slot {} out of range (num_slots {}) on page {}",
-                        href.slot_id,
-                        page.num_slots(),
-                        href.page_id,
-                    ),
-                ));
+                return Err(crate::error::StorageError::Corruption(format!(
+                    "slot {} out of range (num_slots {}) on page {}",
+                    href.slot_id,
+                    page.num_slots(),
+                    href.page_id,
+                )).into());
             }
 
             let slot_data = page.slot_data(href.slot_id);
             if slot_data.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "slot {} on page {} is already deleted",
-                        href.slot_id, href.page_id,
-                    ),
-                ));
+                return Err(crate::error::StorageError::Corruption(format!(
+                    "slot {} on page {} is already deleted",
+                    href.slot_id, href.page_id,
+                )).into());
             }
 
             if slot_data.len() < HEAP_SLOT_HEADER_SIZE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "heap slot too small for header",
-                ));
+                return Err(crate::error::StorageError::DataTruncated {
+                    offset: 0,
+                    needed: HEAP_SLOT_HEADER_SIZE,
+                    available: slot_data.len(),
+                }.into());
             }
 
             let flags = slot_data[0];
@@ -357,16 +331,15 @@ impl Heap {
             while next_page != 0 {
                 chain_count += 1;
                 if chain_count > MAX_OVERFLOW_CHAIN {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "overflow chain exceeds maximum length during free",
-                    ));
+                    return Err(crate::error::StorageError::Corruption(
+                        "overflow chain exceeds maximum length during free".into()
+                    ).into());
                 }
 
                 // Read the next pointer before deallocating
                 let next_overflow = {
                     let guard = self.buffer_pool.fetch_page_shared(next_page)?;
-                    let page = SlottedPageRef::from_buf(guard.data());
+                    let page = SlottedPageRef::from_buf(guard.data())?;
                     page.prev_or_ptr()
                 };
 
@@ -380,13 +353,13 @@ impl Heap {
             let mut guard = self.buffer_pool.fetch_page_exclusive(href.page_id)?;
             {
                 let buf = guard.data_mut();
-                let mut page = SlottedPage::from_buf(buf);
+                let mut page = SlottedPage::from_buf(buf)?;
                 page.delete_slot(href.slot_id);
             }
             guard.mark_dirty();
 
             // Check if page is now completely empty (all slots are tombstones)
-            let page = SlottedPageRef::from_buf(guard.data());
+            let page = SlottedPageRef::from_buf(guard.data())?;
             let num_slots = page.num_slots();
             let all_deleted = (0..num_slots).all(|i| page.slot_data(i).is_empty());
 
@@ -420,7 +393,7 @@ impl Heap {
 
         for pid in 0..page_count as PageId {
             let guard = self.buffer_pool.fetch_page_shared(pid)?;
-            let page = SlottedPageRef::from_buf(guard.data());
+            let page = SlottedPageRef::from_buf(guard.data())?;
 
             if page.page_type() == PageType::Heap {
                 let free = page.free_space();
@@ -448,10 +421,9 @@ impl Heap {
         let chunks: Vec<&[u8]> = data.chunks(overflow_page_capacity).collect();
 
         if chunks.len() > MAX_OVERFLOW_CHAIN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "data requires too many overflow pages",
-            ));
+            return Err(crate::error::StorageError::InvalidConfig(
+                "data requires too many overflow pages".into()
+            ).into());
         }
 
         // Build chain back-to-front
@@ -516,7 +488,7 @@ impl Heap {
         guard.mark_dirty();
 
         // Record the initial free space
-        let free = SlottedPageRef::from_buf(guard.data()).free_space();
+        let free = SlottedPageRef::from_buf(guard.data())?.free_space();
         self.free_space_map.insert(page_id, free);
         drop(guard);
 

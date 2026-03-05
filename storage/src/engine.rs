@@ -60,6 +60,32 @@ pub struct StorageConfig {
     pub checkpoint_interval: Duration,
 }
 
+impl StorageConfig {
+    /// Validate the configuration, returning an error on invalid values.
+    pub fn validate(&self) -> io::Result<()> {
+        // Page header uses u16 for offsets/lengths, so max page size is 65535.
+        // DwbHeader::page_size is also u16.
+        if self.page_size > u16::MAX as usize {
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "page_size {} exceeds maximum of {} (u16 offset limit)",
+                self.page_size,
+                u16::MAX
+            )).into());
+        }
+        if self.page_size < 64 {
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "page_size {} is too small (minimum 64)", self.page_size
+            )).into());
+        }
+        if self.memory_budget < self.page_size {
+            return Err(crate::error::StorageError::InvalidConfig(
+                "memory_budget must be at least page_size".into()
+            ).into());
+        }
+        Ok(())
+    }
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         StorageConfig {
@@ -140,24 +166,18 @@ impl FileHeader {
     /// Verify the magic number and version.
     pub fn verify(&self) -> io::Result<()> {
         if self.magic.get() != FILE_HEADER_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "file header magic mismatch: expected 0x{:08X}, got 0x{:08X}",
-                    FILE_HEADER_MAGIC,
-                    self.magic.get()
-                ),
-            ));
+            return Err(crate::error::StorageError::Corruption(format!(
+                "file header magic mismatch: expected 0x{:08X}, got 0x{:08X}",
+                FILE_HEADER_MAGIC,
+                self.magic.get()
+            )).into());
         }
         if self.version.get() != FILE_HEADER_VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "file header version mismatch: expected {}, got {}",
-                    FILE_HEADER_VERSION,
-                    self.version.get()
-                ),
-            ));
+            return Err(crate::error::StorageError::Corruption(format!(
+                "file header version mismatch: expected {}, got {}",
+                FILE_HEADER_VERSION,
+                self.version.get()
+            )).into());
         }
         Ok(())
     }
@@ -168,16 +188,14 @@ fn read_file_header(buf: &[u8]) -> io::Result<FileHeader> {
     let start = PAGE_HEADER_SIZE;
     let end = start + FILE_HEADER_SIZE;
     if buf.len() < end {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "page 0 buffer too small for FileHeader",
-        ));
+        return Err(crate::error::StorageError::Corruption(
+            "page 0 buffer too small for FileHeader".into()
+        ).into());
     }
     FileHeader::read_from_bytes(&buf[start..end]).map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
+        io::Error::from(crate::error::StorageError::Corruption(
             format!("failed to read FileHeader: {:?}", e),
-        )
+        ))
     })
 }
 
@@ -322,13 +340,10 @@ impl StorageEngine {
             // Validate page_size matches the stored value.
             let stored_page_size = file_header.page_size.get() as usize;
             if stored_page_size != config.page_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "page size mismatch: file has {}, config has {}",
-                        stored_page_size, config.page_size
-                    ),
-                ));
+                return Err(crate::error::StorageError::Corruption(format!(
+                    "page size mismatch: file has {}, config has {}",
+                    stored_page_size, config.page_size
+                )).into());
             }
 
             let checkpoint_lsn = file_header.checkpoint_lsn.get();
@@ -383,6 +398,7 @@ impl StorageEngine {
         config: StorageConfig,
         handler: Option<&mut dyn WalRecordHandler>,
     ) -> io::Result<Self> {
+        config.validate()?;
         let is_durable = page_storage.is_durable();
         let is_new = page_storage.page_count() == 0;
 
@@ -590,6 +606,7 @@ impl StorageEngine {
         dwb_path: Option<PathBuf>,
         db_path: Option<PathBuf>,
     ) -> io::Result<Self> {
+        config.validate()?;
         let page_size = config.page_size;
         let frame_count = config.memory_budget / page_size;
 
@@ -1056,5 +1073,38 @@ mod tests {
         // Verify catalog root pages are still set.
         assert!(fh_after.catalog_root_page.get() > 0);
         assert!(fh_after.catalog_name_root_page.get() > 0);
+    }
+
+    // ─── Test 10: Page size > 65535 should be rejected ───
+    // BUG: Page header uses u16 for offsets, so max page size is 65535.
+    // No validation exists — larger sizes cause silent truncation/corruption.
+
+    #[tokio::test]
+    async fn test_page_size_too_large_rejected() {
+        let config = StorageConfig {
+            page_size: 65536, // One byte over max u16
+            memory_budget: 65536 * 64,
+            ..Default::default()
+        };
+        let result = StorageEngine::open_in_memory(config);
+        assert!(
+            result.is_err(),
+            "page_size > 65535 should be rejected (u16 overflow in page header)"
+        );
+    }
+
+    // ─── Test 11: Page size of exactly 65535 should work ───
+
+    #[tokio::test]
+    async fn test_page_size_max_valid() {
+        let config = StorageConfig {
+            page_size: 65535, // Max valid u16
+            memory_budget: 65535 * 64,
+            ..Default::default()
+        };
+        // Should succeed.
+        let engine = StorageEngine::open_in_memory(config).unwrap();
+        let fh = engine.file_header();
+        assert_eq!(fh.page_size.get(), 65535);
     }
 }

@@ -136,16 +136,27 @@ impl BufferPool {
             let pt = self.page_table.read();
             if let Some(&frame_id) = pt.get(&page_id) {
                 // Page is in the cache. Pin, set ref_bit (atomic, no write lock
-                // needed), acquire read lock, return.
+                // needed), acquire read lock, then re-validate.
                 let slot = &self.frames[frame_id as usize];
                 slot.pin_count.fetch_add(1, Ordering::AcqRel);
                 slot.ref_bit.store(true, Ordering::Release);
                 let guard = slot.lock.read();
-                return Ok(SharedPageGuard {
-                    pool: self,
-                    frame_id,
-                    guard,
-                });
+
+                // Re-validate: between our page_table lookup and acquiring the
+                // read lock, another thread may have evicted this frame and
+                // loaded a different page into it (TOCTOU race). If the frame
+                // no longer holds our page, undo the pin and fall through to
+                // the slow path.
+                if guard.page_id == Some(page_id) {
+                    return Ok(SharedPageGuard {
+                        pool: self,
+                        frame_id,
+                        guard,
+                    });
+                }
+                // Frame was evicted and reused. Undo pin and fall through.
+                drop(guard);
+                slot.pin_count.fetch_sub(1, Ordering::Release);
             }
         }
         // page_table lock is released here.
@@ -212,12 +223,20 @@ impl BufferPool {
                 slot.pin_count.fetch_add(1, Ordering::AcqRel);
                 slot.ref_bit.store(true, Ordering::Release);
                 let guard = slot.lock.write();
-                return Ok(ExclusivePageGuard {
-                    pool: self,
-                    frame_id,
-                    guard,
-                    modified: false,
-                });
+
+                // Re-validate: between our page_table lookup and acquiring the
+                // write lock, another thread may have evicted this frame.
+                if guard.page_id == Some(page_id) {
+                    return Ok(ExclusivePageGuard {
+                        pool: self,
+                        frame_id,
+                        guard,
+                        modified: false,
+                    });
+                }
+                // Frame was evicted and reused. Undo pin and fall through.
+                drop(guard);
+                slot.pin_count.fetch_sub(1, Ordering::Release);
             }
         }
 
@@ -301,10 +320,10 @@ impl BufferPool {
             match pt.get(&page_id) {
                 Some(&fid) => fid,
                 None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::NotFound,
+                    return Err(crate::error::StorageError::InternalBug(
                         format!("page {} not in buffer pool", page_id),
-                    ))
+                    )
+                    .into())
                 }
             }
         };
@@ -322,15 +341,26 @@ impl BufferPool {
 
     /// Snapshot all dirty frames. Returns `(page_id, page_data_copy, lsn)` tuples.
     ///
+    /// Stamps the CRC-32C checksum on each dirty page before copying, so that
+    /// the DWB and recovery can use checksums for torn-write detection.
+    ///
     /// Does **not** clear dirty flags (the checkpoint layer does that after the
     /// double-write buffer write via [`mark_clean`]).
     pub fn dirty_pages(&self) -> Vec<(PageId, Vec<u8>, Lsn)> {
+        use crate::page::SlottedPage;
+
         let mut result = Vec::new();
 
         for slot in &self.frames {
-            let guard = slot.lock.read();
+            // Acquire write lock so we can stamp the checksum in-place.
+            let mut guard = slot.lock.write();
             if guard.dirty
                 && let Some(pid) = guard.page_id {
+                    // Stamp the checksum before snapshotting.
+                    let mut page = SlottedPage::from_buf(&mut guard.data)
+                        .expect("pool frame is always page_size");
+                    page.stamp_checksum();
+
                     let data_copy = guard.data.clone();
                     // Read LSN from the page buffer at offset 24 (little-endian u64).
                     let lsn = read_lsn_from_buf(&guard.data);
@@ -1005,5 +1035,85 @@ mod tests {
         // The pinned page 0 should still be valid.
         verify_pattern(pinned_guard.data(), 0);
         drop(pinned_guard);
+    }
+
+    // ─── Test 14: dirty_pages snapshots have valid checksums ───
+    // BUG: Checksum is never re-stamped after page modification, so
+    // dirty_pages() returns pages with stale checksums. DWB recovery
+    // relies on valid checksums to detect torn writes.
+
+    #[test]
+    fn test_dirty_pages_have_valid_checksums() {
+        use crate::page::{PageType, SlottedPage, SlottedPageRef};
+
+        let storage = make_memory_storage(4);
+        // Initialize page 0 with a valid checksum.
+        {
+            let mut buf = vec![0u8; PAGE_SIZE];
+            SlottedPage::init(&mut buf, 0, PageType::Heap);
+            // init already stamps checksum
+            storage.write_page(0, &buf).unwrap();
+        }
+
+        let pool = make_pool(8, storage.clone());
+
+        // Modify page 0 through the buffer pool (simulates a B-tree insert).
+        {
+            let mut guard = pool.fetch_page_exclusive(0).unwrap();
+            let buf = guard.data_mut();
+            // Write LSN and some data (simulating a real modification).
+            buf[LSN_OFFSET..LSN_OFFSET + LSN_SIZE].copy_from_slice(&100u64.to_le_bytes());
+            let mut page = SlottedPage::from_buf(buf).unwrap();
+            page.insert_slot(b"test data after modification").unwrap();
+            // Note: no stamp_checksum() call — this is the bug.
+        }
+
+        // Snapshot dirty pages (this is what checkpoint does).
+        let dirty = pool.dirty_pages();
+        assert_eq!(dirty.len(), 1);
+
+        // Verify the snapshot has a valid checksum.
+        let (pid, data, _lsn) = &dirty[0];
+        assert_eq!(*pid, 0);
+        let page_ref = SlottedPageRef::from_buf(data).unwrap();
+        assert!(
+            page_ref.verify_checksum(),
+            "BUG: dirty page snapshot should have a valid checksum for DWB recovery"
+        );
+    }
+
+    // ─── Test 15: buffer pool fast-path validates page_id after lock ───
+    // BUG: TOCTOU race in fetch_page_shared fast path. After incrementing
+    // pin_count and acquiring the read lock, the frame may have been evicted
+    // and reused for a different page.
+
+    #[test]
+    fn test_fast_path_validates_page_id() {
+        let storage = make_memory_storage(8);
+        for i in 0..8u32 {
+            write_pattern(&*storage, i);
+        }
+
+        // Pool with 3 frames — forces eviction.
+        let pool = make_pool(3, storage.clone());
+
+        // Load pages 0, 1, 2.
+        for i in 0..3u32 {
+            let g = pool.fetch_page_shared(i).unwrap();
+            drop(g);
+        }
+
+        // Load pages 3, 4, 5 — evicts 0, 1, 2.
+        for i in 3..6u32 {
+            let g = pool.fetch_page_shared(i).unwrap();
+            drop(g);
+        }
+
+        // Now fetch page 0 again — should get correct data (page 0, not
+        // whatever was in the frame before). This is a basic correctness
+        // test; the race itself is hard to trigger deterministically.
+        let g = pool.fetch_page_shared(0).unwrap();
+        assert_eq!(g.page_id(), 0);
+        verify_pattern(g.data(), 0);
     }
 }

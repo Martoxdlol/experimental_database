@@ -76,10 +76,10 @@ impl PostingList {
     /// Decode from bytes.
     pub fn decode(data: &[u8]) -> io::Result<Self> {
         if data.len() < 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "posting list too short for header",
-            ));
+            return Err(crate::error::StorageError::Corruption(
+                "posting list too short for header".into(),
+            )
+            .into());
         }
 
         let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
@@ -88,39 +88,39 @@ impl PostingList {
 
         for _ in 0..count {
             if offset + 2 > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "posting list truncated at key_len",
-                ));
+                return Err(crate::error::StorageError::Corruption(
+                    "posting list truncated at key_len".into(),
+                )
+                .into());
             }
             let key_len =
                 u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
 
             if offset + key_len > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "posting list truncated at key",
-                ));
+                return Err(crate::error::StorageError::Corruption(
+                    "posting list truncated at key".into(),
+                )
+                .into());
             }
             let key = data[offset..offset + key_len].to_vec();
             offset += key_len;
 
             if offset + 2 > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "posting list truncated at value_len",
-                ));
+                return Err(crate::error::StorageError::Corruption(
+                    "posting list truncated at value_len".into(),
+                )
+                .into());
             }
             let value_len =
                 u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
             offset += 2;
 
             if offset + value_len > data.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "posting list truncated at value",
-                ));
+                return Err(crate::error::StorageError::Corruption(
+                    "posting list truncated at value".into(),
+                )
+                .into());
             }
             let value = data[offset..offset + value_len].to_vec();
             offset += value_len;

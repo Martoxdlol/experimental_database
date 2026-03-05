@@ -139,7 +139,8 @@ fn write_raw_slot_entry(buf: &mut [u8], slot: u16, offset: u16, length: u16) {
 /// Appends the cell using `SlottedPage`, then shifts directory entries to place
 /// the new cell at `target_pos`.
 fn insert_cell_at_pos(buf: &mut [u8], data: &[u8], target_pos: u16) -> Result<(), PageFullError> {
-    let mut page = SlottedPage::from_buf(buf);
+    // Buffer from pool is always page_size.
+    let mut page = SlottedPage::from_buf(buf).expect("buffer from pool is always page_size");
     let old_num_slots = page.num_slots();
 
     // Append the cell data (this allocates cell space + directory entry at end).
@@ -171,7 +172,8 @@ fn insert_cell_at_pos(buf: &mut [u8], data: &[u8], target_pos: u16) -> Result<()
 /// Delete a slot at a given position and shift subsequent entries backward
 /// to maintain a contiguous sorted directory (no tombstones).
 fn delete_cell_at_pos(buf: &mut [u8], pos: u16) {
-    let mut page = SlottedPage::from_buf(buf);
+    // Buffer from pool is always page_size.
+    let mut page = SlottedPage::from_buf(buf).expect("buffer from pool is always page_size");
     let num_slots = page.num_slots();
     assert!(pos < num_slots);
 
@@ -189,7 +191,8 @@ fn delete_cell_at_pos(buf: &mut [u8], pos: u16) {
     write_raw_slot_entry(buf, num_slots - 1, 0, 0);
 
     // Decrement num_slots and free_space_start in the header.
-    let mut page = SlottedPage::from_buf(buf);
+    // Buffer from pool is always page_size.
+    let mut page = SlottedPage::from_buf(buf).expect("buffer from pool is always page_size");
     let mut h = page.header();
     let new_num_slots = h.num_slots.get() - 1;
     h.num_slots = zerocopy::byteorder::U16::<zerocopy::byteorder::LittleEndian>::new(new_num_slots);
@@ -254,7 +257,7 @@ impl BTree {
 
         loop {
             let guard = self.buffer_pool.fetch_page_shared(current_page_id)?;
-            let page = SlottedPageRef::from_buf(guard.data());
+            let page = SlottedPageRef::from_buf(guard.data())?;
             let page_type = page.page_type();
 
             match page_type {
@@ -275,13 +278,13 @@ impl BTree {
                     current_page_id = child;
                 }
                 _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(crate::error::StorageError::Corruption(
                         format!(
                             "unexpected page type {:?} during B-tree traversal",
                             page_type
                         ),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -303,7 +306,7 @@ impl BTree {
 
         loop {
             let guard = self.buffer_pool.fetch_page_shared(current_page_id)?;
-            let page = SlottedPageRef::from_buf(guard.data());
+            let page = SlottedPageRef::from_buf(guard.data())?;
             let page_type = page.page_type();
 
             match page_type {
@@ -320,13 +323,13 @@ impl BTree {
                     current_page_id = child;
                 }
                 _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
+                    return Err(crate::error::StorageError::Corruption(
                         format!(
                             "unexpected page type {:?} during B-tree insert traversal",
                             page_type
                         ),
-                    ));
+                    )
+                    .into());
                 }
             }
         }
@@ -337,7 +340,7 @@ impl BTree {
 
         // Check if key already exists for update.
         {
-            let page = SlottedPageRef::from_buf(guard.data());
+            let page = SlottedPageRef::from_buf(guard.data())?;
             let (found, idx) = binary_search_slots(&page, key, true);
             drop(page);
 
@@ -345,7 +348,7 @@ impl BTree {
                 // Update existing key: replace the cell.
                 let new_cell = encode_leaf_cell(key, value);
                 let buf = guard.data_mut();
-                let mut page = SlottedPage::from_buf(buf);
+                let mut page = SlottedPage::from_buf(buf)?;
                 match page.update_slot(idx, &new_cell) {
                     Ok(()) => {
                         return Ok(());
@@ -364,7 +367,7 @@ impl BTree {
         let cell = encode_leaf_cell(key, value);
 
         {
-            let page = SlottedPageRef::from_buf(guard.data());
+            let page = SlottedPageRef::from_buf(guard.data())?;
             let (_found, insert_pos) = binary_search_slots(&page, key, true);
             drop(page);
 
@@ -396,7 +399,7 @@ impl BTree {
 
         loop {
             let guard = self.buffer_pool.fetch_page_shared(current_page_id)?;
-            let page = SlottedPageRef::from_buf(guard.data());
+            let page = SlottedPageRef::from_buf(guard.data())?;
             let page_type = page.page_type();
 
             match page_type {
@@ -412,17 +415,17 @@ impl BTree {
                     current_page_id = child;
                 }
                 _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unexpected page type during delete traversal",
-                    ));
+                    return Err(crate::error::StorageError::Corruption(
+                        "unexpected page type during delete traversal".into(),
+                    )
+                    .into());
                 }
             }
         }
 
         // Acquire exclusive lock on the leaf.
         let mut guard = self.buffer_pool.fetch_page_exclusive(current_page_id)?;
-        let page = SlottedPageRef::from_buf(guard.data());
+        let page = SlottedPageRef::from_buf(guard.data())?;
         let (found, idx) = binary_search_slots(&page, key, true);
         drop(page);
 
@@ -504,7 +507,8 @@ impl BTree {
                 Ok(g) => g,
                 Err(_) => return (None, 0),
             };
-            let page = SlottedPageRef::from_buf(guard.data());
+            // Buffer from pool is always page_size.
+            let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
             let page_type = page.page_type();
 
             match page_type {
@@ -567,7 +571,8 @@ impl BTree {
                 Ok(g) => g,
                 Err(_) => return (None, 0),
             };
-            let page = SlottedPageRef::from_buf(guard.data());
+            // Buffer from pool is always page_size.
+            let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
             let page_type = page.page_type();
 
             match page_type {
@@ -652,7 +657,7 @@ impl BTree {
         free_list: &mut FreeList,
     ) -> io::Result<SplitResult> {
         let old_page_id = guard.page_id();
-        let page = SlottedPageRef::from_buf(guard.data());
+        let page = SlottedPageRef::from_buf(guard.data())?;
         let num_slots = page.num_slots();
         let old_right_sibling = page.prev_or_ptr();
 
@@ -689,9 +694,12 @@ impl BTree {
         for (k, v) in &entries[split_point..] {
             let cell = encode_leaf_cell(k, v);
             let buf = new_guard.data_mut();
-            let num = SlottedPageRef::from_buf(buf).num_slots();
-            insert_cell_at_pos(buf, &cell, num)
-                .expect("new page should have space after split");
+            let num = SlottedPageRef::from_buf(buf)?.num_slots();
+            insert_cell_at_pos(buf, &cell, num).map_err(|_| {
+                io::Error::other(crate::error::StorageError::InternalBug(
+                    "new leaf page should have space after split".into(),
+                ))
+            })?;
         }
         drop(new_guard);
 
@@ -699,16 +707,19 @@ impl BTree {
         {
             let buf = guard.data_mut();
             SlottedPage::init(buf, old_page_id, PageType::BTreeLeaf);
-            let mut page = SlottedPage::from_buf(buf);
+            let mut page = SlottedPage::from_buf(buf)?;
             // Set right sibling of old leaf to new leaf.
             page.set_prev_or_ptr(new_page_id);
             drop(page);
 
             for (k, v) in &entries[..split_point] {
                 let cell = encode_leaf_cell(k, v);
-                let num = SlottedPageRef::from_buf(buf).num_slots();
-                insert_cell_at_pos(buf, &cell, num)
-                    .expect("old page should have space after split");
+                let num = SlottedPageRef::from_buf(buf)?.num_slots();
+                insert_cell_at_pos(buf, &cell, num).map_err(|_| {
+                    io::Error::other(crate::error::StorageError::InternalBug(
+                        "old leaf page should have space after split".into(),
+                    ))
+                })?;
             }
         }
 
@@ -733,7 +744,7 @@ impl BTree {
             let cell = encode_internal_cell(&split.median_key, split.new_page_id);
 
             {
-                let page = SlottedPageRef::from_buf(parent_guard.data());
+                let page = SlottedPageRef::from_buf(parent_guard.data())?;
                 let (_, insert_pos) = binary_search_slots(&page, &split.median_key, false);
                 drop(page);
 
@@ -783,7 +794,7 @@ impl BTree {
         free_list: &mut FreeList,
     ) -> io::Result<SplitResult> {
         let old_page_id = guard.page_id();
-        let page = SlottedPageRef::from_buf(guard.data());
+        let page = SlottedPageRef::from_buf(guard.data())?;
         let num_slots = page.num_slots();
         let leftmost_child = page.prev_or_ptr();
 
@@ -822,9 +833,12 @@ impl BTree {
         for (k, c) in &entries[median_idx + 1..] {
             let cell = encode_internal_cell(k, *c);
             let buf = new_guard.data_mut();
-            let num = SlottedPageRef::from_buf(buf).num_slots();
-            insert_cell_at_pos(buf, &cell, num)
-                .expect("new internal page should have space after split");
+            let num = SlottedPageRef::from_buf(buf)?.num_slots();
+            insert_cell_at_pos(buf, &cell, num).map_err(|_| {
+                io::Error::other(crate::error::StorageError::InternalBug(
+                    "new internal page should have space after split".into(),
+                ))
+            })?;
         }
         drop(new_guard);
 
@@ -832,15 +846,18 @@ impl BTree {
         {
             let buf = guard.data_mut();
             SlottedPage::init(buf, old_page_id, PageType::BTreeInternal);
-            let mut page = SlottedPage::from_buf(buf);
+            let mut page = SlottedPage::from_buf(buf)?;
             page.set_prev_or_ptr(leftmost_child);
             drop(page);
 
             for (k, c) in &entries[..median_idx] {
                 let cell = encode_internal_cell(k, *c);
-                let num = SlottedPageRef::from_buf(buf).num_slots();
-                insert_cell_at_pos(buf, &cell, num)
-                    .expect("old internal page should have space after split");
+                let num = SlottedPageRef::from_buf(buf)?.num_slots();
+                insert_cell_at_pos(buf, &cell, num).map_err(|_| {
+                    io::Error::other(crate::error::StorageError::InternalBug(
+                        "old internal page should have space after split".into(),
+                    ))
+                })?;
             }
         }
 
@@ -868,7 +885,11 @@ impl BTree {
 
             // Insert one slot: (median_key, new_page_id).
             let cell = encode_internal_cell(&split.median_key, split.new_page_id);
-            insert_cell_at_pos(buf, &cell, 0).expect("new root should have space for one entry");
+            insert_cell_at_pos(buf, &cell, 0).map_err(|_| {
+                io::Error::other(crate::error::StorageError::InternalBug(
+                    "new root should have space for one entry".into(),
+                ))
+            })?;
         }
         drop(guard);
 
@@ -951,7 +972,13 @@ impl ScanIterator {
                 }
             };
 
-            let page = SlottedPageRef::from_buf(guard.data());
+            let page = match SlottedPageRef::from_buf(guard.data()) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            };
             let num_slots = page.num_slots();
 
             if self.current_slot >= num_slots {
@@ -1019,7 +1046,13 @@ impl ScanIterator {
                 }
             };
 
-            let page = SlottedPageRef::from_buf(guard.data());
+            let page = match SlottedPageRef::from_buf(guard.data()) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            };
             let num_slots = page.num_slots();
 
             if num_slots == 0 || self.current_slot >= num_slots {
@@ -1113,7 +1146,8 @@ fn find_prev_leaf_page(
         let mut current = root_page;
         loop {
             let guard = buffer_pool.fetch_page_shared(current).ok()?;
-            let page = SlottedPageRef::from_buf(guard.data());
+            // Buffer from pool is always page_size.
+            let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
             match page.page_type() {
                 PageType::BTreeLeaf => break current,
                 PageType::BTreeInternal => {
@@ -1135,7 +1169,8 @@ fn find_prev_leaf_page(
     let mut prev_page_id = leftmost_leaf;
     loop {
         let guard = buffer_pool.fetch_page_shared(prev_page_id).ok()?;
-        let page = SlottedPageRef::from_buf(guard.data());
+        // Buffer from pool is always page_size.
+        let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
         let right = page.prev_or_ptr();
         let ns = page.num_slots();
         drop(page);
@@ -1205,7 +1240,7 @@ mod tests {
 
         let root = tree.root_page();
         let guard = pool.fetch_page_shared(root).unwrap();
-        let page = SlottedPageRef::from_buf(guard.data());
+        let page = SlottedPageRef::from_buf(guard.data()).unwrap();
         assert_eq!(page.page_type(), PageType::BTreeLeaf);
         assert_eq!(page.num_slots(), 0);
     }
@@ -1379,7 +1414,7 @@ mod tests {
         // Verify new root is internal.
         let root = tree.root_page();
         let guard = pool.fetch_page_shared(root).unwrap();
-        let page = SlottedPageRef::from_buf(guard.data());
+        let page = SlottedPageRef::from_buf(guard.data()).unwrap();
         assert_eq!(page.page_type(), PageType::BTreeInternal);
         // Should have at least 1 slot (separator key) pointing to 2 children.
         assert!(page.num_slots() >= 1);

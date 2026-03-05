@@ -5,7 +5,7 @@
 //! implementations. Custom backends (S3, etc.) can plug in via the same traits.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -141,14 +141,11 @@ impl FilePageStorage {
 impl PageStorage for FilePageStorage {
     fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> io::Result<()> {
         if page_id as u64 >= self.page_count.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "page_id {} out of range (page_count {})",
-                    page_id,
-                    self.page_count.load(Ordering::Acquire)
-                ),
-            ));
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "page_id {} out of range (page_count {})",
+                page_id,
+                self.page_count.load(Ordering::Acquire)
+            )).into());
         }
         let offset = page_id as u64 * self.page_size as u64;
         self.file.read_at(buf, offset)?;
@@ -157,14 +154,11 @@ impl PageStorage for FilePageStorage {
 
     fn write_page(&self, page_id: PageId, buf: &[u8]) -> io::Result<()> {
         if page_id as u64 >= self.page_count.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "page_id {} out of range (page_count {})",
-                    page_id,
-                    self.page_count.load(Ordering::Acquire)
-                ),
-            ));
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "page_id {} out of range (page_count {})",
+                page_id,
+                self.page_count.load(Ordering::Acquire)
+            )).into());
         }
         let offset = page_id as u64 * self.page_size as u64;
         self.file.write_at(buf, offset)?;
@@ -258,10 +252,9 @@ impl FileWalStorage {
                 && name.starts_with("segment-") && name.ends_with(".wal") {
                     let seg_id_str = &name["segment-".len()..name.len() - ".wal".len()];
                     let segment_id: u32 = seg_id_str.parse().map_err(|_| {
-                        io::Error::new(
-                            ErrorKind::InvalidData,
+                        io::Error::from(crate::error::StorageError::Corruption(
                             format!("bad segment name: {}", name),
-                        )
+                        ))
                     })?;
                     let metadata = fs::metadata(&path)?;
                     let file_size = metadata.len();
@@ -279,10 +272,9 @@ impl FileWalStorage {
         }
 
         if segments.is_empty() {
-            return Err(io::Error::new(
-                ErrorKind::NotFound,
-                "no WAL segments found in directory",
-            ));
+            return Err(crate::error::StorageError::Corruption(
+                "no WAL segments found in directory".into()
+            ).into());
         }
 
         // Sort by base_lsn
@@ -377,24 +369,20 @@ impl FileWalStorage {
         file.read_exact(&mut header)?;
 
         if header[0..4] != WAL_SEGMENT_MAGIC {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
+            return Err(crate::error::StorageError::Corruption(
                 format!("corrupt WAL segment header (bad magic) in {:?}", path),
-            ));
+            ).into());
         }
 
-        let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let version = crate::util::read_u32_le(&header, 4)?;
         if version != 1 {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                format!(
-                    "unsupported WAL segment version {} in {:?}",
-                    version, path
-                ),
-            ));
+            return Err(crate::error::StorageError::Corruption(format!(
+                "unsupported WAL segment version {} in {:?}",
+                version, path
+            )).into());
         }
 
-        let base_lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let base_lsn = crate::util::read_u64_le(&header, 8)?;
         Ok(base_lsn)
     }
 
@@ -598,14 +586,11 @@ impl PageStorage for MemoryPageStorage {
     fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> io::Result<()> {
         let pages = self.pages.read();
         if page_id as usize >= pages.len() {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "page_id {} out of range (page_count {})",
-                    page_id,
-                    pages.len()
-                ),
-            ));
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "page_id {} out of range (page_count {})",
+                page_id,
+                pages.len()
+            )).into());
         }
         buf.copy_from_slice(&pages[page_id as usize]);
         Ok(())
@@ -614,14 +599,11 @@ impl PageStorage for MemoryPageStorage {
     fn write_page(&self, page_id: PageId, buf: &[u8]) -> io::Result<()> {
         let mut pages = self.pages.write();
         if page_id as usize >= pages.len() {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "page_id {} out of range (page_count {})",
-                    page_id,
-                    pages.len()
-                ),
-            ));
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "page_id {} out of range (page_count {})",
+                page_id,
+                pages.len()
+            )).into());
         }
         pages[page_id as usize].copy_from_slice(buf);
         Ok(())

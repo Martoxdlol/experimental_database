@@ -1,13 +1,13 @@
 use std::ops::Bound;
 use std::path::Path;
 
-use storage::btree::ScanDirection;
-use storage::catalog_btree::{
+use exdb_storage::btree::ScanDirection;
+use exdb_storage::catalog_btree::{
     self, CatalogEntityType, CatalogIndexState, CollectionEntry, IndexEntry, IndexType,
 };
-use storage::engine::{StorageConfig, StorageEngine};
-use storage::posting::{PostingEntry, PostingList};
-use storage::recovery::NoOpHandler;
+use exdb_storage::engine::{StorageConfig, StorageEngine};
+use exdb_storage::posting::{PostingEntry, PostingList};
+use exdb_storage::recovery::NoOpHandler;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {

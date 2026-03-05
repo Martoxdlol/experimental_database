@@ -1,0 +1,11 @@
+[package]
+name = "exdb"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+exdb-core = { workspace = true }
+exdb-storage = { workspace = true }
+exdb-docstore = { workspace = true }
+exdb-query = { workspace = true }
+exdb-tx = { workspace = true }

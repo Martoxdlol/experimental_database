@@ -1,0 +1,16 @@
+[package]
+name = "exdb-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+exdb-core = { workspace = true }
+zerocopy = { workspace = true }
+crc32fast = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "io-util"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { version = "1", features = ["full", "test-util"] }

@@ -14,16 +14,16 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use storage::backend::{MemoryPageStorage, MemoryWalStorage, PageStorage, WalStorage};
-use storage::btree::ScanDirection;
-use storage::catalog_btree::{
+use exdb_storage::backend::{MemoryPageStorage, MemoryWalStorage, PageStorage, WalStorage};
+use exdb_storage::btree::ScanDirection;
+use exdb_storage::catalog_btree::{
     self, CatalogEntityType, CatalogIndexState, CollectionEntry, IndexEntry, IndexType,
 };
-use storage::engine::{StorageConfig, StorageEngine};
-use storage::heap::HeapRef;
-use storage::recovery::{NoOpHandler, WalRecordHandler};
-use storage::vacuum::VacuumEntry;
-use storage::wal::WalRecord;
+use exdb_storage::engine::{StorageConfig, StorageEngine};
+use exdb_storage::heap::HeapRef;
+use exdb_storage::recovery::{NoOpHandler, WalRecordHandler};
+use exdb_storage::vacuum::VacuumEntry;
+use exdb_storage::wal::WalRecord;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Helpers
@@ -97,12 +97,7 @@ async fn test_full_lifecycle_1000_entries() {
             let key = format!("key-{:06}", i);
             let expected = format!("value-{:06}", i);
             let value = handle.get(key.as_bytes()).unwrap();
-            assert_eq!(
-                value,
-                Some(expected.into_bytes()),
-                "missing key {}",
-                key
-            );
+            assert_eq!(value, Some(expected.into_bytes()), "missing key {}", key);
         }
 
         // Verify scan returns all 1000 entries in order.
@@ -189,10 +184,7 @@ async fn test_custom_backend() {
 
     let handle = engine.create_btree().unwrap();
     handle.insert(b"custom", b"backend").unwrap();
-    assert_eq!(
-        handle.get(b"custom").unwrap(),
-        Some(b"backend".to_vec())
-    );
+    assert_eq!(handle.get(b"custom").unwrap(), Some(b"backend".to_vec()));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -337,8 +329,7 @@ async fn test_catalog_btree_persistence() {
             aux_root_pages: vec![],
             config: vec![],
         };
-        let idx_key =
-            catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx1.index_id);
+        let idx_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx1.index_id);
         let idx_val = catalog_btree::serialize_index(&idx1);
         catalog.insert(&idx_key, &idx_val).unwrap();
 
@@ -385,8 +376,7 @@ async fn test_catalog_btree_persistence() {
         assert_eq!(col2.doc_count, 7);
 
         // Verify name index lookup.
-        let name_key =
-            catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, "users");
+        let name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, "users");
         let name_val = name_idx.get(&name_key).unwrap().unwrap();
         let resolved_id = catalog_btree::deserialize_name_value(&name_val).unwrap();
         assert_eq!(resolved_id, 1);
@@ -619,7 +609,10 @@ async fn test_wal_multiple_records_and_read() {
 
     // Verify all LSNs are monotonically increasing.
     for window in lsns.windows(2) {
-        assert!(window[1] > window[0], "LSNs must be monotonically increasing");
+        assert!(
+            window[1] > window[0],
+            "LSNs must be monotonically increasing"
+        );
     }
 
     // Read from the beginning and verify all records.
@@ -862,7 +855,7 @@ async fn test_heap_btree_reference_pattern() {
     // Verify: read heap ref from btree, load from heap.
     for (key, expected_value) in &expected {
         let href_bytes = handle.get(key).unwrap().unwrap();
-        let href = storage::heap::HeapRef::from_bytes(href_bytes[..6].try_into().unwrap());
+        let href = exdb_storage::heap::HeapRef::from_bytes(href_bytes[..6].try_into().unwrap());
         let loaded = engine.heap_load(href).unwrap();
         assert_eq!(&loaded, expected_value);
     }
@@ -1342,10 +1335,7 @@ async fn test_page_size_mismatch_on_reopen() {
             ..Default::default()
         };
         let result = StorageEngine::open(&path, config, &mut NoOpHandler);
-        assert!(
-            result.is_err(),
-            "opening with wrong page_size should fail"
-        );
+        assert!(result.is_err(), "opening with wrong page_size should fail");
     }
 }
 
@@ -1432,7 +1422,7 @@ async fn test_free_list_persistence() {
 
 #[tokio::test]
 async fn test_truncated_wal_frame_recovery() {
-    use storage::recovery::{Recovery, RecoveryMode};
+    use exdb_storage::recovery::{Recovery, RecoveryMode};
 
     let page_storage = MemoryPageStorage::new(4096);
     let wal_storage = MemoryWalStorage::new();
@@ -1783,7 +1773,7 @@ async fn test_vacuum_persistence_file_backed() {
 
 #[tokio::test]
 async fn test_crash_mid_checkpoint_dwb_recovery() {
-    use storage::page::{PageType, SlottedPage, SlottedPageRef};
+    use exdb_storage::page::{PageType, SlottedPage, SlottedPageRef};
 
     let tmp = tempfile::TempDir::new().unwrap();
     let dwb_path = tmp.path().join("test.dwb");
@@ -1844,7 +1834,9 @@ async fn test_crash_mid_checkpoint_dwb_recovery() {
 
     // Partial scatter-write: only pages 0..5 were written before crash.
     for i in 0..5u32 {
-        page_storage.write_page(i, &updated_pages[i as usize]).unwrap();
+        page_storage
+            .write_page(i, &updated_pages[i as usize])
+            .unwrap();
     }
     // Corrupt pages 5..8 (torn writes).
     for i in 5..8u32 {
@@ -1854,7 +1846,7 @@ async fn test_crash_mid_checkpoint_dwb_recovery() {
     // Pages 8..10 still have valid original data.
 
     // Run DWB recovery.
-    let dwb = storage::dwb::DoubleWriteBuffer::new(
+    let dwb = exdb_storage::dwb::DoubleWriteBuffer::new(
         &dwb_path,
         page_storage.clone() as Arc<dyn PageStorage>,
         page_size,
@@ -1943,7 +1935,11 @@ async fn test_buffer_pool_extreme_pressure() {
         let count = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
             .count();
-        assert_eq!(count, 100, "tree {} should have 100 entries after reopen", t);
+        assert_eq!(
+            count, 100,
+            "tree {} should have 100 entries after reopen",
+            t
+        );
     }
     engine2.close().await.unwrap();
 }

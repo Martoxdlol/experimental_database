@@ -1,0 +1,10 @@
+[package]
+name = "exdb-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+exdb = { workspace = true }
+exdb-wire = { workspace = true }
+exdb-replication = { workspace = true }
+tokio = { workspace = true }

@@ -52,8 +52,110 @@ dependencies = [
 ]
 
 [[package]]
-name = "experimental_database"
+name = "exdb"
 version = "0.1.0"
+dependencies = [
+ "exdb-core",
+ "exdb-docstore",
+ "exdb-query",
+ "exdb-storage",
+ "exdb-tx",
+]
+
+[[package]]
+name = "exdb-cli"
+version = "0.1.0"
+dependencies = [
+ "exdb",
+ "exdb-wire",
+ "tokio",
+]
+
+[[package]]
+name = "exdb-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "exdb-docstore"
+version = "0.1.0"
+dependencies = [
+ "exdb-core",
+ "exdb-storage",
+]
+
+[[package]]
+name = "exdb-query"
+version = "0.1.0"
+dependencies = [
+ "exdb-core",
+ "exdb-docstore",
+ "exdb-storage",
+]
+
+[[package]]
+name = "exdb-replication"
+version = "0.1.0"
+dependencies = [
+ "exdb",
+ "exdb-storage",
+ "tokio",
+]
+
+[[package]]
+name = "exdb-server"
+version = "0.1.0"
+dependencies = [
+ "exdb",
+ "exdb-replication",
+ "exdb-wire",
+ "tokio",
+]
+
+[[package]]
+name = "exdb-storage"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "exdb-core",
+ "parking_lot",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "zerocopy",
+]
+
+[[package]]
+name = "exdb-studio"
+version = "0.1.0"
+dependencies = [
+ "exdb",
+ "exdb-wire",
+ "tokio",
+]
+
+[[package]]
+name = "exdb-tx"
+version = "0.1.0"
+dependencies = [
+ "exdb-core",
+ "exdb-docstore",
+ "exdb-query",
+ "exdb-storage",
+]
+
+[[package]]
+name = "exdb-wire"
+version = "0.1.0"
+dependencies = [
+ "exdb",
+ "serde",
+ "serde_json",
+ "tokio",
+]
 
 [[package]]
 name = "fastrand"
@@ -285,6 +387,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
@@ -344,18 +447,6 @@ checksum = "86f4aa3ad99f2088c990dfa82d367e19cb29268ed67c574d10d0a4bfe71f07e0"
 dependencies = [
  "libc",
  "windows-sys 0.60.2",
-]
-
-[[package]]
-name = "storage"
-version = "0.1.0"
-dependencies = [
- "crc32fast",
- "parking_lot",
- "tempfile",
- "thiserror",
- "tokio",
- "zerocopy",
 ]
 
 [[package]]

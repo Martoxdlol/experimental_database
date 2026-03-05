@@ -1,10 +1,41 @@
-[package]
-name = "experimental_database"
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/storage",
+    "crates/docstore",
+    "crates/query",
+    "crates/tx",
+    "crates/database",
+    "crates/replication",
+    "crates/wire",
+    "apps/server",
+    "apps/cli",
+    "apps/studio",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates
+exdb-core         = { path = "crates/core" }
+exdb-storage      = { path = "crates/storage" }
+exdb-docstore     = { path = "crates/docstore" }
+exdb-query        = { path = "crates/query" }
+exdb-tx           = { path = "crates/tx" }
+exdb              = { path = "crates/database" }
+exdb-replication  = { path = "crates/replication" }
+exdb-wire         = { path = "crates/wire" }
 
-[workspace]
-resolver = "3"
-members = ["storage"]
+# Shared external deps
+tokio       = { version = "1", features = ["full"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+thiserror   = "2"
+tracing     = "0.1"
+parking_lot = "0.12"
+zerocopy    = { version = "0.8", features = ["derive"] }
+crc32fast   = "1"
+tempfile    = "3"

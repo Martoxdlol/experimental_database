@@ -1,0 +1,8 @@
+[package]
+name = "exdb-docstore"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+exdb-core = { workspace = true }
+exdb-storage = { workspace = true }

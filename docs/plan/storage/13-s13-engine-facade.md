@@ -234,8 +234,7 @@ StorageEngine::open(path, config, handler):
    - free_list = FreeList::new(file_header.free_list_head, buffer_pool)
    - wal_writer = WalWriter::new(wal_storage, wal_config)
    - wal_reader = WalReader::new(wal_storage)
-   - heap = Heap::new(buffer_pool)
-   - heap.rebuild_free_space_map()
+   - heap = Heap::new(buffer_pool)    // empty free space map; populates incrementally
    - checkpoint = Checkpoint::new(buffer_pool, Some(dwb), wal_writer, true)
    - vacuum_task = VacuumTask::new(buffer_pool)
 

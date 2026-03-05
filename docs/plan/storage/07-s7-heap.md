@@ -124,15 +124,10 @@ Overflow page (PageType::Overflow):
 
 ### Free Space Map
 
-- **In-memory only**: rebuilt on startup by scanning all heap pages.
-- **rebuild_free_space_map()**: iterate all pages in the page store. For each page with `page_type == Heap`, record `(page_id, free_space())`.
+- **In-memory only**: starts empty on startup, populates incrementally.
 - **During operation**: updated incrementally on store/free.
-- **Not persisted**: heap pages are identified by their PageType during scan.
-
-**Finding heap pages on startup**: The buffer pool doesn't provide a "scan all pages" API. Instead, we can:
-- Option A: Walk the catalog B-tree to find all collections, then scan their primary B-trees for external HeapRefs. Complex and domain-aware.
-- Option B: Scan the page file linearly, reading each page header. Simple and generic.
-- **Use Option B**: Linear scan of data.db, checking page_type of each page header. This is O(n_pages) but only done once on startup.
+- **Not persisted**: after restart, partially-full heap pages from previous sessions are not immediately reusable. New stores allocate fresh pages until previous pages are touched by `free()`. This trades a small amount of wasted space for O(1) startup — critical for large databases where a full page scan would read hundreds of GB.
+- **`rebuild_free_space_map()`**: available for diagnostics (e.g. studio) but NOT called on the startup path.
 
 ### Concurrency
 

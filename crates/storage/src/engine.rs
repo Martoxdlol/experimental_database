@@ -754,9 +754,10 @@ impl StorageEngine {
         )?);
         let wal_reader = WalReader::new(wal_storage.clone());
 
-        // Build heap and rebuild free space map.
-        let mut heap = Heap::new(buffer_pool.clone());
-        heap.rebuild_free_space_map()?;
+        // Build heap with empty free space map.  The map populates
+        // incrementally as store()/free() are called — avoids an O(n_pages)
+        // scan that would block startup on large databases.
+        let heap = Heap::new(buffer_pool.clone());
 
         // Build checkpoint.
         let dwb = dwb_path.map(|p| {

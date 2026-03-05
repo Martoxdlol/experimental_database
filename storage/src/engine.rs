@@ -12,7 +12,7 @@ use crate::dwb::DoubleWriteBuffer;
 use crate::free_list::FreeList;
 use crate::heap::{Heap, HeapRef};
 use crate::page::{PageType, SlottedPage};
-use crate::recovery::{Recovery, WalRecordHandler};
+use crate::recovery::{Recovery, RecoveryMode, WalRecordHandler};
 use crate::vacuum::{VacuumEntry, VacuumTask};
 use crate::wal::{Lsn, WalConfig, WalIterator, WalReader, WalWriter};
 
@@ -349,13 +349,14 @@ impl StorageEngine {
             let checkpoint_lsn = file_header.checkpoint_lsn.get();
 
             // Run recovery.
-            Recovery::run(
+            let (_end_lsn, _stats) = Recovery::run(
                 page_storage.as_ref(),
                 wal_storage.as_ref(),
                 Some(dwb_path.as_path()),
                 checkpoint_lsn,
                 config.page_size,
                 handler,
+                RecoveryMode::Strict,
             )?;
 
             // Build components.
@@ -422,13 +423,14 @@ impl StorageEngine {
             if is_durable
                 && let Some(h) = handler {
                     let checkpoint_lsn = file_header.checkpoint_lsn.get();
-                    Recovery::run(
+                    let (_end_lsn, _stats) = Recovery::run(
                         page_storage.as_ref(),
                         wal_storage.as_ref(),
                         None,
                         checkpoint_lsn,
                         config.page_size,
                         h,
+                        RecoveryMode::Strict,
                     )?;
                 }
 

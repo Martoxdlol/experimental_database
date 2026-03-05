@@ -1432,7 +1432,7 @@ async fn test_free_list_persistence() {
 
 #[tokio::test]
 async fn test_truncated_wal_frame_recovery() {
-    use storage::recovery::Recovery;
+    use storage::recovery::{Recovery, RecoveryMode};
 
     let page_storage = MemoryPageStorage::new(4096);
     let wal_storage = MemoryWalStorage::new();
@@ -1481,13 +1481,14 @@ async fn test_truncated_wal_frame_recovery() {
     wal_storage.append(&good_after).unwrap();
 
     let mut handler = CollectingHandler::new();
-    let _end_lsn = Recovery::run(
+    let (_end_lsn, _stats) = Recovery::run(
         &page_storage,
         &wal_storage,
         None,
         0,
         4096,
         &mut handler,
+        RecoveryMode::Strict,
     )
     .unwrap();
 

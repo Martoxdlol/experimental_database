@@ -232,9 +232,9 @@ impl Heap {
                 let ov_page = SlottedPageRef::from_buf(ov_guard.data())?;
 
                 // Validate page type
-                if ov_page.page_type() != PageType::Overflow {
+                if ov_page.page_type_checked()? != PageType::Overflow {
                     return Err(crate::error::StorageError::Corruption(format!(
-                        "expected overflow page at {}, got {:?}", next_page, ov_page.page_type()
+                        "expected overflow page at {}, got {:?}", next_page, ov_page.page_type_checked()
                     )).into());
                 }
 
@@ -395,7 +395,7 @@ impl Heap {
             let guard = self.buffer_pool.fetch_page_shared(pid)?;
             let page = SlottedPageRef::from_buf(guard.data())?;
 
-            if page.page_type() == PageType::Heap {
+            if page.page_type_checked()? == PageType::Heap {
                 let free = page.free_space();
                 self.free_space_map.insert(pid, free);
             }

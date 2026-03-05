@@ -32,7 +32,19 @@ const LSN_SIZE: usize = 8;
 
 // ─── Errors ───
 
-/// Returned when all frames are dirty or pinned and no victim can be found.
+/// Returned when all buffer pool frames are pinned and no victim can be
+/// evicted.
+///
+/// This is a returned error (not a panic). The checkpoint process does
+/// **not** trigger this error because it reads dirty-frame metadata
+/// without allocating new frames.
+///
+/// Common causes:
+/// - All frames are held by concurrent readers/writers (page guards not
+///   yet dropped).
+/// - All frames are dirty and the clock eviction sweep skipped them.
+///
+/// Callers should release any held page guards and retry the operation.
 #[derive(Debug)]
 pub struct BufferPoolFull;
 

@@ -11,6 +11,32 @@ use crate::wal::{Lsn, WalRecord, WAL_RECORD_CHECKPOINT};
 use std::io;
 use std::path::Path;
 
+// ─── Recovery Mode & Stats ───
+
+/// Controls how WAL replay handles corrupt records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryMode {
+    /// Stop at the first corrupt record (default, safest).
+    Strict,
+    /// Skip corrupt records and continue replaying. May recover more data
+    /// after a mid-WAL corruption, at the risk of applying records that
+    /// depended on the skipped ones.
+    BestEffort,
+}
+
+/// Statistics from a recovery run.
+#[derive(Debug, Clone, Default)]
+pub struct RecoveryStats {
+    /// Number of WAL records successfully replayed.
+    pub records_replayed: u64,
+    /// Number of corrupt WAL records skipped (BestEffort mode only).
+    pub records_skipped_corrupt: u64,
+    /// Number of pages restored from the DWB.
+    pub dwb_pages_restored: u32,
+    /// Number of DWB pages skipped due to corruption.
+    pub dwb_pages_skipped_corrupt: u32,
+}
+
 // ─── Constants ───
 
 /// WAL frame header size: 4 (payload_len) + 4 (crc32c) + 1 (record_type) = 9 bytes.
@@ -68,7 +94,7 @@ impl Recovery {
     /// 3. Open WAL, replay from checkpoint_lsn
     /// 4. Call handler for each replayed record (skip CHECKPOINT records)
     ///
-    /// Returns the LSN after the last valid record (new write position).
+    /// Returns the LSN after the last valid record and recovery statistics.
     pub fn run(
         page_storage: &dyn PageStorage,
         wal_storage: &dyn WalStorage,
@@ -76,16 +102,21 @@ impl Recovery {
         checkpoint_lsn: Lsn,
         page_size: usize,
         handler: &mut dyn WalRecordHandler,
-    ) -> io::Result<Lsn> {
+        mode: RecoveryMode,
+    ) -> io::Result<(Lsn, RecoveryStats)> {
+        let mut stats = RecoveryStats::default();
+
         // Step 2: DWB recovery (if applicable).
         if let Some(path) = dwb_path {
-            Self::dwb_recover(path, page_storage, page_size)?;
+            let (restored, skipped) = Self::dwb_recover(path, page_storage, page_size)?;
+            stats.dwb_pages_restored = restored;
+            stats.dwb_pages_skipped_corrupt = skipped;
         }
 
         // Step 3: WAL replay from checkpoint_lsn.
-        let end_lsn = Self::replay_wal(wal_storage, checkpoint_lsn, handler)?;
+        let end_lsn = Self::replay_wal(wal_storage, checkpoint_lsn, handler, mode, &mut stats)?;
 
-        Ok(end_lsn)
+        Ok((end_lsn, stats))
     }
 
     /// Check if recovery is needed (DWB non-empty or WAL has records past checkpoint).
@@ -124,6 +155,8 @@ impl Recovery {
         wal_storage: &dyn WalStorage,
         start_lsn: Lsn,
         handler: &mut dyn WalRecordHandler,
+        mode: RecoveryMode,
+        stats: &mut RecoveryStats,
     ) -> io::Result<Lsn> {
         let mut end_lsn = start_lsn;
         let mut current_lsn = start_lsn;
@@ -151,6 +184,16 @@ impl Recovery {
 
             // Implausibly large payload.
             if payload_len > MAX_WAL_RECORD_SIZE {
+                if mode == RecoveryMode::BestEffort {
+                    stats.records_skipped_corrupt += 1;
+                    current_lsn = match Self::scan_forward_for_valid_frame(
+                        wal_storage, current_lsn + 1,
+                    )? {
+                        Some(next) => next,
+                        None => break,
+                    };
+                    continue;
+                }
                 break;
             }
 
@@ -173,7 +216,17 @@ impl Recovery {
                 hasher.finalize()
             };
             if computed_crc != stored_crc {
-                // CRC mismatch -- stop replay.
+                if mode == RecoveryMode::BestEffort {
+                    stats.records_skipped_corrupt += 1;
+                    current_lsn = match Self::scan_forward_for_valid_frame(
+                        wal_storage, current_lsn + 1,
+                    )? {
+                        Some(next) => next,
+                        None => break,
+                    };
+                    continue;
+                }
+                // Strict mode: stop replay.
                 break;
             }
 
@@ -194,26 +247,89 @@ impl Recovery {
 
             // Deliver to handler.
             handler.handle_record(&record)?;
+            stats.records_replayed += 1;
         }
 
         Ok(end_lsn)
     }
 
+    /// Scan forward byte-by-byte from `start` looking for a valid WAL frame.
+    /// Returns the LSN of the next valid frame, or None if not found within 1MB.
+    fn scan_forward_for_valid_frame(
+        wal_storage: &dyn WalStorage,
+        start: Lsn,
+    ) -> io::Result<Option<Lsn>> {
+        const MAX_SCAN: u64 = 1024 * 1024; // 1 MB
+
+        let mut probe = start;
+        let limit = start.saturating_add(MAX_SCAN);
+
+        while probe < limit {
+            let mut header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
+            let n = wal_storage.read_from(probe, &mut header_buf)?;
+            if n < WAL_FRAME_HEADER_SIZE {
+                return Ok(None);
+            }
+
+            let payload_len = u32::from_le_bytes(
+                [header_buf[0], header_buf[1], header_buf[2], header_buf[3]],
+            ) as usize;
+            let record_type = header_buf[8];
+
+            // Quick plausibility check.
+            if payload_len == 0 || payload_len > MAX_WAL_RECORD_SIZE {
+                probe += 1;
+                continue;
+            }
+
+            // Try to read the payload and verify CRC.
+            let mut payload = vec![0u8; payload_len];
+            let n = wal_storage.read_from(
+                probe + WAL_FRAME_HEADER_SIZE as u64,
+                &mut payload,
+            )?;
+            if n < payload_len {
+                // Payload extends past WAL end at this probe — try next byte.
+                probe += 1;
+                continue;
+            }
+
+            let computed_crc = {
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&[record_type]);
+                hasher.update(&payload);
+                hasher.finalize()
+            };
+            let stored_crc = u32::from_le_bytes(
+                [header_buf[4], header_buf[5], header_buf[6], header_buf[7]],
+            );
+
+            if computed_crc == stored_crc {
+                return Ok(Some(probe));
+            }
+
+            probe += 1;
+        }
+
+        Ok(None)
+    }
+
     /// DWB recovery: restore torn pages from the DWB file.
+    /// Returns (pages_restored, pages_skipped_corrupt).
     fn dwb_recover(
         dwb_path: &Path,
         page_storage: &dyn PageStorage,
         page_size: usize,
-    ) -> io::Result<u32> {
+    ) -> io::Result<(u32, u32)> {
         use std::io::Read;
 
         if !dwb_path.exists() {
-            return Ok(0);
+            return Ok((0, 0));
         }
 
         let metadata = std::fs::metadata(dwb_path)?;
         if metadata.len() == 0 {
-            return Ok(0);
+            return Ok((0, 0));
         }
 
         let mut file = std::fs::File::open(dwb_path)?;
@@ -224,7 +340,7 @@ impl Recovery {
         if bytes_read < DWB_HEADER_SIZE {
             // Partial header -- treat as empty.
             Self::truncate_dwb(dwb_path)?;
-            return Ok(0);
+            return Ok((0, 0));
         }
 
         let magic = u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
@@ -236,14 +352,14 @@ impl Recovery {
         // Verify magic.
         if magic != DWB_MAGIC {
             Self::truncate_dwb(dwb_path)?;
-            return Ok(0);
+            return Ok((0, 0));
         }
 
         // Verify header checksum.
         let expected_checksum = crc32fast::hash(&header_buf[0..12]);
         if stored_checksum != expected_checksum {
             Self::truncate_dwb(dwb_path)?;
-            return Ok(0);
+            return Ok((0, 0));
         }
 
         // Verify page size.
@@ -256,6 +372,7 @@ impl Recovery {
         }
 
         let mut restored = 0u32;
+        let mut skipped_corrupt = 0u32;
         let entry_size = DWB_ENTRY_PREFIX_SIZE + page_size;
 
         for _ in 0..page_count {
@@ -273,6 +390,7 @@ impl Recovery {
             let dwb_ref = SlottedPageRef::from_buf(dwb_page_data)?;
             if !dwb_ref.verify_checksum() {
                 // DWB page itself is corrupt. Skip.
+                skipped_corrupt += 1;
                 continue;
             }
 
@@ -298,7 +416,15 @@ impl Recovery {
         page_storage.sync()?;
         Self::truncate_dwb(dwb_path)?;
 
-        Ok(restored)
+        if skipped_corrupt > 0 {
+            eprintln!(
+                "WARNING: DWB recovery skipped {} corrupt page(s). \
+                 Data may be lost if the corresponding storage pages are also corrupt.",
+                skipped_corrupt,
+            );
+        }
+
+        Ok((restored, skipped_corrupt))
     }
 
     /// Truncate the DWB file.
@@ -408,13 +534,14 @@ mod tests {
         let checkpoint_lsn = 0;
         let mut handler = CountingHandler::new();
 
-        let end_lsn = Recovery::run(
+        let (end_lsn, _stats) = Recovery::run(
             &page_storage,
             &wal_storage,
             None,
             checkpoint_lsn,
             PAGE_SIZE,
             &mut handler,
+            RecoveryMode::Strict,
         )
         .unwrap();
 
@@ -440,13 +567,14 @@ mod tests {
         let checkpoint_lsn = 0;
         let mut handler = CountingHandler::new();
 
-        let end_lsn = Recovery::run(
+        let (end_lsn, _stats) = Recovery::run(
             &page_storage,
             &wal_storage,
             None,
             checkpoint_lsn,
             PAGE_SIZE,
             &mut handler,
+            RecoveryMode::Strict,
         )
         .unwrap();
 
@@ -520,13 +648,14 @@ mod tests {
         }
 
         let mut handler = CountingHandler::new();
-        let _end_lsn = Recovery::run(
+        let (_end_lsn, _stats) = Recovery::run(
             &page_storage,
             &wal_storage,
             Some(dwb_path.as_path()),
             0,
             PAGE_SIZE,
             &mut handler,
+            RecoveryMode::Strict,
         )
         .unwrap();
 
@@ -564,13 +693,14 @@ mod tests {
         wal_storage.append(&good_after).unwrap();
 
         let mut handler = CountingHandler::new();
-        let _end_lsn = Recovery::run(
+        let (_end_lsn, _stats) = Recovery::run(
             &page_storage,
             &wal_storage,
             None,
             0,
             PAGE_SIZE,
             &mut handler,
+            RecoveryMode::Strict,
         )
         .unwrap();
 
@@ -589,13 +719,14 @@ mod tests {
         let checkpoint_lsn = 42;
         let mut handler = CountingHandler::new();
 
-        let end_lsn = Recovery::run(
+        let (end_lsn, _stats) = Recovery::run(
             &page_storage,
             &wal_storage,
             None,
             checkpoint_lsn,
             PAGE_SIZE,
             &mut handler,
+            RecoveryMode::Strict,
         )
         .unwrap();
 
@@ -666,25 +797,27 @@ mod tests {
 
         // First replay.
         let mut handler1 = CountingHandler::new();
-        let end1 = Recovery::run(
+        let (end1, _stats1) = Recovery::run(
             &page_storage,
             &wal_storage,
             None,
             0,
             PAGE_SIZE,
             &mut handler1,
+            RecoveryMode::Strict,
         )
         .unwrap();
 
         // Second replay.
         let mut handler2 = CountingHandler::new();
-        let end2 = Recovery::run(
+        let (end2, _stats2) = Recovery::run(
             &page_storage,
             &wal_storage,
             None,
             0,
             PAGE_SIZE,
             &mut handler2,
+            RecoveryMode::Strict,
         )
         .unwrap();
 
@@ -708,13 +841,14 @@ mod tests {
 
         // No DWB, no WAL records.
         let mut handler = NoOpHandler;
-        let end_lsn = Recovery::run(
+        let (end_lsn, _stats) = Recovery::run(
             &page_storage,
             &wal_storage,
             None,
             0,
             PAGE_SIZE,
             &mut handler,
+            RecoveryMode::Strict,
         )
         .unwrap();
 
@@ -749,6 +883,7 @@ mod tests {
             0,
             PAGE_SIZE,
             &mut handler,
+            RecoveryMode::Strict,
         );
 
         assert!(result.is_err());
@@ -782,13 +917,14 @@ mod tests {
         wal_storage.append(&frame3).unwrap();
 
         let mut handler = CountingHandler::new();
-        let _end_lsn = Recovery::run(
+        let (_end_lsn, _stats) = Recovery::run(
             &page_storage,
             &wal_storage,
             None,
             0,
             PAGE_SIZE,
             &mut handler,
+            RecoveryMode::Strict,
         )
         .unwrap();
 
@@ -797,5 +933,56 @@ mod tests {
         assert_eq!(handler.records[0].payload, b"tx-1");
         assert_eq!(handler.records[1].payload, b"tx-2");
         assert_eq!(handler.records[2].payload, b"tx-3");
+    }
+
+    // ─── Test 11: BestEffort mode recovers records around corruption ───
+
+    #[test]
+    fn best_effort_skips_corrupt() {
+        let page_storage = MemoryPageStorage::new(PAGE_SIZE);
+        let wal_storage = MemoryWalStorage::new();
+
+        // Write: valid record, corrupt bytes, valid record.
+        let frame1 = encode_frame(0x01, b"before");
+        wal_storage.append(&frame1).unwrap();
+
+        // Write corrupt bytes (invalid CRC).
+        let corrupt = vec![0x05, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x42, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        wal_storage.append(&corrupt).unwrap();
+
+        let frame2 = encode_frame(0x01, b"after");
+        wal_storage.append(&frame2).unwrap();
+
+        // Strict mode: only gets first record.
+        let mut strict_handler = CountingHandler::new();
+        let (_end_lsn, strict_stats) = Recovery::run(
+            &page_storage,
+            &wal_storage,
+            None,
+            0,
+            PAGE_SIZE,
+            &mut strict_handler,
+            RecoveryMode::Strict,
+        )
+        .unwrap();
+        assert_eq!(strict_handler.records.len(), 1);
+        assert_eq!(strict_stats.records_skipped_corrupt, 0);
+
+        // BestEffort mode: gets both records, reports 1 skipped.
+        let mut best_handler = CountingHandler::new();
+        let (_end_lsn, best_stats) = Recovery::run(
+            &page_storage,
+            &wal_storage,
+            None,
+            0,
+            PAGE_SIZE,
+            &mut best_handler,
+            RecoveryMode::BestEffort,
+        )
+        .unwrap();
+        assert_eq!(best_handler.records.len(), 2);
+        assert_eq!(best_stats.records_skipped_corrupt, 1);
+        assert_eq!(best_handler.records[0].payload, b"before");
+        assert_eq!(best_handler.records[1].payload, b"after");
     }
 }

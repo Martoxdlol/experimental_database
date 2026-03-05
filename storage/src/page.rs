@@ -221,6 +221,7 @@ impl<'a> SlottedPage<'a> {
     }
 
     /// Return the page type. Panics if the stored byte is invalid.
+    #[deprecated(note = "use page_type_checked() for safe error handling")]
     pub fn page_type(&self) -> PageType {
         PageType::from_u8(self.header().page_type)
             .expect("invalid page type byte in header")
@@ -229,6 +230,19 @@ impl<'a> SlottedPage<'a> {
     /// Return the page type, or `None` if the stored byte is invalid.
     pub fn try_page_type(&self) -> Option<PageType> {
         PageType::from_u8(self.header().page_type)
+    }
+
+    /// Return the page type, or a `Corruption` error if the stored byte is invalid.
+    pub fn page_type_checked(&self) -> std::io::Result<PageType> {
+        let h = self.header();
+        self.try_page_type().ok_or_else(|| {
+            crate::error::StorageError::Corruption(format!(
+                "invalid page type byte {:#04x} in page {}",
+                h.page_type,
+                h.page_id.get(),
+            ))
+            .into()
+        })
     }
 
     /// Return the number of slots (including tombstones).
@@ -570,6 +584,7 @@ impl<'a> SlottedPageRef<'a> {
     }
 
     /// Return the page type. Panics if the stored byte is invalid.
+    #[deprecated(note = "use page_type_checked() for safe error handling")]
     pub fn page_type(&self) -> PageType {
         PageType::from_u8(self.header().page_type)
             .expect("invalid page type byte in header")
@@ -578,6 +593,19 @@ impl<'a> SlottedPageRef<'a> {
     /// Return the page type, or `None` if the stored byte is invalid.
     pub fn try_page_type(&self) -> Option<PageType> {
         PageType::from_u8(self.header().page_type)
+    }
+
+    /// Return the page type, or a `Corruption` error if the stored byte is invalid.
+    pub fn page_type_checked(&self) -> std::io::Result<PageType> {
+        let h = self.header();
+        self.try_page_type().ok_or_else(|| {
+            crate::error::StorageError::Corruption(format!(
+                "invalid page type byte {:#04x} in page {}",
+                h.page_type,
+                h.page_id.get(),
+            ))
+            .into()
+        })
     }
 
     /// Return the number of slots.
@@ -652,6 +680,7 @@ fn compute_checksum_on_buf(buf: &[u8]) -> u32 {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -1014,5 +1043,27 @@ mod tests {
         // Also verify the mutable variant.
         let page = SlottedPage::from_buf(&mut buf).unwrap();
         assert_eq!(page.try_page_type(), None);
+    }
+
+    // 18. page_type_checked() returns Err on invalid byte, Ok on valid byte.
+    #[test]
+    fn test_page_type_checked() {
+        let mut buf = new_buf();
+        SlottedPage::init(&mut buf, 1, PageType::BTreeLeaf);
+
+        // Valid page type → Ok
+        let page_ref = SlottedPageRef::from_buf(&buf).unwrap();
+        assert_eq!(page_ref.page_type_checked().unwrap(), PageType::BTreeLeaf);
+
+        let page = SlottedPage::from_buf(&mut buf).unwrap();
+        assert_eq!(page.page_type_checked().unwrap(), PageType::BTreeLeaf);
+
+        // Corrupt page type → Err
+        buf[4] = 0xFF;
+        let page_ref = SlottedPageRef::from_buf(&buf).unwrap();
+        assert!(page_ref.page_type_checked().is_err());
+
+        let page = SlottedPage::from_buf(&mut buf).unwrap();
+        assert!(page.page_type_checked().is_err());
     }
 }

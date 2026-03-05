@@ -258,7 +258,7 @@ impl BTree {
         loop {
             let guard = self.buffer_pool.fetch_page_shared(current_page_id)?;
             let page = SlottedPageRef::from_buf(guard.data())?;
-            let page_type = page.page_type();
+            let page_type = page.page_type_checked()?;
 
             match page_type {
                 PageType::BTreeLeaf => {
@@ -307,7 +307,7 @@ impl BTree {
         loop {
             let guard = self.buffer_pool.fetch_page_shared(current_page_id)?;
             let page = SlottedPageRef::from_buf(guard.data())?;
-            let page_type = page.page_type();
+            let page_type = page.page_type_checked()?;
 
             match page_type {
                 PageType::BTreeLeaf => {
@@ -400,7 +400,7 @@ impl BTree {
         loop {
             let guard = self.buffer_pool.fetch_page_shared(current_page_id)?;
             let page = SlottedPageRef::from_buf(guard.data())?;
-            let page_type = page.page_type();
+            let page_type = page.page_type_checked()?;
 
             match page_type {
                 PageType::BTreeLeaf => {
@@ -509,10 +509,9 @@ impl BTree {
             };
             // Buffer from pool is always page_size.
             let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
-            let page_type = page.page_type();
 
-            match page_type {
-                PageType::BTreeLeaf => {
+            match page.try_page_type() {
+                Some(PageType::BTreeLeaf) => {
                     let num_slots = page.num_slots();
                     if num_slots == 0 {
                         return (None, 0);
@@ -544,7 +543,7 @@ impl BTree {
 
                     return (Some(current_page_id), start_slot);
                 }
-                PageType::BTreeInternal => {
+                Some(PageType::BTreeInternal) => {
                     let child = match lower {
                         None => page.prev_or_ptr(),
                         Some((key, _)) => find_child_in_internal(&page, key),
@@ -573,10 +572,9 @@ impl BTree {
             };
             // Buffer from pool is always page_size.
             let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
-            let page_type = page.page_type();
 
-            match page_type {
-                PageType::BTreeLeaf => {
+            match page.try_page_type() {
+                Some(PageType::BTreeLeaf) => {
                     let num_slots = page.num_slots();
                     if num_slots == 0 {
                         return (None, 0);
@@ -624,7 +622,7 @@ impl BTree {
 
                     return (Some(current_page_id), start_slot);
                 }
-                PageType::BTreeInternal => {
+                Some(PageType::BTreeInternal) => {
                     let child = match upper {
                         None => {
                             // Go to rightmost child.
@@ -1148,9 +1146,9 @@ fn find_prev_leaf_page(
             let guard = buffer_pool.fetch_page_shared(current).ok()?;
             // Buffer from pool is always page_size.
             let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
-            match page.page_type() {
-                PageType::BTreeLeaf => break current,
-                PageType::BTreeInternal => {
+            match page.try_page_type() {
+                Some(PageType::BTreeLeaf) => break current,
+                Some(PageType::BTreeInternal) => {
                     let child = page.prev_or_ptr();
                     drop(page);
                     drop(guard);
@@ -1194,6 +1192,7 @@ fn find_prev_leaf_page(
 // ═══════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::backend::{MemoryPageStorage, PageStorage};

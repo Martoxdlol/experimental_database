@@ -156,13 +156,18 @@ impl WalWriter {
 
     /// Background writer task. Batches incoming requests, performs a single
     /// `append` + `sync`, and responds with assigned LSNs.
+    ///
+    /// The batch processing is wrapped in `catch_unwind` so that a panic
+    /// in storage I/O does not kill the task permanently. In-flight callers
+    /// of the panicked batch receive `WalShutDown` (their oneshot senders
+    /// are dropped), but the task continues for future requests.
     async fn background_task(
         storage: Arc<dyn WalStorage>,
         mut rx: mpsc::Receiver<WalWriteRequest>,
         current_lsn: Arc<AtomicU64>,
     ) {
         loop {
-            // Step 1: Block on the first request.
+            // Step 1: Block on the first request (outside catch_unwind — recv can't panic).
             let first = match rx.recv().await {
                 Some(req) => req,
                 None => return, // Channel closed -- shutdown.
@@ -174,65 +179,83 @@ impl WalWriter {
                 batch.push(req);
             }
 
-            // Step 3: Serialize the entire batch into a single buffer and
-            //         track each request's assigned LSN.
-            let mut buf = Vec::new();
-            let mut assignments: Vec<(Lsn, oneshot::Sender<io::Result<Lsn>>)> = Vec::new();
-            let mut lsn = current_lsn.load(Ordering::Acquire);
+            // Step 3-6: Process batch (sync code, wrapped in catch_unwind).
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Self::process_batch(&storage, batch, &current_lsn);
+            }));
 
-            for req in batch {
-                match req {
-                    WalWriteRequest::Record {
-                        record_type,
-                        payload,
-                        response,
-                    } => {
-                        let assigned_lsn = lsn;
-                        let frame = encode_frame(record_type, &payload);
-                        lsn += frame.len() as u64;
-                        buf.extend_from_slice(&frame);
-                        assignments.push((assigned_lsn, response));
-                    }
-                    WalWriteRequest::RawFrame { data, response } => {
-                        let assigned_lsn = lsn;
-                        lsn += data.len() as u64;
-                        buf.extend_from_slice(&data);
-                        assignments.push((assigned_lsn, response));
-                    }
+            if let Err(_panic) = result {
+                eprintln!(
+                    "WAL writer: caught panic in batch processing. \
+                     In-flight callers will receive WalShutDown. Continuing."
+                );
+                // The batch's oneshot senders were moved into process_batch and
+                // dropped by the panic unwind → callers get RecvError → WalShutDown.
+                // The loop continues for future requests.
+            }
+        }
+    }
+
+    /// Process a single batch of WAL write requests: serialize, append, sync,
+    /// and respond.
+    fn process_batch(
+        storage: &Arc<dyn WalStorage>,
+        batch: Vec<WalWriteRequest>,
+        current_lsn: &Arc<AtomicU64>,
+    ) {
+        // Serialize the entire batch into a single buffer.
+        let mut buf = Vec::new();
+        let mut assignments: Vec<(Lsn, oneshot::Sender<io::Result<Lsn>>)> = Vec::new();
+        let mut lsn = current_lsn.load(Ordering::Acquire);
+
+        for req in batch {
+            match req {
+                WalWriteRequest::Record {
+                    record_type,
+                    payload,
+                    response,
+                } => {
+                    let assigned_lsn = lsn;
+                    let frame = encode_frame(record_type, &payload);
+                    lsn += frame.len() as u64;
+                    buf.extend_from_slice(&frame);
+                    assignments.push((assigned_lsn, response));
+                }
+                WalWriteRequest::RawFrame { data, response } => {
+                    let assigned_lsn = lsn;
+                    lsn += data.len() as u64;
+                    buf.extend_from_slice(&data);
+                    assignments.push((assigned_lsn, response));
                 }
             }
+        }
 
-            // Step 4: Single append to storage.
-            let append_result = storage.append(&buf);
+        // Single append to storage.
+        let append_result = storage.append(&buf);
 
-            // Step 5: Single sync (fsync).
-            let sync_result = if append_result.is_ok() {
-                storage.sync()
+        // Single sync (fsync).
+        let sync_result = if append_result.is_ok() {
+            storage.sync()
+        } else {
+            Ok(())
+        };
+
+        // Update the current LSN and respond to all requesters.
+        if append_result.is_ok() && sync_result.is_ok() {
+            current_lsn.store(lsn, Ordering::Release);
+            for (assigned_lsn, response) in assignments {
+                let _ = response.send(Ok(assigned_lsn));
+            }
+        } else {
+            let err_msg = if let Err(ref e) = append_result {
+                e.to_string()
+            } else if let Err(ref e) = sync_result {
+                e.to_string()
             } else {
-                // Skip sync if append failed.
-                Ok(())
+                "unknown WAL error".to_string()
             };
-
-            // Step 6: Update the current LSN and respond to all requesters.
-            if append_result.is_ok() && sync_result.is_ok() {
-                current_lsn.store(lsn, Ordering::Release);
-                for (assigned_lsn, response) in assignments {
-                    let _ = response.send(Ok(assigned_lsn));
-                }
-            } else {
-                // Propagate the first error to all requesters.
-                let err_msg = if let Err(ref e) = append_result {
-                    e.to_string()
-                } else if let Err(ref e) = sync_result {
-                    e.to_string()
-                } else {
-                    "unknown WAL error".to_string()
-                };
-                for (_assigned_lsn, response) in assignments {
-                    let _ = response.send(Err(io::Error::other(
-                        err_msg.clone(),
-                    )));
-                }
+            for (_assigned_lsn, response) in assignments {
+                let _ = response.send(Err(io::Error::other(err_msg.clone())));
             }
         }
     }

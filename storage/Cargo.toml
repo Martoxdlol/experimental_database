@@ -4,3 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+zerocopy = { version = "0.8", features = ["derive"] }
+crc32fast = "1"
+parking_lot = "0.12"
+tokio = { version = "1", features = ["sync", "rt", "time", "io-util"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }

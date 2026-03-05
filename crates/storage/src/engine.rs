@@ -539,11 +539,14 @@ impl StorageEngine {
 
     /// Run a checkpoint. Flushes dirty pages and writes a checkpoint WAL record.
     pub async fn checkpoint(&self) -> io::Result<()> {
-        let checkpoint_lsn = self.checkpoint.run().await?;
-        // Update file header with new checkpoint LSN.
+        // Pre-stamp the checkpoint LSN into the file header *before* flushing
+        // so that page 0 is included in the dirty-page snapshot and gets
+        // written + marked clean in the same pass.
+        let checkpoint_lsn = self.checkpoint.wal_lsn();
         self.update_file_header(|fh| {
             fh.checkpoint_lsn = U64::new(checkpoint_lsn);
         })?;
+        self.checkpoint.run().await?;
         Ok(())
     }
 

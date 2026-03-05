@@ -54,6 +54,31 @@ pub fn Toolbar() -> Element {
                     },
                     "Open DB..."
                 }
+                button {
+                    class: "btn",
+                    onclick: move |_| {
+                        spawn(async move {
+                            if let Some(path) = pick_new_database_dir().await {
+                                match tokio::task::spawn_blocking(move || DbHandle::open(&path)).await {
+                                    Ok(Ok(handle)) => {
+                                        state.db.set(Some(Arc::new(handle)));
+                                        state.active_module.set(Module::Overview);
+                                        state.breadcrumb.set(vec!["Database".to_string(), "Overview".to_string()]);
+                                        state.write_enabled.set(true);
+                                        state.last_result.set(Some(OperationResult::Success("New database created".into())));
+                                    }
+                                    Ok(Err(e)) => {
+                                        state.last_result.set(Some(OperationResult::Error(format!("Failed to create: {e}"))));
+                                    }
+                                    Err(e) => {
+                                        state.last_result.set(Some(OperationResult::Error(format!("Task error: {e}"))));
+                                    }
+                                }
+                            }
+                        });
+                    },
+                    "New DB..."
+                }
                 if db_open {
                     button {
                         class: "btn",
@@ -141,4 +166,28 @@ async fn pick_database_dir() -> Option<PathBuf> {
         .pick_folder()
         .await?;
     Some(handle.path().to_path_buf())
+}
+
+async fn pick_new_database_dir() -> Option<PathBuf> {
+    // User picks a parent folder, then we append a "new.exdb" subdir.
+    // If the picked folder is already empty, use it directly.
+    let handle = rfd::AsyncFileDialog::new()
+        .set_title("Choose Directory for New Database")
+        .pick_folder()
+        .await?;
+    let path = handle.path().to_path_buf();
+
+    // If the directory is empty (or doesn't have data.db), use it directly as the DB dir.
+    // Otherwise create a "new.exdb" subdirectory.
+    if !path.join("data.db").exists() {
+        Some(path)
+    } else {
+        let mut candidate = path.join("new.exdb");
+        let mut i = 1;
+        while candidate.exists() {
+            candidate = path.join(format!("new_{i}.exdb"));
+            i += 1;
+        }
+        Some(candidate)
+    }
 }

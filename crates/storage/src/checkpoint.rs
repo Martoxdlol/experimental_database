@@ -44,6 +44,11 @@ impl Checkpoint {
         }
     }
 
+    /// Return the current WAL LSN (useful for pre-stamping the file header).
+    pub fn wal_lsn(&self) -> Lsn {
+        self.wal_writer.current_lsn()
+    }
+
     /// Run a full checkpoint. Returns the checkpoint LSN.
     ///
     /// For in-memory backends: writes WAL record only (DWB + scatter-write skipped).

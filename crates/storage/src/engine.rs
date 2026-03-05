@@ -668,8 +668,10 @@ impl StorageEngine {
             write_file_header(buf, &file_header);
         }
 
-        // Flush page 0 to storage so it's durable.
-        buffer_pool.flush_page(0)?;
+        // Flush all dirty pages (page 0 + catalog B-tree roots) so they're durable.
+        for (page_id, _, _) in buffer_pool.dirty_pages() {
+            buffer_pool.flush_page(page_id)?;
+        }
 
         // Build WAL writer and reader.
         let wal_writer = Arc::new(WalWriter::new(

@@ -176,3 +176,9 @@ CRITICAL DESIGN CONSTRAINTS:
 9. In-memory backends skip DWB, checkpoint scatter-write, and recovery (all no-ops).
 
 FOR EACH PHASE: read the corresponding docs/plan/storage/XX-*.md file(s) thoroughly BEFORE writing code. They contain the exact types, algorithms, and test cases. Write all tests listed in the plan. Make sure cargo test passes before moving to the next phase." --completion-promise "DONE" --max-iterations 20
+
+
+----------------------------------
+
+
+/ralph-loop:ralph-loop "Implement docs/studio-plan.md. " --completion-promise "DONE" --max-iterations 20

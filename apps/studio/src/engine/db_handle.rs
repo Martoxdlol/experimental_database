@@ -38,10 +38,7 @@ pub struct SlotInfo {
 
 /// WAL segment summary.
 pub struct WalSegmentInfo {
-    pub oldest_lsn: Option<u64>,
     pub current_lsn: u64,
-    pub retained_size: u64,
-    pub total_size: u64,
 }
 
 /// A single WAL record for display.
@@ -90,16 +87,6 @@ pub struct FreeListInfo {
     pub chain: Vec<u32>,
 }
 
-/// Heap slot info.
-pub struct HeapSlotInfo {
-    pub page_id: u32,
-    pub slot_id: u16,
-    pub flags: u8,
-    pub total_length: u32,
-    pub first_chunk: Vec<u8>,
-    pub overflow_chain: Vec<u32>,
-}
-
 // ─── DbHandle ───
 
 /// Full read-write handle to an open database.
@@ -125,10 +112,6 @@ impl DbHandle {
     /// Close the database (checkpoint + shutdown).
     pub async fn close(&self) -> io::Result<()> {
         self.engine.close().await
-    }
-
-    pub fn engine(&self) -> &StorageEngine {
-        &self.engine
     }
 
     // ─── FileHeader ───
@@ -224,14 +207,6 @@ impl DbHandle {
     }
 
     // ─── Page Write ───
-
-    pub fn write_page_raw(&self, page_id: u32, bytes: &[u8]) -> io::Result<()> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id)?;
-        let buf = guard.data_mut();
-        let len = buf.len().min(bytes.len());
-        buf[..len].copy_from_slice(&bytes[..len]);
-        Ok(())
-    }
 
     pub fn init_page(&self, page_id: u32, page_type: PageType) -> io::Result<()> {
         let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id)?;
@@ -383,13 +358,7 @@ impl DbHandle {
     pub fn wal_info(&self) -> WalSegmentInfo {
         let wal_storage = self.engine.wal_writer();
         let current_lsn = wal_storage.current_lsn();
-        // Read from engine's wal reader
-        WalSegmentInfo {
-            oldest_lsn: None,
-            current_lsn,
-            retained_size: 0,
-            total_size: 0,
-        }
+        WalSegmentInfo { current_lsn }
     }
 
     pub fn read_wal_frames(&self, from_lsn: u64, limit: usize) -> Vec<WalFrameInfo> {
@@ -542,6 +511,142 @@ impl DbHandle {
         }
 
         Ok(indexes)
+    }
+
+    // ─── Catalog Write ───
+
+    pub fn catalog_create_collection(&self, name: &str) -> io::Result<CollectionInfo> {
+        let fh = self.engine.file_header();
+        let mut catalog_root = fh.catalog_root_page.get();
+        let mut name_root = fh.catalog_name_root_page.get();
+
+        // Auto-create catalog B-trees if needed
+        if catalog_root == 0 {
+            let tree = self.engine.create_btree()?;
+            catalog_root = tree.root_page();
+            self.update_file_header_field("catalog_root_page", catalog_root as u64)?;
+        }
+        if name_root == 0 {
+            let tree = self.engine.create_btree()?;
+            name_root = tree.root_page();
+            self.update_file_header_field("catalog_name_root_page", name_root as u64)?;
+        }
+
+        // Allocate IDs
+        let fh = self.engine.file_header();
+        let col_id = fh.next_collection_id.get();
+        self.update_file_header_field("next_collection_id", col_id + 1)?;
+
+        // Create data B-tree for the collection
+        let data_tree = self.engine.create_btree()?;
+        let data_root = data_tree.root_page();
+
+        let entry = catalog_btree::CollectionEntry {
+            collection_id: col_id,
+            name: name.to_string(),
+            primary_root_page: data_root,
+            doc_count: 0,
+        };
+
+        // Insert into by-id catalog
+        let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, col_id);
+        let value = catalog_btree::serialize_collection(&entry);
+        let tree = self.engine.open_btree(catalog_root);
+        tree.insert(&id_key, &value)?;
+
+        // Insert into by-name catalog
+        let name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, name);
+        let name_value = catalog_btree::serialize_name_value(col_id);
+        let name_tree = self.engine.open_btree(name_root);
+        name_tree.insert(&name_key, &name_value)?;
+
+        Ok(CollectionInfo {
+            id: col_id,
+            name: name.to_string(),
+            data_root_page: data_root,
+            doc_count: 0,
+            indexes: vec![],
+        })
+    }
+
+    pub fn catalog_drop_collection(&self, collection_id: u64, name: &str) -> io::Result<()> {
+        let fh = self.engine.file_header();
+        let catalog_root = fh.catalog_root_page.get();
+        let name_root = fh.catalog_name_root_page.get();
+        if catalog_root == 0 {
+            return Err(io::Error::other("No catalog"));
+        }
+
+        // Delete from by-id
+        let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, collection_id);
+        let tree = self.engine.open_btree(catalog_root);
+        tree.delete(&id_key)?;
+
+        // Delete from by-name
+        if name_root != 0 {
+            let name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, name);
+            let name_tree = self.engine.open_btree(name_root);
+            name_tree.delete(&name_key)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn catalog_create_index(
+        &self,
+        collection_id: u64,
+        name: &str,
+        field_paths: Vec<Vec<String>>,
+    ) -> io::Result<IndexInfo> {
+        let fh = self.engine.file_header();
+        let catalog_root = fh.catalog_root_page.get();
+        if catalog_root == 0 {
+            return Err(io::Error::other("No catalog"));
+        }
+
+        let idx_id = fh.next_index_id.get();
+        self.update_file_header_field("next_index_id", idx_id + 1)?;
+
+        let idx_tree = self.engine.create_btree()?;
+        let root_page = idx_tree.root_page();
+
+        let entry = catalog_btree::IndexEntry {
+            index_id: idx_id,
+            collection_id,
+            name: name.to_string(),
+            field_paths: field_paths.clone(),
+            root_page,
+            state: CatalogIndexState::Building,
+            index_type: catalog_btree::IndexType::BTree,
+            aux_root_pages: vec![],
+            config: vec![],
+        };
+
+        let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx_id);
+        let value = catalog_btree::serialize_index(&entry);
+        let tree = self.engine.open_btree(catalog_root);
+        tree.insert(&id_key, &value)?;
+
+        Ok(IndexInfo {
+            id: idx_id,
+            name: name.to_string(),
+            root_page,
+            status: "Building".to_string(),
+            field_paths,
+        })
+    }
+
+    pub fn catalog_drop_index(&self, index_id: u64) -> io::Result<()> {
+        let fh = self.engine.file_header();
+        let catalog_root = fh.catalog_root_page.get();
+        if catalog_root == 0 {
+            return Err(io::Error::other("No catalog"));
+        }
+
+        let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, index_id);
+        let tree = self.engine.open_btree(catalog_root);
+        tree.delete(&id_key)?;
+        Ok(())
     }
 
     // ─── Checkpoint + Maintenance ───

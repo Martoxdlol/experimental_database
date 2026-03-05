@@ -33,9 +33,10 @@ pub fn ConsoleModule() -> Element {
             "checkpoint",
         ],
         "btree" => vec!["scan", "get", "insert", "delete"],
-        "page" => vec!["read", "compact", "stamp_checksum"],
+        "page" => vec!["read", "init", "insert_slot", "update_slot", "delete_slot", "compact", "stamp_checksum"],
         "freelist" => vec!["walk", "allocate", "deallocate"],
         "heap" => vec!["load", "store", "free"],
+        "catalog" => vec!["list", "create_collection", "drop_collection", "create_index", "drop_index"],
         _ => vec![],
     };
 
@@ -62,6 +63,7 @@ pub fn ConsoleModule() -> Element {
                                 option { value: "page", "page(id)" }
                                 option { value: "freelist", "freelist" }
                                 option { value: "heap", "heap" }
+                                option { value: "catalog", "catalog" }
                             }
                         }
                         div {
@@ -239,6 +241,47 @@ fn execute_command(
                 if info.checksum_valid { "OK" } else { "BAD" }
             ))
         }
+        ("page", "init") => {
+            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
+            let pt = match p2 {
+                "BTreeLeaf" | "btree_leaf" => exdb_storage::page::PageType::BTreeLeaf,
+                "BTreeInternal" | "btree_internal" => exdb_storage::page::PageType::BTreeInternal,
+                "Heap" | "heap" => exdb_storage::page::PageType::Heap,
+                "Overflow" | "overflow" => exdb_storage::page::PageType::Overflow,
+                "Free" | "free" => exdb_storage::page::PageType::Free,
+                _ => return Err("Unknown page type. Use: BTreeLeaf, BTreeInternal, Heap, Overflow, Free".into()),
+            };
+            db.init_page(page_id, pt)
+                .map(|_| format!("Page #{page_id} initialized as {p2}"))
+                .map_err(|e| e.to_string())
+        }
+        ("page", "insert_slot") => {
+            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
+            let data = parse_hex(p2).ok_or("Invalid hex data")?;
+            db.insert_slot(page_id, &data)
+                .map(|slot_id| format!("Inserted slot #{slot_id}"))
+                .map_err(|e| e.to_string())
+        }
+        ("page", "update_slot") => {
+            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
+            // p2 = "slot_id:hex_data"
+            let parts: Vec<&str> = p2.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                return Err("Format: slot_id:hex_data".into());
+            }
+            let slot_id = parts[0].parse::<u16>().map_err(|_| "Invalid slot ID")?;
+            let data = parse_hex(parts[1]).ok_or("Invalid hex data")?;
+            db.update_slot(page_id, slot_id, &data)
+                .map(|_| format!("Updated slot #{slot_id}"))
+                .map_err(|e| e.to_string())
+        }
+        ("page", "delete_slot") => {
+            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
+            let slot_id = p2.parse::<u16>().map_err(|_| "Invalid slot ID".to_string())?;
+            db.delete_slot(page_id, slot_id)
+                .map(|_| format!("Deleted slot #{slot_id}"))
+                .map_err(|e| e.to_string())
+        }
         ("page", "compact") => {
             let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
             db.compact_page(page_id)
@@ -295,6 +338,55 @@ fn execute_command(
             let slot_id = p2.parse::<u16>().map_err(|_| "Invalid slot ID".to_string())?;
             db.heap_free(page_id, slot_id)
                 .map(|_| "Freed".into())
+                .map_err(|e| e.to_string())
+        }
+        ("catalog", "list") => {
+            let cols = db.list_collections().map_err(|e| e.to_string())?;
+            if cols.is_empty() {
+                Ok("No collections".into())
+            } else {
+                let lines: Vec<String> = cols.iter().map(|c| {
+                    format!("  [{}] {} (root={}, docs={}, indexes={})",
+                        c.id, c.name, c.data_root_page, c.doc_count, c.indexes.len())
+                }).collect();
+                Ok(format!("{} collections:\n{}", cols.len(), lines.join("\n")))
+            }
+        }
+        ("catalog", "create_collection") => {
+            if p1.is_empty() {
+                return Err("Name required in param1".into());
+            }
+            db.catalog_create_collection(p1)
+                .map(|info| format!("Created '{}' (id={}, root={})", info.name, info.id, info.data_root_page))
+                .map_err(|e| e.to_string())
+        }
+        ("catalog", "drop_collection") => {
+            let col_id = p1.parse::<u64>().map_err(|_| "Invalid collection ID in param1".to_string())?;
+            let name = if p2.is_empty() { "unknown" } else { p2 };
+            db.catalog_drop_collection(col_id, name)
+                .map(|_| format!("Dropped collection #{col_id}"))
+                .map_err(|e| e.to_string())
+        }
+        ("catalog", "create_index") => {
+            // p1 = collection_id, p2 = "name:field1,field2"
+            let col_id = p1.parse::<u64>().map_err(|_| "Invalid collection ID in param1".to_string())?;
+            let parts: Vec<&str> = p2.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                return Err("Format param2: index_name:field1,field2".into());
+            }
+            let name = parts[0];
+            let field_paths: Vec<Vec<String>> = parts[1]
+                .split(',')
+                .map(|f| f.trim().split('.').map(|s| s.to_string()).collect())
+                .collect();
+            db.catalog_create_index(col_id, name, field_paths)
+                .map(|info| format!("Created index '{}' (id={}, root={})", info.name, info.id, info.root_page))
+                .map_err(|e| e.to_string())
+        }
+        ("catalog", "drop_index") => {
+            let idx_id = p1.parse::<u64>().map_err(|_| "Invalid index ID in param1".to_string())?;
+            db.catalog_drop_index(idx_id)
+                .map(|_| format!("Dropped index #{idx_id}"))
                 .map_err(|e| e.to_string())
         }
         _ => Err(format!("Unknown command: {target}.{method}")),

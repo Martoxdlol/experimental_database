@@ -135,7 +135,7 @@ pub fn BTreeModule() -> Element {
 
 #[component]
 fn BTreeView(root_page: u32, write_enabled: bool) -> Element {
-    let state = use_context::<AppState>();
+    let mut state = use_context::<AppState>();
     let db = state.db.read().clone();
 
     let Some(db) = db else {
@@ -171,14 +171,42 @@ fn BTreeView(root_page: u32, write_enabled: bool) -> Element {
                                         th { "#" }
                                         th { "Key" }
                                         th { "Value" }
+                                        if write_enabled {
+                                            th { "Actions" }
+                                        }
                                     }
                                 }
                                 tbody {
                                     for (i, entry) in info.entries.iter().enumerate() {
-                                        tr {
-                                            td { "{i}" }
-                                            td { "{hex_short(&entry.key)}" }
-                                            td { "{hex_short(&entry.value)}" }
+                                        {
+                                            let key_clone = entry.key.clone();
+                                            rsx! {
+                                                tr {
+                                                    td { "{i}" }
+                                                    td { "{hex_short(&entry.key)}" }
+                                                    td { "{hex_short(&entry.value)}" }
+                                                    if write_enabled {
+                                                        td {
+                                                            button {
+                                                                class: "edit-btn",
+                                                                title: "Delete key",
+                                                                onclick: move |e| {
+                                                                    e.stop_propagation();
+                                                                    let db = state.db.read().clone();
+                                                                    if let Some(db) = db {
+                                                                        match db.btree_delete(root_page, &key_clone) {
+                                                                            Ok(true) => state.last_result.set(Some(OperationResult::Success("Key deleted".into()))),
+                                                                            Ok(false) => state.last_result.set(Some(OperationResult::Error("Key not found".into()))),
+                                                                            Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
+                                                                        }
+                                                                    }
+                                                                },
+                                                                "\u{2717}"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -207,7 +235,7 @@ fn BTreeView(root_page: u32, write_enabled: bool) -> Element {
                 }
 
                 // Insert key-value form
-                if write_enabled && info.is_leaf {
+                if write_enabled {
                     InsertKvForm { root_page }
                 }
             }
@@ -221,6 +249,7 @@ fn InsertKvForm(root_page: u32) -> Element {
     let mut state = use_context::<AppState>();
     let mut key_hex: Signal<String> = use_signal(String::new);
     let mut value_hex: Signal<String> = use_signal(String::new);
+    let mut value_mode: Signal<String> = use_signal(|| "hex".to_string());
 
     rsx! {
         div { class: "card",
@@ -237,12 +266,34 @@ fn InsertKvForm(root_page: u32) -> Element {
                             oninput: move |e| key_hex.set(e.value()),
                         }
                     }
+                    div { style: "display: flex; gap: 8px;",
+                        label { style: "font-size: 11px; color: var(--text-secondary);",
+                            input {
+                                r#type: "radio",
+                                name: "val_mode_{root_page}",
+                                checked: *value_mode.read() == "hex",
+                                onchange: move |_| value_mode.set("hex".to_string()),
+                            }
+                            " Hex"
+                        }
+                        label { style: "font-size: 11px; color: var(--text-secondary);",
+                            input {
+                                r#type: "radio",
+                                name: "val_mode_{root_page}",
+                                checked: *value_mode.read() == "text",
+                                onchange: move |_| value_mode.set("text".to_string()),
+                            }
+                            " UTF-8 Text"
+                        }
+                    }
                     div {
-                        label { style: "color: var(--text-secondary); font-size: 11px;", "Value (hex):" }
+                        label { style: "color: var(--text-secondary); font-size: 11px;",
+                            "Value ({value_mode.read()}):"
+                        }
                         input {
                             class: "edit-input",
                             style: "width: 100%;",
-                            placeholder: "e.g. 48656C6C6F",
+                            placeholder: if *value_mode.read() == "hex" { "e.g. 48656C6C6F" } else { "text value" },
                             value: "{value_hex.read()}",
                             oninput: move |e| value_hex.set(e.value()),
                         }
@@ -251,7 +302,11 @@ fn InsertKvForm(root_page: u32) -> Element {
                         class: "btn btn-action",
                         onclick: move |_| {
                             let key = parse_hex(&key_hex.read());
-                            let value = parse_hex(&value_hex.read());
+                            let value = if *value_mode.read() == "hex" {
+                                parse_hex(&value_hex.read())
+                            } else {
+                                Some(value_hex.read().as_bytes().to_vec())
+                            };
                             if let (Some(k), Some(v)) = (key, value) {
                                 let db = state.db.read().clone();
                                 if let Some(db) = db {
@@ -289,6 +344,9 @@ fn hex_short(data: &[u8]) -> String {
 
 fn parse_hex(s: &str) -> Option<Vec<u8>> {
     let s = s.replace(' ', "");
+    if s.is_empty() {
+        return Some(Vec::new());
+    }
     if !s.len().is_multiple_of(2) {
         return None;
     }

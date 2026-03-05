@@ -32,7 +32,7 @@ pub fn PagesModule() -> Element {
 
     // Load selected page detail
     let _page_detail = use_memo(move || {
-        
+
         *selected_page.read()
     });
 
@@ -274,16 +274,6 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
                     div { class: "card",
                         div { class: "card-header",
                             "Slot Directory ({info.num_slots} slots)"
-                            if write_enabled {
-                                button {
-                                    class: "btn btn-action",
-                                    style: "margin-left: auto; font-size: 11px; padding: 2px 8px;",
-                                    onclick: move |_| {
-                                        // TODO: insert slot dialog
-                                    },
-                                    "+ Insert Slot"
-                                }
-                            }
                         }
                         div { class: "card-body",
                             table { class: "slot-table",
@@ -399,6 +389,17 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
                             }
                         }
                     }
+
+                    // Insert Slot Form
+                    InsertSlotForm { page_id }
+
+                    // Init Page As Type
+                    InitPageForm { page_id }
+
+                    // Update Slot Form
+                    if let Some(slot_idx) = *selected_slot.read() {
+                        UpdateSlotForm { page_id, slot_index: slot_idx }
+                    }
                 }
 
                 // Hex Dump
@@ -412,6 +413,187 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
         }
         _ => {
             rsx! { div { "Loading page..." } }
+        }
+    }
+}
+
+#[component]
+fn InsertSlotForm(page_id: u32) -> Element {
+    let mut state = use_context::<AppState>();
+    let mut hex_input: Signal<String> = use_signal(String::new);
+    let mut text_input: Signal<String> = use_signal(String::new);
+    let mut mode: Signal<String> = use_signal(|| "hex".to_string());
+
+    rsx! {
+        div { class: "card",
+            div { class: "card-header", "Insert Slot" }
+            div { class: "card-body",
+                div { style: "display: flex; gap: 8px; margin-bottom: 8px;",
+                    label { style: "font-size: 11px; color: var(--text-secondary);",
+                        input {
+                            r#type: "radio",
+                            name: "insert_mode_{page_id}",
+                            checked: *mode.read() == "hex",
+                            onchange: move |_| mode.set("hex".to_string()),
+                        }
+                        " Hex"
+                    }
+                    label { style: "font-size: 11px; color: var(--text-secondary);",
+                        input {
+                            r#type: "radio",
+                            name: "insert_mode_{page_id}",
+                            checked: *mode.read() == "text",
+                            onchange: move |_| mode.set("text".to_string()),
+                        }
+                        " UTF-8 Text"
+                    }
+                }
+                if *mode.read() == "hex" {
+                    input {
+                        class: "edit-input",
+                        style: "width: 100%; margin-bottom: 8px;",
+                        placeholder: "Hex bytes: e.g. 48 65 6C 6C 6F",
+                        value: "{hex_input.read()}",
+                        oninput: move |e| hex_input.set(e.value()),
+                    }
+                } else {
+                    input {
+                        class: "edit-input",
+                        style: "width: 100%; margin-bottom: 8px;",
+                        placeholder: "UTF-8 text data",
+                        value: "{text_input.read()}",
+                        oninput: move |e| text_input.set(e.value()),
+                    }
+                }
+                button {
+                    class: "btn btn-action",
+                    onclick: move |_| {
+                        let current_mode = mode.read().clone();
+                        let data = if current_mode == "hex" {
+                            let h = hex_input.read().clone();
+                            parse_hex_bytes(&h)
+                        } else {
+                            let t = text_input.read().clone();
+                            Some(t.into_bytes())
+                        };
+                        if let Some(data) = data {
+                            let db = state.db.read().clone();
+                            if let Some(db) = db {
+                                match db.insert_slot(page_id, &data) {
+                                    Ok(slot_id) => {
+                                        state.last_result.set(Some(OperationResult::Success(
+                                            format!("Inserted slot #{slot_id} ({} bytes)", data.len())
+                                        )));
+                                        hex_input.set(String::new());
+                                        text_input.set(String::new());
+                                    }
+                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
+                                }
+                            }
+                        } else {
+                            state.last_result.set(Some(OperationResult::Error("Invalid hex input".into())));
+                        }
+                    },
+                    "Insert"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn UpdateSlotForm(page_id: u32, slot_index: u16) -> Element {
+    let mut state = use_context::<AppState>();
+    let mut hex_input: Signal<String> = use_signal(String::new);
+
+    rsx! {
+        div { class: "card",
+            div { class: "card-header", "Update Slot #{slot_index}" }
+            div { class: "card-body",
+                input {
+                    class: "edit-input",
+                    style: "width: 100%; margin-bottom: 8px;",
+                    placeholder: "New hex data for slot",
+                    value: "{hex_input.read()}",
+                    oninput: move |e| hex_input.set(e.value()),
+                }
+                button {
+                    class: "btn btn-action",
+                    onclick: move |_| {
+                        let h = hex_input.read().clone();
+                        if let Some(data) = parse_hex_bytes(&h) {
+                            let db = state.db.read().clone();
+                            if let Some(db) = db {
+                                match db.update_slot(page_id, slot_index, &data) {
+                                    Ok(()) => {
+                                        state.last_result.set(Some(OperationResult::Success(
+                                            format!("Updated slot #{slot_index}")
+                                        )));
+                                        hex_input.set(String::new());
+                                    }
+                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
+                                }
+                            }
+                        } else {
+                            state.last_result.set(Some(OperationResult::Error("Invalid hex input".into())));
+                        }
+                    },
+                    "Update"
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn InitPageForm(page_id: u32) -> Element {
+    let mut state = use_context::<AppState>();
+    let mut page_type_sel: Signal<String> = use_signal(|| "BTreeLeaf".to_string());
+
+    rsx! {
+        div { class: "card",
+            div { class: "card-header", "Re-Initialize Page" }
+            div { class: "card-body",
+                div { style: "display: flex; gap: 8px; align-items: flex-end;",
+                    div {
+                        label { style: "color: var(--text-secondary); font-size: 11px; display: block;", "Page Type:" }
+                        select {
+                            class: "select",
+                            value: "{page_type_sel.read()}",
+                            onchange: move |e| page_type_sel.set(e.value()),
+                            option { value: "BTreeLeaf", "BTreeLeaf" }
+                            option { value: "BTreeInternal", "BTreeInternal" }
+                            option { value: "Heap", "Heap" }
+                            option { value: "Overflow", "Overflow" }
+                            option { value: "Free", "Free" }
+                        }
+                    }
+                    button {
+                        class: "btn btn-danger",
+                        onclick: move |_| {
+                            let pt_name = page_type_sel.read().clone();
+                            let pt = match pt_name.as_str() {
+                                "BTreeLeaf" => PageType::BTreeLeaf,
+                                "BTreeInternal" => PageType::BTreeInternal,
+                                "Heap" => PageType::Heap,
+                                "Overflow" => PageType::Overflow,
+                                "Free" => PageType::Free,
+                                _ => return,
+                            };
+                            let db = state.db.read().clone();
+                            if let Some(db) = db {
+                                match db.init_page(page_id, pt) {
+                                    Ok(()) => state.last_result.set(Some(OperationResult::Success(
+                                        format!("Page #{page_id} re-initialized as {pt_name}")
+                                    ))),
+                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
+                                }
+                            }
+                        },
+                        "Re-Initialize (destructive)"
+                    }
+                }
+            }
         }
     }
 }
@@ -459,4 +641,18 @@ fn pct(part: u32, total: u32) -> f64 {
     } else {
         (part as f64 / total as f64) * 100.0
     }
+}
+
+fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let s = s.replace(' ', "");
+    if s.is_empty() {
+        return Some(Vec::new());
+    }
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }

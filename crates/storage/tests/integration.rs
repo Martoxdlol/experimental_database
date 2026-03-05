@@ -1977,3 +1977,72 @@ async fn test_double_close() {
     );
     engine2.close().await.unwrap();
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 35: Fresh database reopen without checkpoint
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Create a fresh database and drop it without checkpoint or close.
+/// Reopen should succeed — init_new_database flushes all pages.
+#[tokio::test]
+async fn test_reopen_fresh_db_without_checkpoint() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("fresh_no_ckpt");
+
+    {
+        let _engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        // Drop without checkpoint or close.
+    }
+
+    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+    // Verify the catalog roots are valid by creating a btree (touches the free list + catalog).
+    let handle = engine.create_btree().unwrap();
+    handle.insert(b"k", b"v").unwrap();
+    assert_eq!(handle.get(b"k").unwrap(), Some(b"v".to_vec()));
+    engine.close().await.unwrap();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 36: Heap store works after reopen (empty free space map)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// After reopen the heap free space map is empty. Verify that store()
+/// still works (allocates new pages) and that old blobs are still loadable.
+#[tokio::test]
+async fn test_heap_store_after_reopen() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("heap_reopen_db");
+
+    let btree_root;
+    {
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let handle = engine.create_btree().unwrap();
+        btree_root = handle.root_page();
+
+        // Store a blob, persist its ref in a btree.
+        let data = vec![0xAAu8; 500];
+        let href = engine.heap_store(&data).unwrap();
+        handle.insert(b"blob1", &href.to_bytes()).unwrap();
+
+        engine.checkpoint().await.unwrap();
+        engine.close().await.unwrap();
+    }
+
+    // Reopen — free space map is empty.
+    {
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let handle = engine.open_btree(btree_root);
+
+        // Old blob is still loadable.
+        let href_bytes = handle.get(b"blob1").unwrap().unwrap();
+        let href = HeapRef::from_bytes(href_bytes[..6].try_into().unwrap());
+        assert_eq!(engine.heap_load(href).unwrap(), vec![0xAAu8; 500]);
+
+        // New store works despite empty free space map.
+        let data2 = vec![0xBBu8; 300];
+        let href2 = engine.heap_store(&data2).unwrap();
+        assert_eq!(engine.heap_load(href2).unwrap(), data2);
+
+        engine.close().await.unwrap();
+    }
+}

@@ -43,7 +43,8 @@ A page-oriented storage engine library providing B+ trees, heap storage, write-a
 | **checkpoint** | `checkpoint.rs` | Flush dirty buffer pool pages through DWB, write checkpoint WAL record. |
 | **recovery** | `recovery.rs` | DWB restore + WAL replay via `WalRecordHandler` trait callback. |
 | **vacuum** | `vacuum.rs` | Batch entry removal from B-trees. |
-| **catalog_btree** | `catalog_btree.rs` | Key format + serialization for collection/index catalog entries. |
+| **catalog_btree** | `catalog_btree.rs` | Key format + serialization for collection/index catalog entries. Supports `IndexType` (BTree/Gin/FullText/Vector) with aux root pages and opaque config. |
+| **posting** | `posting.rs` | Sorted posting list codec for inverted indexes (GIN/FTS). Encode/decode + set operations (union/intersect/difference). |
 | **engine** | `engine.rs` | `StorageEngine` facade composing all sub-layers. `FileHeader` (84-byte zerocopy) on page 0. |
 
 ## How It Works

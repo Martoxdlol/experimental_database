@@ -383,7 +383,7 @@ Maximum document size (16 MB) requires at most ~2,000 overflow pages at 8 KB pag
 
 B-tree pages do not need a free space map — their space is managed by B-tree insert/split mechanics.
 
-**Concurrency**: both the free page list and the heap free space map are accessed exclusively by the single writer (section 5.10). No concurrent access control is needed — the writer serializes all page allocations, deallocations, and heap inserts. Checkpoint reads the free list head from the file header but does not modify it. The heap free space map is rebuilt on startup and updated only during write operations.
+**Concurrency**: both the free page list and the heap free space map are accessed exclusively by the single writer (section 5.11). No concurrent access control is needed — the writer serializes all page allocations, deallocations, and heap inserts. Checkpoint reads the free list head from the file header but does not modify it. The heap free space map is rebuilt on startup and updated only during write operations.
 
 ### 2.7 Buffer Pool
 
@@ -434,7 +434,7 @@ The buffer pool is the central concurrent data structure. Its design enables **c
 
 **Clock eviction**: the `clock_hand` is an `AtomicU32` advanced with `fetch_add` (no lock needed). During victim selection, frames are inspected by attempting to acquire their `RwLock` — frames that are locked (in use) are skipped, not waited on.
 
-**Latch ordering** (deadlock prevention): page latches are always acquired in ascending `page_id` order when multiple pages must be held simultaneously (e.g., during B-tree splits). The page table lock is never held while acquiring a frame lock. See section 5.10 for the complete latch hierarchy.
+**Latch ordering** (deadlock prevention): page latches are always acquired in ascending `page_id` order when multiple pages must be held simultaneously (e.g., during B-tree splits). The page table lock is never held while acquiring a frame lock. See section 5.11 for the complete latch hierarchy.
 
 **No latches across await points**: frame `RwLock`s are **synchronous** (`parking_lot::RwLock`, not `tokio::sync::RwLock`). They are acquired and released within synchronous code blocks. This prevents async deadlocks where a task holding a latch is descheduled indefinitely. Disk I/O (which requires `.await`) is always performed outside of any frame latch — data is read into a temporary buffer, then copied into the frame under the latch.
 
@@ -824,7 +824,7 @@ Checkpointing flushes dirty buffer pool pages to the data file, allowing old WAL
 
 If the system crashes during step 4 (some `data.db` writes torn), `data.dwb` still contains the correct page images (fsynced in step 3). On recovery, these are restored before WAL replay (see 2.10).
 
-**Checkpoint concurrency**: the checkpoint runs on its own background task but must coordinate with the single writer (section 5.10) and concurrent readers:
+**Checkpoint concurrency**: the checkpoint runs on its own background task but must coordinate with the single writer (section 5.11) and concurrent readers:
 
 - **Steps 1–2** (record LSN, collect dirty frames): the checkpoint acquires the **writer lock** to prevent new commits from starting. While holding the lock, it records `checkpoint_lsn` and snapshots the list of dirty frames along with their page data (copied from frame buffers). The writer lock is then released. This critical section is brief — it copies dirty page contents but does no disk I/O.
 - **Steps 3–5** (DWB write, scatter-write, fsync): executed **without the writer lock**. New commits can proceed concurrently, dirtying frames. The DWB is written from the snapshot taken in step 2, so concurrent modifications do not affect it. Scatter-writes use positional I/O (section 2.7.1) and do not block concurrent page reads.
@@ -1525,6 +1525,65 @@ When document versions are vacuumed (section 2.11), their secondary index entrie
 - Primary B-tree entries for vacuumed versions are removed as part of the primary vacuum pass.
 - Reclaimed B-tree pages are added to the free page list.
 
+### 3.9 GIN (Generalized Inverted) Indexes
+
+GIN indexes map terms to posting lists (sorted sets of document references). Used for array containment, multi-value fields, and as the foundation for full-text search.
+
+**Storage structure** (3 B-trees per GIN index):
+
+| B-tree | Key | Value |
+|--------|-----|-------|
+| Posting tree | term bytes | Encoded `PostingList` (inline or HeapRef) |
+| Pending inserts | term bytes | Encoded `PostingList` (buffered writes) |
+| Doc-term map | `doc_id[16] \|\| inv_ts[8]` | List of terms for this doc version |
+
+**Write path**: New entries go into the pending inserts buffer. Periodically (or at checkpoint), pending entries are merged into the main posting tree using `PostingList::merge_pending()`.
+
+**Read path**: For each query term, read from the posting tree and merge with pending inserts. Intersect posting lists for AND queries, union for OR queries.
+
+**Posting entry format**: `key = doc_id[16] || inv_ts[8]`, `value = empty`.
+
+**Catalog entry**: `IndexType::Gin`, `root_page` = posting tree, `aux_root_pages` = [pending_inserts, doc_term_map].
+
+### 3.10 Full-Text Search Indexes
+
+Full-text search indexes extend GIN with tokenization and positional posting lists.
+
+**Differences from plain GIN**:
+- Terms are produced by a tokenizer (configured in `IndexEntry.config`)
+- Posting entry values store term positions: `position_count(u16 LE) || [position(u32 LE)...]`
+- Phrase queries use position data to verify term adjacency
+
+**Storage structure**: Same 3 B-trees as GIN. The `config` field stores the tokenizer configuration (e.g. `tokenizer=unicode61;stemmer=english`).
+
+**Catalog entry**: `IndexType::FullText`, same aux structure as GIN.
+
+### 3.11 Vector Indexes (HNSW)
+
+Vector indexes enable approximate nearest neighbor (ANN) search for embedding-based queries.
+
+**Storage structure** (2 B-trees per vector index):
+
+| B-tree | Key | Value |
+|--------|-----|-------|
+| Vector data | `doc_id[16] \|\| inv_ts[8]` | Raw vector bytes (f32 LE array) |
+| Adjacency lists | `layer(u8) \|\| node_id[16]` | Neighbor list (node_id array) |
+
+**HNSW parameters** (stored in `IndexEntry.config`):
+- `dimensions`: u16 LE — vector dimensionality
+- `m`: u8 — max connections per layer
+- `ef_construction`: u16 LE — search width during construction
+
+**Write path**: Insert vector into data tree, then update HNSW graph by connecting to nearest neighbors.
+
+**Read path**: HNSW greedy search from entry point, descending layers. Return top-k nearest neighbors by distance.
+
+**Distance functions**: Cosine similarity, Euclidean distance, dot product (selected per index).
+
+**Catalog entry**: `IndexType::Vector`, `root_page` = vector data tree, `aux_root_pages` = [adjacency_lists].
+
+**OCC considerations**: Vector search breaks the interval-based read set model (no total ordering on vector space). Recommended approach: vector queries are exempt from OCC conflict detection by default, with opt-in distance-ball tracking for consistency-sensitive workloads.
+
 ---
 
 ## 4. Query Engine
@@ -1813,7 +1872,7 @@ For **array-indexed fields**, a single document may produce multiple old keys an
 
 ### 5.6 Read Set
 
-The read set records which portions of the index key space a transaction has observed. It is used for OCC validation at commit time (section 5.7) and as the watch predicate for subscription invalidation (section 5.8).
+The read set records which portions of the index key space a transaction has observed. It is used for OCC validation at commit time (section 5.7) and as the watch predicate for subscription invalidation (section 5.9).
 
 #### 5.6.1 Structure
 
@@ -1931,7 +1990,7 @@ Transactions that remain open too long prevent vacuuming (section 2.11) and caus
 | `tx_idle_timeout` | 30 s | Maximum time a transaction can remain open without any client activity (no messages referencing this `tx`). |
 | `tx_max_lifetime` | 5 min | Maximum total time a transaction can remain open, regardless of activity. |
 
-When a timeout fires, the server aborts the transaction (equivalent to `rollback`) and sends an `error` response with code `tx_timeout` for the next message that references the expired `tx`. Subscription chain transactions (section 5.8) reset the `tx_max_lifetime` on each chain link — only the current link's lifetime is limited, not the total chain duration.
+When a timeout fires, the server aborts the transaction (equivalent to `rollback`) and sends an `error` response with code `tx_timeout` for the next message that references the expired `tx`. Subscription chain transactions (section 5.9) reset the `tx_max_lifetime` on each chain link — only the current link's lifetime is limited, not the total chain duration.
 
 ### 5.7 OCC Validation (Conflict Detection)
 
@@ -1987,7 +2046,19 @@ Checking both keys is essential. A document updated from `status="active"` to `s
 
 **Commit log pruning**: entries with `commit_ts ≤ oldest_active_begin_ts` can be removed — no active transaction will validate against them.
 
-### 5.8 Transaction Subscriptions
+### 5.8 OCC Impact of Advanced Index Types
+
+**GIN / Full-Text Search indexes**:
+- **Write sets**: A single document write may produce many `IndexDelta` entries (one per term). For GIN, the set of terms is extracted from the indexed field. For FTS, the tokenizer produces the term list. Each term generates an `(old_key, new_key)` pair in the write set.
+- **Read sets**: Term lookups produce point intervals (single key). AND queries produce the intersection of multiple single-term intervals. This scales the existing interval model — more intervals per query, but each is small.
+- **Conflict detection**: Same algorithm as B-tree indexes. A concurrent commit that modifies a posting list for a term in the read set triggers a conflict.
+
+**Vector indexes**:
+- Vector similarity queries **break the interval model** — there is no total ordering on vector space, so key intervals cannot represent the "read set" of a nearest-neighbor search.
+- **Default behavior**: Vector queries are exempt from OCC conflict detection. This means concurrent writes to vectors do not cause transaction aborts, but results may be slightly stale.
+- **Opt-in consistency**: For workloads that need strict consistency, vector queries can opt into a distance-ball model: the read set records `(center_vector, max_distance)`, and any concurrent write whose vector falls within that ball triggers a conflict. This is expensive (requires distance computation at validation time) and is off by default.
+
+### 5.9 Transaction Subscriptions
 
 Subscriptions operate at the **transaction level**: a subscription watches the entire read set of a committed transaction, not an individual query.
 
@@ -2029,7 +2100,7 @@ The registry uses the same `(collection, index)` grouping as the read set and co
 
 **Subscription update on chain commit**: when a chain transaction (the new transaction from step 3) commits, its read set replaces the subscription's previous read set in the registry. Old intervals are removed, new intervals are inserted.
 
-### 5.9 Query Result Caching
+### 5.10 Query Result Caching
 
 The subscription mechanism naturally enables **query result caching**: the server (or client) can cache the full result of a query alongside its read set. On subsequent identical queries, the cached result is returned immediately if no intervening commit has invalidated the read set.
 
@@ -2037,17 +2108,17 @@ The subscription mechanism naturally enables **query result caching**: the serve
 
 **Cache lifecycle**: cached results are associated with the `read_ts` at which they were computed. A cache hit is valid if and only if no commit in `(read_ts, current_ts)` conflicts with the read set. This check is equivalent to the OCC validation in 5.7.
 
-### 5.10 Concurrency Model
+### 5.11 Concurrency Model
 
 The system uses a **single-writer, concurrent-reader** model. One writer processes commits sequentially; multiple readers execute queries concurrently with each other and with the writer.
 
-#### 5.10.1 Async Runtime
+#### 5.11.1 Async Runtime
 
 All I/O and computation runs on the tokio async runtime. CPU-bound work (page operations, B-tree traversals) runs on the runtime's thread pool. Blocking synchronous locks (`parking_lot::RwLock` on buffer pool frames) are held only for microsecond-scale operations and are never held across `.await` points to prevent async deadlocks.
 
-#### 5.10.2 Single Writer
+#### 5.11.2 Single Writer
 
-A single **writer task** serializes all operations that modify the page store. The writer processes one commit at a time, executing steps 1–6 of the commit protocol (section 5.11) sequentially:
+A single **writer task** serializes all operations that modify the page store. The writer processes one commit at a time, executing steps 1–6 of the commit protocol (section 5.12) sequentially:
 
 1. OCC validation against the commit log.
 2. Assign `commit_ts` (atomic increment).
@@ -2066,7 +2137,7 @@ The writer is implemented as a dedicated tokio task that receives commit request
 
 **Throughput**: the single writer is the serialization bottleneck. Under high write load, throughput is bounded by the speed of one commit pipeline iteration. The WAL group commit (section 2.8.6) amortizes fsync cost. Page mutations are in-memory (buffer pool), so step 4 is fast. The practical bottleneck is WAL fsync latency, which group commit mitigates.
 
-#### 5.10.3 Concurrent Readers
+#### 5.11.3 Concurrent Readers
 
 Read-only queries run on any tokio task, concurrently with each other and with the writer:
 
@@ -2077,7 +2148,7 @@ Read-only queries run on any tokio task, concurrently with each other and with t
 
 **Reader–writer interaction on the same page**: if a reader holds a `SharedPageGuard` on a page that the writer wants to modify, the writer's `ExclusivePageGuard` acquisition blocks until the reader releases. Frame `RwLock` contention is the only point of interaction between readers and the writer. In practice, contention is rare — the writer modifies a small number of pages per commit, and readers traverse a much larger set.
 
-#### 5.10.4 Background Tasks
+#### 5.11.4 Background Tasks
 
 Several background tasks run concurrently with the writer and readers:
 
@@ -2091,7 +2162,7 @@ All page-modifying background tasks funnel through the writer — they do not by
 
 The checkpoint is the one exception: it writes to `data.dwb` and scatter-writes to `data.db` outside the writer. This is safe because checkpoint writes are to pages whose contents were snapshotted while the writer lock was held (section 2.9), and the mark-clean step checks LSNs to avoid clobbering concurrent modifications.
 
-#### 5.10.5 Latch Hierarchy
+#### 5.11.5 Latch Hierarchy
 
 To prevent deadlocks, locks are always acquired in this order:
 
@@ -2109,7 +2180,7 @@ To prevent deadlocks, locks are always acquired in this order:
 - Frame locks are synchronous (`parking_lot::RwLock`) and never held across `.await` points. All async I/O is performed outside the latch — read into a temp buffer, then copy under latch.
 - The writer lock is an async mutex (`tokio::sync::Mutex`) since the writer performs async I/O (WAL fsync) while holding it. This is safe because the writer lock is always the outermost lock — no synchronous latch is held while awaiting it.
 
-#### 5.10.6 Concurrency Summary
+#### 5.11.6 Concurrency Summary
 
 | Operation | Runs on | Page access | Serialized? |
 |-----------|---------|-------------|-------------|
@@ -2120,7 +2191,7 @@ To prevent deadlocks, locks are always acquired in this order:
 | Vacuum | Writer task (submitted) | `ExclusivePageGuard` | Yes — through writer |
 | Index build | Writer task (submitted) | `ExclusivePageGuard` | Yes — through writer |
 
-### 5.11 Commit Protocol and Ordering Guarantees
+### 5.12 Commit Protocol and Ordering Guarantees
 
 The commit protocol enforces a strict ordering of effects. When a client receives commit confirmation, it is guaranteed that:
 

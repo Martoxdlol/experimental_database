@@ -17,7 +17,7 @@ use std::sync::Arc;
 use storage::backend::{MemoryPageStorage, MemoryWalStorage, PageStorage, WalStorage};
 use storage::btree::ScanDirection;
 use storage::catalog_btree::{
-    self, CatalogEntityType, CatalogIndexState, CollectionEntry, IndexEntry,
+    self, CatalogEntityType, CatalogIndexState, CollectionEntry, IndexEntry, IndexType,
 };
 use storage::engine::{StorageConfig, StorageEngine};
 use storage::recovery::{NoOpHandler, WalRecordHandler};
@@ -332,6 +332,9 @@ async fn test_catalog_btree_persistence() {
             field_paths: vec![vec!["email".to_string()]],
             root_page: 300,
             state: CatalogIndexState::Ready,
+            index_type: IndexType::BTree,
+            aux_root_pages: vec![],
+            config: vec![],
         };
         let idx_key =
             catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx1.index_id);

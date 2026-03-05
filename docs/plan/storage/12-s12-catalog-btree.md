@@ -178,6 +178,69 @@ The file header (page 0) stores the root pages of both B-trees: `catalog_root_pa
 5. `serialize_name_value(collection_id)` → name_value.
 6. `name_btree.insert(name_key, name_value)`.
 
+## Index Type Discriminant
+
+```rust
+/// Index type discriminant.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexType {
+    BTree    = 0x01,
+    Gin      = 0x02,
+    FullText = 0x03,
+    Vector   = 0x04,
+}
+```
+
+The `IndexEntry` includes three additional fields to support GIN, FTS, and vector indexes:
+
+```rust
+pub struct IndexEntry {
+    // ... existing fields ...
+    pub index_type: IndexType,
+    pub aux_root_pages: Vec<PageId>,  // additional B-trees (pending buffer, doc-term map, adjacency)
+    pub config: Vec<u8>,              // opaque config (tokenizer ID, HNSW params, etc.)
+}
+```
+
+### Extended IndexEntry Serialization Format
+
+```
+index_id:              u64 LE    (8 bytes)
+collection_id:         u64 LE    (8 bytes)
+index_type:            u8        (1 byte)
+name_len:              u16 LE    (2 bytes)
+name:                  [u8; name_len]
+field_count:           u8        (1 byte)
+  For each field_path:
+    segment_count:     u8        (1 byte)
+    For each segment:
+      seg_len:         u16 LE    (2 bytes)
+      segment:         [u8; seg_len]
+root_page:             u32 LE    (4 bytes)
+state:                 u8        (1 byte)
+aux_count:             u8        (1 byte)
+  For each aux root page:
+    aux_page:          u32 LE    (4 bytes)
+config_len:            u16 LE    (2 bytes)
+config:                [u8; config_len]
+```
+
+### Aux Root Pages by Index Type
+
+| IndexType | root_page | aux_root_pages |
+|-----------|-----------|----------------|
+| BTree | B-tree root | (none) |
+| Gin | posting B-tree | [pending_inserts, doc_term_map] |
+| FullText | posting B-tree | [pending_inserts, doc_term_map] |
+| Vector | vector data B-tree | [adjacency_lists] |
+
+### Config Format (caller-defined, opaque to storage layer)
+
+- **GIN**: empty or application-specific
+- **FullText**: tokenizer config (e.g. `tokenizer=unicode61;stemmer=english`)
+- **Vector**: HNSW params (e.g. `dimensions(u16 LE) || m(u8) || ef_construction(u16 LE)`)
+
 ## Error Handling
 
 | Error | Cause | Handling |

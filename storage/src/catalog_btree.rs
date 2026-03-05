@@ -58,6 +58,37 @@ impl CatalogIndexState {
     }
 }
 
+// ─── Index Types ───
+
+/// Index type discriminant.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexType {
+    /// Standard B-tree secondary index.
+    BTree = 0x01,
+    /// Generalized inverted index (term → posting list).
+    Gin = 0x02,
+    /// Full-text search index (GIN + tokenizer + positional postings).
+    FullText = 0x03,
+    /// Vector similarity index (HNSW graph).
+    Vector = 0x04,
+}
+
+impl IndexType {
+    pub fn from_u8(val: u8) -> io::Result<Self> {
+        match val {
+            0x01 => Ok(IndexType::BTree),
+            0x02 => Ok(IndexType::Gin),
+            0x03 => Ok(IndexType::FullText),
+            0x04 => Ok(IndexType::Vector),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown index type: 0x{:02x}", val),
+            )),
+        }
+    }
+}
+
 // ─── Collection Entry ───
 
 /// Collection metadata stored in the catalog B-tree.
@@ -81,6 +112,12 @@ pub struct IndexEntry {
     pub field_paths: Vec<Vec<String>>,
     pub root_page: PageId,
     pub state: CatalogIndexState,
+    /// Index type discriminant.
+    pub index_type: IndexType,
+    /// Additional B-tree root pages (e.g. pending buffer, doc-term map, adjacency lists).
+    pub aux_root_pages: Vec<PageId>,
+    /// Opaque configuration bytes (e.g. HNSW params, tokenizer ID).
+    pub config: Vec<u8>,
 }
 
 // ─── Key Construction ───
@@ -172,9 +209,12 @@ pub fn deserialize_collection(data: &[u8]) -> io::Result<CollectionEntry> {
 
 /// Serialize an IndexEntry to bytes (for B-tree value).
 ///
-/// Format: index_id(u64 LE) || collection_id(u64 LE) || name_len(u16 LE) || name
+/// Format: index_id(u64 LE) || collection_id(u64 LE) || index_type(u8)
+///       || name_len(u16 LE) || name
 ///       || field_count(u8) || [segment_count(u8) || [seg_len(u16 LE) || segment]...]
 ///       || root_page(u32 LE) || state(u8)
+///       || aux_count(u8) || [aux_page(u32 LE)...]
+///       || config_len(u16 LE) || config
 pub fn serialize_index(entry: &IndexEntry) -> Vec<u8> {
     let name_bytes = entry.name.as_bytes();
     let name_len = name_bytes.len() as u16;
@@ -182,6 +222,7 @@ pub fn serialize_index(entry: &IndexEntry) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(&entry.index_id.to_le_bytes());
     buf.extend_from_slice(&entry.collection_id.to_le_bytes());
+    buf.push(entry.index_type as u8);
     buf.extend_from_slice(&name_len.to_le_bytes());
     buf.extend_from_slice(name_bytes);
 
@@ -198,13 +239,21 @@ pub fn serialize_index(entry: &IndexEntry) -> Vec<u8> {
     buf.extend_from_slice(&entry.root_page.to_le_bytes());
     buf.push(entry.state as u8);
 
+    buf.push(entry.aux_root_pages.len() as u8);
+    for &aux_page in &entry.aux_root_pages {
+        buf.extend_from_slice(&aux_page.to_le_bytes());
+    }
+    buf.extend_from_slice(&(entry.config.len() as u16).to_le_bytes());
+    buf.extend_from_slice(&entry.config);
+
     buf
 }
 
 /// Deserialize an IndexEntry from bytes.
 pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
-    // Minimum: 8 + 8 + 2 + 0 + 1 + 4 + 1 = 24
-    if data.len() < 24 {
+    // Minimum: 8 (index_id) + 8 (collection_id) + 1 (index_type) + 2 (name_len)
+    //        + 1 (field_count) + 4 (root_page) + 1 (state) + 1 (aux_count) + 2 (config_len) = 28
+    if data.len() < 28 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "index entry too short",
@@ -219,10 +268,13 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
     let collection_id = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
     offset += 8;
 
+    let index_type = IndexType::from_u8(data[offset])?;
+    offset += 1;
+
     let name_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
     offset += 2;
 
-    if data.len() < offset + name_len + 1 + 4 + 1 {
+    if offset + name_len > data.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "index entry truncated at name",
@@ -300,6 +352,46 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
     offset += 4;
 
     let state = CatalogIndexState::from_u8(data[offset])?;
+    offset += 1;
+
+    if offset >= data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "index entry truncated at aux_count",
+        ));
+    }
+    let aux_count = data[offset] as usize;
+    offset += 1;
+
+    if offset + aux_count * 4 > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "index entry truncated at aux_root_pages",
+        ));
+    }
+    let mut aux_root_pages = Vec::with_capacity(aux_count);
+    for _ in 0..aux_count {
+        let page = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        aux_root_pages.push(page);
+    }
+
+    if offset + 2 > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "index entry truncated at config_len",
+        ));
+    }
+    let config_len = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+    offset += 2;
+
+    if offset + config_len > data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "index entry truncated at config",
+        ));
+    }
+    let config = data[offset..offset + config_len].to_vec();
 
     Ok(IndexEntry {
         index_id,
@@ -308,6 +400,9 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
         field_paths,
         root_page,
         state,
+        index_type,
+        aux_root_pages,
+        config,
     })
 }
 
@@ -438,6 +533,9 @@ mod tests {
             ],
             root_page: 200,
             state: CatalogIndexState::Ready,
+            index_type: IndexType::BTree,
+            aux_root_pages: vec![],
+            config: vec![],
         };
 
         let data = serialize_index(&entry);
@@ -537,6 +635,9 @@ mod tests {
                 field_paths: vec![vec!["field".to_string()]],
                 root_page: (i * 20) as PageId,
                 state: CatalogIndexState::Ready,
+                index_type: IndexType::BTree,
+                aux_root_pages: vec![],
+                config: vec![],
             };
             let key = make_catalog_id_key(CatalogEntityType::Index, i);
             let value = serialize_index(&entry);
@@ -594,6 +695,9 @@ mod tests {
                 field_paths: vec![vec!["field".to_string()]],
                 root_page: (i * 20) as PageId,
                 state: CatalogIndexState::Ready,
+                index_type: IndexType::BTree,
+                aux_root_pages: vec![],
+                config: vec![],
             };
             let key = make_catalog_id_key(CatalogEntityType::Index, i);
             let value = serialize_index(&entry);
@@ -633,6 +737,9 @@ mod tests {
             field_paths: vec![],
             root_page: 50,
             state: CatalogIndexState::Building,
+            index_type: IndexType::BTree,
+            aux_root_pages: vec![],
+            config: vec![],
         };
 
         let data = serialize_index(&entry);
@@ -673,5 +780,192 @@ mod tests {
             let decoded = deserialize_name_value(&encoded);
             assert_eq!(decoded, id);
         }
+    }
+
+    // ─── Test 13: IndexType roundtrip ───
+    #[test]
+    fn index_type_roundtrip() {
+        for (variant, byte) in [
+            (IndexType::BTree, 0x01),
+            (IndexType::Gin, 0x02),
+            (IndexType::FullText, 0x03),
+            (IndexType::Vector, 0x04),
+        ] {
+            assert_eq!(variant as u8, byte);
+            assert_eq!(IndexType::from_u8(byte).unwrap(), variant);
+
+            let entry = IndexEntry {
+                index_id: 1,
+                collection_id: 1,
+                name: "test".to_string(),
+                field_paths: vec![vec!["f".to_string()]],
+                root_page: 10,
+                state: CatalogIndexState::Ready,
+                index_type: variant,
+                aux_root_pages: vec![],
+                config: vec![],
+            };
+            let data = serialize_index(&entry);
+            let decoded = deserialize_index(&data).unwrap();
+            assert_eq!(decoded.index_type, variant);
+        }
+    }
+
+    // ─── Test 14: IndexType invalid ───
+    #[test]
+    fn index_type_invalid() {
+        assert!(IndexType::from_u8(0x00).is_err());
+        assert!(IndexType::from_u8(0x05).is_err());
+        assert!(IndexType::from_u8(0xFF).is_err());
+    }
+
+    // ─── Test 15: GIN entry with aux pages ───
+    #[test]
+    fn gin_entry_with_aux_pages() {
+        let entry = IndexEntry {
+            index_id: 10,
+            collection_id: 5,
+            name: "tags_gin".to_string(),
+            field_paths: vec![vec!["tags".to_string()]],
+            root_page: 100,
+            state: CatalogIndexState::Ready,
+            index_type: IndexType::Gin,
+            aux_root_pages: vec![101, 102, 103], // posting, pending, doc-term
+            config: vec![],
+        };
+        let data = serialize_index(&entry);
+        let decoded = deserialize_index(&data).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(decoded.aux_root_pages.len(), 3);
+    }
+
+    // ─── Test 16: FTS entry with config ───
+    #[test]
+    fn fts_entry_with_config() {
+        let config = b"tokenizer=unicode61;stemmer=english".to_vec();
+        let entry = IndexEntry {
+            index_id: 20,
+            collection_id: 5,
+            name: "content_fts".to_string(),
+            field_paths: vec![vec!["body".to_string()], vec!["title".to_string()]],
+            root_page: 200,
+            state: CatalogIndexState::Building,
+            index_type: IndexType::FullText,
+            aux_root_pages: vec![201, 202],
+            config: config.clone(),
+        };
+        let data = serialize_index(&entry);
+        let decoded = deserialize_index(&data).unwrap();
+        assert_eq!(decoded, entry);
+        assert_eq!(decoded.config, config);
+    }
+
+    // ─── Test 17: Vector entry with aux + config ───
+    #[test]
+    fn vector_entry_full() {
+        // HNSW params: dimensions(u16 LE) || m(u8) || ef_construction(u16 LE)
+        let mut config = Vec::new();
+        config.extend_from_slice(&384u16.to_le_bytes()); // dimensions
+        config.push(16); // m
+        config.extend_from_slice(&200u16.to_le_bytes()); // ef_construction
+        let entry = IndexEntry {
+            index_id: 30,
+            collection_id: 7,
+            name: "embedding_vec".to_string(),
+            field_paths: vec![vec!["embedding".to_string()]],
+            root_page: 300,
+            state: CatalogIndexState::Ready,
+            index_type: IndexType::Vector,
+            aux_root_pages: vec![301, 302], // vector data, adjacency
+            config,
+        };
+        let data = serialize_index(&entry);
+        let decoded = deserialize_index(&data).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    // ─── Test 18: Empty aux and config ───
+    #[test]
+    fn empty_aux_and_config() {
+        let entry = IndexEntry {
+            index_id: 1,
+            collection_id: 1,
+            name: "x".to_string(),
+            field_paths: vec![],
+            root_page: 5,
+            state: CatalogIndexState::Ready,
+            index_type: IndexType::BTree,
+            aux_root_pages: vec![],
+            config: vec![],
+        };
+        let data = serialize_index(&entry);
+        let decoded = deserialize_index(&data).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    // ─── Test 19: Large config roundtrip ───
+    #[test]
+    fn large_config_roundtrip() {
+        let config: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
+        let entry = IndexEntry {
+            index_id: 50,
+            collection_id: 1,
+            name: "big_config".to_string(),
+            field_paths: vec![vec!["f".to_string()]],
+            root_page: 500,
+            state: CatalogIndexState::Ready,
+            index_type: IndexType::Gin,
+            aux_root_pages: vec![501],
+            config,
+        };
+        let data = serialize_index(&entry);
+        let decoded = deserialize_index(&data).unwrap();
+        assert_eq!(decoded, entry);
+    }
+
+    // ─── Test 20: GIN in dual B-tree catalog ───
+    #[test]
+    fn gin_in_dual_btree_catalog() {
+        let (pool, mut fl) = setup();
+        let id_btree = BTree::create(pool.clone(), &mut fl).unwrap();
+
+        // Insert a BTree index and a GIN index.
+        let btree_idx = IndexEntry {
+            index_id: 1,
+            collection_id: 1,
+            name: "btree_idx".to_string(),
+            field_paths: vec![vec!["email".to_string()]],
+            root_page: 10,
+            state: CatalogIndexState::Ready,
+            index_type: IndexType::BTree,
+            aux_root_pages: vec![],
+            config: vec![],
+        };
+        let gin_idx = IndexEntry {
+            index_id: 2,
+            collection_id: 1,
+            name: "tags_gin".to_string(),
+            field_paths: vec![vec!["tags".to_string()]],
+            root_page: 20,
+            state: CatalogIndexState::Ready,
+            index_type: IndexType::Gin,
+            aux_root_pages: vec![21, 22, 23],
+            config: vec![0x01, 0x02],
+        };
+
+        for entry in [&btree_idx, &gin_idx] {
+            let key = make_catalog_id_key(CatalogEntityType::Index, entry.index_id);
+            let value = serialize_index(entry);
+            id_btree.insert(&key, &value, &mut fl).unwrap();
+        }
+
+        // Retrieve and verify both.
+        let key1 = make_catalog_id_key(CatalogEntityType::Index, 1);
+        let found1 = deserialize_index(&id_btree.get(&key1).unwrap().unwrap()).unwrap();
+        assert_eq!(found1, btree_idx);
+
+        let key2 = make_catalog_id_key(CatalogEntityType::Index, 2);
+        let found2 = deserialize_index(&id_btree.get(&key2).unwrap().unwrap()).unwrap();
+        assert_eq!(found2, gin_idx);
     }
 }

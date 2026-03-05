@@ -20,4 +20,5 @@ pub mod checkpoint;
 pub mod recovery;
 pub mod vacuum;
 pub mod catalog_btree;
+pub mod posting;
 pub mod engine;

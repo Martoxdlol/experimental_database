@@ -67,8 +67,6 @@ struct FrameData {
     page_id: Option<PageId>,
     /// Whether the page has been modified since the last flush.
     dirty: bool,
-    /// Clock eviction reference bit (set on access, cleared by clock hand).
-    ref_bit: bool,
 }
 
 /// One slot in the fixed-size frame array.
@@ -114,7 +112,6 @@ impl BufferPool {
                     data: vec![0u8; config.page_size],
                     page_id: None,
                     dirty: false,
-                    ref_bit: false,
                 }),
                 pin_count: AtomicU32::new(0),
                 ref_bit: AtomicBool::new(false),
@@ -332,14 +329,13 @@ impl BufferPool {
 
         for slot in &self.frames {
             let guard = slot.lock.read();
-            if guard.dirty {
-                if let Some(pid) = guard.page_id {
+            if guard.dirty
+                && let Some(pid) = guard.page_id {
                     let data_copy = guard.data.clone();
                     // Read LSN from the page buffer at offset 24 (little-endian u64).
                     let lsn = read_lsn_from_buf(&guard.data);
                     result.push((pid, data_copy, lsn));
                 }
-            }
         }
 
         result
@@ -454,8 +450,7 @@ impl BufferPool {
             return Ok(idx);
         }
 
-        Err(io::Error::new(
-            io::ErrorKind::Other,
+        Err(io::Error::other(
             BufferPoolFull,
         ))
     }

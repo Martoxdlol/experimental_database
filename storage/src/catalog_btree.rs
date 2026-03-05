@@ -21,7 +21,7 @@ pub enum CatalogEntityType {
 }
 
 impl CatalogEntityType {
-    fn from_u8(val: u8) -> io::Result<Self> {
+    pub fn from_u8(val: u8) -> io::Result<Self> {
         match val {
             0x01 => Ok(CatalogEntityType::Collection),
             0x02 => Ok(CatalogEntityType::Index),
@@ -391,7 +391,7 @@ mod tests {
     // Verify memcmp ordering matches string ordering for collection names.
     #[test]
     fn name_key_ordering() {
-        let names = vec!["alpha", "bravo", "charlie", "delta"];
+        let names = ["alpha", "bravo", "charlie", "delta"];
         let mut keys: Vec<Vec<u8>> = names
             .iter()
             .map(|n| make_catalog_name_key(CatalogEntityType::Collection, n))

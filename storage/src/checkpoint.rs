@@ -63,8 +63,8 @@ impl Checkpoint {
         let dirty = self.buffer_pool.dirty_pages();
 
         // Step 3: If durable and non-empty, write through DWB.
-        if self.is_durable && !dirty.is_empty() {
-            if let Some(ref dwb) = self.dwb {
+        if self.is_durable && !dirty.is_empty()
+            && let Some(ref dwb) = self.dwb {
                 // Strip the LSN from dirty_pages results; DWB takes &[(PageId, Vec<u8>)].
                 let pages_for_dwb: Vec<_> = dirty
                     .iter()
@@ -72,7 +72,6 @@ impl Checkpoint {
                     .collect();
                 dwb.write_pages(&pages_for_dwb)?;
             }
-        }
 
         // Step 4: Mark flushed pages as clean.
         for (page_id, _data, lsn) in &dirty {

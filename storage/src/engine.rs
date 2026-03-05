@@ -390,8 +390,8 @@ impl StorageEngine {
             file_header.verify()?;
 
             // Run recovery if durable and handler provided.
-            if is_durable {
-                if let Some(h) = handler {
+            if is_durable
+                && let Some(h) = handler {
                     let checkpoint_lsn = file_header.checkpoint_lsn.get();
                     Recovery::run(
                         page_storage.as_ref(),
@@ -402,7 +402,6 @@ impl StorageEngine {
                         h,
                     )?;
                 }
-            }
 
             Self::build_from_existing(
                 page_storage,

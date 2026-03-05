@@ -254,8 +254,8 @@ impl FileWalStorage {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("segment-") && name.ends_with(".wal") {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.starts_with("segment-") && name.ends_with(".wal") {
                     let seg_id_str = &name["segment-".len()..name.len() - ".wal".len()];
                     let segment_id: u32 = seg_id_str.parse().map_err(|_| {
                         io::Error::new(
@@ -276,7 +276,6 @@ impl FileWalStorage {
                         path,
                     });
                 }
-            }
         }
 
         if segments.is_empty() {
@@ -451,11 +450,10 @@ impl WalStorage for FileWalStorage {
         }
 
         // Check if we need to roll over
-        if let Some(seg) = inner.segments.last() {
-            if seg.file_size > self.segment_size as u64 {
+        if let Some(seg) = inner.segments.last()
+            && seg.file_size > self.segment_size as u64 {
                 Self::rollover(&mut inner, &self.dir)?;
             }
-        }
 
         Ok(offset)
     }

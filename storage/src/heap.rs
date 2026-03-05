@@ -155,7 +155,7 @@ impl Heap {
             let buf = guard.data_mut();
             let mut page = SlottedPage::from_buf(buf);
             page.insert_slot(&slot_payload).map_err(|_| {
-                io::Error::new(io::ErrorKind::Other, "page full during heap insert")
+                io::Error::other("page full during heap insert")
             })?
         };
         guard.mark_dirty();
@@ -762,8 +762,8 @@ mod tests {
         let href2;
         {
             let mut heap1 = Heap::new(pool.clone());
-            href1 = heap1.store(&vec![1u8; 100], &mut free_list).unwrap();
-            href2 = heap1.store(&vec![2u8; 200], &mut free_list).unwrap();
+            href1 = heap1.store(&[1u8; 100], &mut free_list).unwrap();
+            href2 = heap1.store(&[2u8; 200], &mut free_list).unwrap();
         }
 
         // Create a new Heap instance (simulating restart) with empty free space map
@@ -781,7 +781,7 @@ mod tests {
         assert_eq!(heap2.load(href2).unwrap(), vec![2u8; 200]);
 
         // Verify store works with rebuilt map (finds free space)
-        let href3 = heap2.store(&vec![3u8; 150], &mut free_list).unwrap();
+        let href3 = heap2.store(&[3u8; 150], &mut free_list).unwrap();
         assert_eq!(heap2.load(href3).unwrap(), vec![3u8; 150]);
     }
 

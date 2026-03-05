@@ -47,6 +47,7 @@ pub struct DwbHeader {
 
 impl DwbHeader {
     /// Serialize the header to a 16-byte buffer.
+    #[allow(clippy::wrong_self_convention)]
     fn to_bytes(&self) -> [u8; DWB_HEADER_SIZE] {
         let mut buf = [0u8; DWB_HEADER_SIZE];
         buf[0..4].copy_from_slice(&self.magic.to_le_bytes());

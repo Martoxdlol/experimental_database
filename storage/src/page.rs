@@ -431,11 +431,7 @@ impl<'a> SlottedPage<'a> {
         let h = self.header();
         let start = h.free_space_start.get() as usize;
         let end = h.free_space_end.get() as usize;
-        if end > start {
-            end - start
-        } else {
-            0
-        }
+        end.saturating_sub(start)
     }
 
     /// Total reclaimable space: contiguous free space plus fragmented space from
@@ -612,11 +608,7 @@ impl<'a> SlottedPageRef<'a> {
         let h = self.header();
         let start = h.free_space_start.get() as usize;
         let end = h.free_space_end.get() as usize;
-        if end > start {
-            end - start
-        } else {
-            0
-        }
+        end.saturating_sub(start)
     }
 
     /// Verify the stored checksum matches the computed value.

@@ -229,8 +229,7 @@ impl WalWriter {
                     "unknown WAL error".to_string()
                 };
                 for (_assigned_lsn, response) in assignments {
-                    let _ = response.send(Err(io::Error::new(
-                        io::ErrorKind::Other,
+                    let _ = response.send(Err(io::Error::other(
                         err_msg.clone(),
                     )));
                 }

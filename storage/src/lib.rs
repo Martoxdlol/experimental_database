@@ -4,6 +4,10 @@
 //! write-ahead logging, and crash recovery. It operates on raw bytes and pages with
 //! no domain-specific knowledge (no DocId, Ts, Document, Filter, MVCC, etc.).
 
+// SlottedPage/SlottedPageRef are borrowed views without Drop impls.
+// Explicit drop() calls document when page access ends before guard release.
+#![allow(clippy::drop_non_drop)]
+
 pub mod backend;
 pub mod page;
 pub mod buffer_pool;

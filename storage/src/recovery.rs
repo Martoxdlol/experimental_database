@@ -95,14 +95,13 @@ impl Recovery {
         checkpoint_lsn: Lsn,
     ) -> io::Result<bool> {
         // Check DWB.
-        if let Some(path) = dwb_path {
-            if path.exists() {
+        if let Some(path) = dwb_path
+            && path.exists() {
                 let metadata = std::fs::metadata(path)?;
                 if metadata.len() > 0 {
                     return Ok(true);
                 }
             }
-        }
 
         // Check WAL: see if there are any valid records past checkpoint_lsn.
         let mut header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
@@ -381,7 +380,7 @@ mod tests {
         fn handle_record(&mut self, _record: &WalRecord) -> io::Result<()> {
             self.count += 1;
             if self.count == self.error_on {
-                return Err(io::Error::new(io::ErrorKind::Other, "handler error"));
+                return Err(io::Error::other("handler error"));
             }
             Ok(())
         }
@@ -479,7 +478,7 @@ mod tests {
         }
 
         // Write DWB file with valid page data.
-        let dwb_pages: Vec<Vec<u8>> = (0..5u32).map(|i| make_valid_page(i)).collect();
+        let dwb_pages: Vec<Vec<u8>> = (0..5u32).map(make_valid_page).collect();
         {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()

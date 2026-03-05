@@ -9,7 +9,7 @@ use crate::error::StorageError;
 
 /// Read a little-endian `u16` from `data` at `offset`.
 pub fn read_u16_le(data: &[u8], offset: usize) -> io::Result<u16> {
-    let end = offset.checked_add(2).unwrap_or(usize::MAX);
+    let end = offset.saturating_add(2);
     if end > data.len() {
         return Err(StorageError::DataTruncated {
             offset,
@@ -23,7 +23,7 @@ pub fn read_u16_le(data: &[u8], offset: usize) -> io::Result<u16> {
 
 /// Read a little-endian `u32` from `data` at `offset`.
 pub fn read_u32_le(data: &[u8], offset: usize) -> io::Result<u32> {
-    let end = offset.checked_add(4).unwrap_or(usize::MAX);
+    let end = offset.saturating_add(4);
     if end > data.len() {
         return Err(StorageError::DataTruncated {
             offset,
@@ -42,7 +42,7 @@ pub fn read_u32_le(data: &[u8], offset: usize) -> io::Result<u32> {
 
 /// Read a little-endian `u64` from `data` at `offset`.
 pub fn read_u64_le(data: &[u8], offset: usize) -> io::Result<u64> {
-    let end = offset.checked_add(8).unwrap_or(usize::MAX);
+    let end = offset.saturating_add(8);
     if end > data.len() {
         return Err(StorageError::DataTruncated {
             offset,
@@ -65,7 +65,7 @@ pub fn read_u64_le(data: &[u8], offset: usize) -> io::Result<u64> {
 
 /// Read a big-endian `u32` from `data` at `offset`.
 pub fn read_u32_be(data: &[u8], offset: usize) -> io::Result<u32> {
-    let end = offset.checked_add(4).unwrap_or(usize::MAX);
+    let end = offset.saturating_add(4);
     if end > data.len() {
         return Err(StorageError::DataTruncated {
             offset,
@@ -84,7 +84,7 @@ pub fn read_u32_be(data: &[u8], offset: usize) -> io::Result<u32> {
 
 /// Read a big-endian `u64` from `data` at `offset`.
 pub fn read_u64_be(data: &[u8], offset: usize) -> io::Result<u64> {
-    let end = offset.checked_add(8).unwrap_or(usize::MAX);
+    let end = offset.saturating_add(8);
     if end > data.len() {
         return Err(StorageError::DataTruncated {
             offset,
@@ -107,7 +107,7 @@ pub fn read_u64_be(data: &[u8], offset: usize) -> io::Result<u64> {
 
 /// Read a little-endian `u16` from `data` at `offset`, returning a big-endian value.
 pub fn read_u16_be(data: &[u8], offset: usize) -> io::Result<u16> {
-    let end = offset.checked_add(2).unwrap_or(usize::MAX);
+    let end = offset.saturating_add(2);
     if end > data.len() {
         return Err(StorageError::DataTruncated {
             offset,

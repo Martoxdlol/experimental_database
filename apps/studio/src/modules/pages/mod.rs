@@ -21,6 +21,7 @@ pub fn PagesModule() -> Element {
 
     // Load page list
     let page_list = use_resource(move || {
+        let _rev = *state.revision.read();
         let db = db.clone();
         async move {
             tokio::task::spawn_blocking(move || db.scan_page_types())
@@ -142,6 +143,7 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
     };
 
     let page_info = use_resource(move || {
+        let _rev = *state.revision.read();
         let db = db.clone();
         async move {
             tokio::task::spawn_blocking(move || db.read_page(page_id))
@@ -332,9 +334,12 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
                                                                         let db = state.db.read().clone();
                                                                         if let Some(db) = db {
                                                                             match db.delete_slot(page_id, idx) {
-                                                                                Ok(()) => state.last_result.set(Some(OperationResult::Success(
-                                                                                    format!("Deleted slot #{idx}")
-                                                                                ))),
+                                                                                Ok(()) => {
+                                                                                    state.last_result.set(Some(OperationResult::Success(
+                                                                                        format!("Deleted slot #{idx}")
+                                                                                    )));
+                                                                                    state.notify_mutation();
+                                                                                }
                                                                                 Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                                             }
                                                                         }
@@ -366,7 +371,10 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
                                         let db = state.db.read().clone();
                                         if let Some(db) = db {
                                             match db.compact_page(page_id) {
-                                                Ok(()) => state.last_result.set(Some(OperationResult::Success("Page compacted".into()))),
+                                                Ok(()) => {
+                                                    state.last_result.set(Some(OperationResult::Success("Page compacted".into())));
+                                                    state.notify_mutation();
+                                                }
                                                 Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                             }
                                         }
@@ -379,7 +387,10 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
                                         let db = state.db.read().clone();
                                         if let Some(db) = db {
                                             match db.stamp_checksum(page_id) {
-                                                Ok(()) => state.last_result.set(Some(OperationResult::Success("Checksum stamped".into()))),
+                                                Ok(()) => {
+                                                    state.last_result.set(Some(OperationResult::Success("Checksum stamped".into())));
+                                                    state.notify_mutation();
+                                                }
                                                 Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                             }
                                         }
@@ -484,6 +495,7 @@ fn InsertSlotForm(page_id: u32) -> Element {
                                         state.last_result.set(Some(OperationResult::Success(
                                             format!("Inserted slot #{slot_id} ({} bytes)", data.len())
                                         )));
+                                        state.notify_mutation();
                                         hex_input.set(String::new());
                                         text_input.set(String::new());
                                     }
@@ -529,6 +541,7 @@ fn UpdateSlotForm(page_id: u32, slot_index: u16) -> Element {
                                         state.last_result.set(Some(OperationResult::Success(
                                             format!("Updated slot #{slot_index}")
                                         )));
+                                        state.notify_mutation();
                                         hex_input.set(String::new());
                                     }
                                     Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
@@ -583,9 +596,12 @@ fn InitPageForm(page_id: u32) -> Element {
                             let db = state.db.read().clone();
                             if let Some(db) = db {
                                 match db.init_page(page_id, pt) {
-                                    Ok(()) => state.last_result.set(Some(OperationResult::Success(
-                                        format!("Page #{page_id} re-initialized as {pt_name}")
-                                    ))),
+                                    Ok(()) => {
+                                        state.last_result.set(Some(OperationResult::Success(
+                                            format!("Page #{page_id} re-initialized as {pt_name}")
+                                        )));
+                                        state.notify_mutation();
+                                    }
                                     Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                 }
                             }

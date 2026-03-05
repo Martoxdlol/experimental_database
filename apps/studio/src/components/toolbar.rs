@@ -114,8 +114,7 @@ pub fn Toolbar() -> Element {
                                 if let Some(db) = db {
                                     match db.checkpoint().await {
                                         Ok(()) => {
-                                            let dirty = db.dirty_page_count();
-                                            state.dirty_page_count.set(dirty);
+                                            state.notify_mutation();
                                             state.last_result.set(Some(OperationResult::Success("Checkpoint complete".into())));
                                         }
                                         Err(e) => {

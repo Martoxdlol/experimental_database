@@ -22,6 +22,7 @@ pub fn OverviewModule() -> Element {
     // Count pages by type
     let db_for_scan = db.clone();
     let type_counts = use_resource(move || {
+        let _rev = *state.revision.read();
         let db = db_for_scan.clone();
         async move {
             tokio::task::spawn_blocking(move || db.scan_page_types())
@@ -164,9 +165,12 @@ fn header_row(
                                     let db = state.db.read().clone();
                                     if let Some(db) = db {
                                         match db.update_file_header_field(&fn_c, val) {
-                                            Ok(()) => state.last_result.set(Some(OperationResult::Success(
-                                                format!("Updated {fn_c} to {val}")
-                                            ))),
+                                            Ok(()) => {
+                                                state.last_result.set(Some(OperationResult::Success(
+                                                    format!("Updated {fn_c} to {val}")
+                                                )));
+                                                state.notify_mutation();
+                                            }
                                             Err(e) => state.last_result.set(Some(OperationResult::Error(
                                                 e.to_string()
                                             ))),

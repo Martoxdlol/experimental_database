@@ -82,6 +82,9 @@ pub struct AppState {
     pub dirty_page_count: Signal<usize>,
     /// Last operation result for toast display.
     pub last_result: Signal<Option<OperationResult>>,
+    /// Monotonic revision counter — bumped on every write mutation.
+    /// `use_resource` closures read this to re-fetch data after mutations.
+    pub revision: Signal<u64>,
 }
 
 impl AppState {
@@ -93,11 +96,21 @@ impl AppState {
             write_enabled: Signal::new(false),
             dirty_page_count: Signal::new(0),
             last_result: Signal::new(None),
+            revision: Signal::new(0),
         }
     }
 
     /// Whether a database is currently open.
     pub fn is_open(&self) -> bool {
         self.db.read().is_some()
+    }
+
+    /// Call after any successful write mutation to refresh all data views.
+    pub fn notify_mutation(&mut self) {
+        self.revision.set(self.revision.cloned() + 1);
+        // Update dirty page count
+        if let Some(db) = self.db.read().as_ref() {
+            self.dirty_page_count.set(db.dirty_page_count());
+        }
     }
 }

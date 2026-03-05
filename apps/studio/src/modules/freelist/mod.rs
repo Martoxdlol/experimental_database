@@ -13,6 +13,7 @@ pub fn FreeListModule() -> Element {
     };
 
     let free_list = use_resource(move || {
+        let _rev = *state.revision.read();
         let db = db.clone();
         async move {
             tokio::task::spawn_blocking(move || db.walk_free_list())
@@ -77,6 +78,7 @@ pub fn FreeListModule() -> Element {
                                                     state.last_result.set(Some(OperationResult::Success(
                                                         format!("Allocated page #{page_id}")
                                                     )));
+                                                    state.notify_mutation();
                                                 }
                                                 Err(e) => {
                                                     state.last_result.set(Some(OperationResult::Error(e.to_string())));
@@ -125,6 +127,7 @@ fn DeallocateForm() -> Element {
                                     state.last_result.set(Some(OperationResult::Success(
                                         format!("Deallocated page #{page_id}")
                                     )));
+                                    state.notify_mutation();
                                     page_input.set(String::new());
                                 }
                                 Err(e) => {

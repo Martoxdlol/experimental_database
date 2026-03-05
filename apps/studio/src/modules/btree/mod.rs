@@ -18,6 +18,7 @@ pub fn BTreeModule() -> Element {
     // Build tree selector from catalog
     let db_for_catalog = db.clone();
     let collections = use_resource(move || {
+        let _rev = *state.revision.read();
         let db = db_for_catalog.clone();
         async move {
             tokio::task::spawn_blocking(move || db.list_collections())
@@ -111,6 +112,7 @@ pub fn BTreeModule() -> Element {
                                                 state.last_result.set(Some(OperationResult::Success(
                                                     format!("Created new B-tree with root page #{root}")
                                                 )));
+                                                state.notify_mutation();
                                             }
                                             Err(e) => {
                                                 state.last_result.set(Some(OperationResult::Error(e.to_string())));
@@ -144,6 +146,7 @@ fn BTreeView(root_page: u32, write_enabled: bool) -> Element {
 
     // Load node
     let node = use_resource(move || {
+        let _rev = *state.revision.read();
         let db = db.clone();
         async move {
             tokio::task::spawn_blocking(move || db.read_btree_node(root_page))
@@ -195,7 +198,10 @@ fn BTreeView(root_page: u32, write_enabled: bool) -> Element {
                                                                     let db = state.db.read().clone();
                                                                     if let Some(db) = db {
                                                                         match db.btree_delete(root_page, &key_clone) {
-                                                                            Ok(true) => state.last_result.set(Some(OperationResult::Success("Key deleted".into()))),
+                                                                            Ok(true) => {
+                                                                                state.last_result.set(Some(OperationResult::Success("Key deleted".into())));
+                                                                                state.notify_mutation();
+                                                                            }
                                                                             Ok(false) => state.last_result.set(Some(OperationResult::Error("Key not found".into()))),
                                                                             Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                                         }
@@ -313,6 +319,7 @@ fn InsertKvForm(root_page: u32) -> Element {
                                     match db.btree_insert(root_page, &k, &v) {
                                         Ok(()) => {
                                             state.last_result.set(Some(OperationResult::Success("Key inserted".into())));
+                                            state.notify_mutation();
                                             key_hex.set(String::new());
                                             value_hex.set(String::new());
                                         }

@@ -17,6 +17,7 @@ pub fn WalModule() -> Element {
     let mut selected_frame: Signal<Option<usize>> = use_signal(|| None);
 
     let frames = use_resource(move || {
+        let _rev = *state.revision.read();
         let db = db.clone();
         let lsn = *from_lsn.read();
         async move {
@@ -174,6 +175,7 @@ fn WalAppendForm() -> Element {
                                                 state.last_result.set(Some(OperationResult::Success(
                                                     format!("Appended WAL record at LSN {lsn}")
                                                 )));
+                                                state.notify_mutation();
                                                 payload_hex.set(String::new());
                                             }
                                             Err(e) => {

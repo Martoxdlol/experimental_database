@@ -17,6 +17,7 @@ pub fn HeapModule() -> Element {
     // Find all heap pages
     let db_for_scan = db.clone();
     let heap_pages = use_resource(move || {
+        let _rev = *state.revision.read();
         let db = db_for_scan.clone();
         async move {
             tokio::task::spawn_blocking(move || {
@@ -185,6 +186,7 @@ fn StoreBlobForm() -> Element {
                                         state.last_result.set(Some(OperationResult::Success(
                                             format!("Stored {} bytes at page={page_id}, slot={slot_id}", data.len())
                                         )));
+                                        state.notify_mutation();
                                         text_input.set(String::new());
                                         hex_input.set(String::new());
                                     }
@@ -307,6 +309,7 @@ fn FreeBlobForm() -> Element {
                                             state.last_result.set(Some(OperationResult::Success(
                                                 format!("Freed blob at page={page}, slot={slot}")
                                             )));
+                                            state.notify_mutation();
                                             page_input.set(String::new());
                                             slot_input.set(String::new());
                                         }

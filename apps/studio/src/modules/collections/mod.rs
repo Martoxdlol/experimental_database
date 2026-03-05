@@ -15,6 +15,7 @@ pub fn CollectionsModule() -> Element {
     let mut selected_collection: Signal<Option<(u64, String, u32)>> = use_signal(|| None);
 
     let collections = use_resource(move || {
+        let _rev = *state.revision.read();
         let db = db.clone();
         async move {
             tokio::task::spawn_blocking(move || db.list_collections())
@@ -82,6 +83,7 @@ fn DocumentBrowser(collection_name: String, root_page: u32, write_enabled: bool)
 
     // Scan the collection's data B-tree
     let documents = use_resource(move || {
+        let _rev = *state.revision.read();
         let db = db.clone();
         async move {
             tokio::task::spawn_blocking(move || db.btree_scan(root_page, 100))
@@ -124,7 +126,10 @@ fn DocumentBrowser(collection_name: String, root_page: u32, write_enabled: bool)
                                             let db = state.db.read().clone();
                                             if let Some(db) = db {
                                                 match db.btree_delete(root_page, &key_clone) {
-                                                    Ok(true) => state.last_result.set(Some(OperationResult::Success("Entry deleted".into()))),
+                                                    Ok(true) => {
+                                                        state.last_result.set(Some(OperationResult::Success("Entry deleted".into())));
+                                                        state.notify_mutation();
+                                                    }
                                                     Ok(false) => state.last_result.set(Some(OperationResult::Error("Key not found".into()))),
                                                     Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                 }
@@ -254,6 +259,7 @@ fn InsertDocumentForm(root_page: u32) -> Element {
                                 match db.btree_insert(root_page, &k, &v) {
                                     Ok(()) => {
                                         state.last_result.set(Some(OperationResult::Success("Document inserted".into())));
+                                        state.notify_mutation();
                                         key_hex.set(String::new());
                                         value_input.set(String::new());
                                     }

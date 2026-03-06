@@ -330,7 +330,7 @@ impl BTreeHandle {
 
 - File header is on page 0, read at startup.
 - Updated via `update_file_header()` which acquires the file header lock, applies the update, and writes page 0 through the buffer pool.
-- Updated after: checkpoint (checkpoint_lsn, visible_ts), create/drop collection (catalog roots, ID allocators), free list changes (free_list_head).
+- Updated after: checkpoint (checkpoint_lsn, visible_ts), transactional catalog mutations at commit time (catalog roots, ID allocators), free list changes (free_list_head).
 
 Both `checkpoint_lsn` and `visible_ts` are read from the FileHeader (page 0) on startup. No sidecar files are needed.
 

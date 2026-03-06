@@ -31,13 +31,15 @@ const MAX_WAL_RECORD_SIZE: usize = 64 * 1024 * 1024;
 // Defined here as a central registry. The WAL itself treats these as opaque
 // byte tags — the SEMANTICS are defined by higher layers (catalog, storage
 // engine, etc.) that produce and consume these records.
-pub const WAL_RECORD_TX_COMMIT: u8 = 0x01;
+//
+// NOTE: Catalog DDL (create/drop collection/index) is included in the
+// TxCommit record payload as catalog_mutations. There are no separate
+// WAL record types for DDL — this ensures atomicity of DDL + data
+// mutations within a single transaction.
+pub const WAL_RECORD_TX_COMMIT: u8 = 0x01;      // data mutations + catalog mutations
 pub const WAL_RECORD_CHECKPOINT: u8 = 0x02;
-pub const WAL_RECORD_CREATE_COLLECTION: u8 = 0x03;
-pub const WAL_RECORD_DROP_COLLECTION: u8 = 0x04;
-pub const WAL_RECORD_CREATE_INDEX: u8 = 0x05;
-pub const WAL_RECORD_DROP_INDEX: u8 = 0x06;
-pub const WAL_RECORD_INDEX_READY: u8 = 0x07;
+// 0x03–0x06: reserved (formerly separate DDL records, now part of TxCommit)
+pub const WAL_RECORD_INDEX_READY: u8 = 0x07;     // background index build completed
 pub const WAL_RECORD_VACUUM: u8 = 0x08;
 pub const WAL_RECORD_VISIBLE_TS: u8 = 0x09;
 pub const WAL_RECORD_ROLLBACK_VACUUM: u8 = 0x0A;

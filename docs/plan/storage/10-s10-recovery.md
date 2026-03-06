@@ -140,12 +140,10 @@ The storage engine itself does NOT interpret most WAL records — it passes them
 - All other record types: passed to `handler.handle_record()`.
 
 The handler (provided by Layer 6 Database) interprets domain-specific records:
-- `TxCommit (0x01)`: redo mutations to primary B-tree + secondary indexes
-- `CreateCollection (0x03)`: update catalog B-tree
-- `DropCollection (0x04)`: update catalog B-tree
-- `CreateIndex (0x05)`: update catalog B-tree
-- `DropIndex (0x06)`: update catalog B-tree
-- `IndexReady (0x07)`: transition index state
+- `TxCommit (0x01)`: redo data mutations to primary B-tree + secondary indexes,
+  AND apply any catalog mutations (create/drop collection/index) embedded in the
+  same record — catalog DDL is transactional and part of TxCommit
+- `IndexReady (0x07)`: transition index state (Building → Ready)
 - `Vacuum (0x08)`: remove entries (idempotent)
 
 ### In-Memory Backend

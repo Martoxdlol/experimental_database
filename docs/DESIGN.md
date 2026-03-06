@@ -557,31 +557,58 @@ All WAL record payloads use a compact binary encoding. Multi-byte integers are *
 
 | Code | Name | Scope | Description |
 |------|------|-------|-------------|
-| `0x01` | `TxCommit` | per-database | Transaction commit with mutations and index deltas |
+| `0x01` | `TxCommit` | per-database | Transaction commit with mutations, index deltas, and catalog mutations (DDL) |
 | `0x02` | `Checkpoint` | per-database | Marks a successful checkpoint |
-| `0x03` | `CreateCollection` | per-database | New collection created |
-| `0x04` | `DropCollection` | per-database | Collection dropped |
-| `0x05` | `CreateIndex` | per-database | New secondary index created |
-| `0x06` | `DropIndex` | per-database | Index dropped |
+| `0x03`–`0x06` | *(reserved)* | — | Formerly separate DDL records; now part of `TxCommit` |
 | `0x07` | `IndexReady` | per-database | Index build completed (`Building` → `Ready`) |
 | `0x08` | `Vacuum` | per-database | Old document versions removed |
 | `0x10` | `CreateDatabase` | system | New database created (`_system` WAL only) |
 | `0x11` | `DropDatabase` | system | Database dropped (`_system` WAL only) |
 
-Types `0x10`–`0x11` are only written to the `_system` database WAL. Types `0x01`–`0x08` are written to per-database WALs. Codes `0x09`–`0x0F` and `0x12`–`0xFF` are reserved for future use.
+Types `0x10`–`0x11` are only written to the `_system` database WAL. Types `0x01`–`0x08` are written to per-database WALs. Codes `0x09`–`0x0F` and `0x12`–`0xFF` are reserved for future use. Catalog DDL (create/drop collection/index) is embedded in the `TxCommit` record to ensure atomicity with data mutations within the same transaction.
 
 ---
 
 **`TxCommit` (0x01)**
 
 ```
-tx_id:                u64
-commit_ts:            u64
-mutation_count:       u32
-mutations:            Mutation[mutation_count]
-index_delta_count:    u32
-index_deltas:         IndexDelta[index_delta_count]
+tx_id:                    u64
+commit_ts:                u64
+catalog_mutation_count:   u32
+catalog_mutations:        CatalogMutation[catalog_mutation_count]
+mutation_count:            u32
+mutations:                 Mutation[mutation_count]
+index_delta_count:         u32
+index_deltas:              IndexDelta[index_delta_count]
 ```
+
+**CatalogMutation** (variable length):
+
+```
+op_type:         u8       (0x01 = CreateCollection, 0x02 = DropCollection,
+                            0x03 = CreateIndex, 0x04 = DropIndex)
+
+[if CreateCollection]:
+  collection_id: u64
+  name_len:      u16
+  name:          [u8; name_len]   (UTF-8)
+
+[if DropCollection]:
+  collection_id: u64
+
+[if CreateIndex]:
+  index_id:       u64
+  collection_id:  u64
+  name_len:       u16
+  name:           [u8; name_len]   (UTF-8)
+  field_count:    u8
+  field_paths:    FieldPath[field_count]
+
+[if DropIndex]:
+  index_id:       u64
+```
+
+Catalog mutations are applied **before** data mutations during both commit and WAL replay, so that newly created collections exist before documents are inserted into them.
 
 **Mutation**:
 
@@ -641,51 +668,7 @@ Marks that all WAL records with `LSN < checkpoint_lsn` have been fully materiali
 
 ---
 
-**`CreateCollection` (0x03)**
-
-```
-collection_id:  u64
-name_len:       u16
-name:           [u8; name_len]   (UTF-8)
-```
-
----
-
-**`DropCollection` (0x04)**
-
-```
-collection_id:  u64
-```
-
----
-
-**`CreateIndex` (0x05)**
-
-```
-index_id:         u64
-collection_id:    u64
-name_len:         u16
-name:             [u8; name_len]   (UTF-8)
-field_count:      u8
-field_paths:      FieldPath[field_count]
-```
-
-Where each `FieldPath`:
-
-```
-segment_count:  u8
-segments:       (u16 len + [u8; len])[segment_count]
-```
-
-Example: field path `["user", "email"]` → `segment_count = 2`, segments = `[{4, "user"}, {5, "email"}]`.
-
----
-
-**`DropIndex` (0x06)**
-
-```
-index_id:  u64
-```
+*Record types 0x03–0x06 (formerly separate CreateCollection, DropCollection, CreateIndex, DropIndex) are now embedded as `CatalogMutation` entries within `TxCommit` records. See the `TxCommit` format above.*
 
 ---
 
@@ -771,7 +754,7 @@ WAL writes are serialized through a **single-writer committer** (see 5.10). This
 
 **Throughput**: group commit transforms O(N) fsyncs into O(1) per batch. On NVMe storage with concurrent load, typical batches contain 10–100+ transactions per fsync.
 
-**Non-transaction records** (`CreateCollection`, `CreateIndex`, etc.) follow the same write path. They are enqueued, batched, and fsynced identically to `TxCommit` records.
+**Catalog DDL** (create/drop collection/index) is included within `TxCommit` records as `CatalogMutation` entries. All WAL records (`TxCommit`, `IndexReady`, `Vacuum`, etc.) follow the same write path — they are enqueued, batched, and fsynced identically.
 
 #### 2.8.7 Segment Rollover
 
@@ -893,9 +876,7 @@ On startup after a crash:
 3. Open `data.db` — all pages are now at least as recent as the checkpoint (torn pages repaired by step 2).
 4. Open WAL, locate the segment containing `checkpoint_lsn` (see 2.8.1), scan forward.
 5. For each WAL record (verified by CRC-32C per 2.8.3), replay by type:
-   - `TxCommit`: redo mutations — insert document versions into the primary B-tree; apply `IndexDelta` entries to secondary indexes via the buffer pool.
-   - `CreateCollection` / `DropCollection`: update the catalog B-tree and in-memory cache.
-   - `CreateIndex` / `DropIndex`: update the catalog B-tree and in-memory cache.
+   - `TxCommit`: first apply any `CatalogMutation` entries (create/drop collection/index — update catalog B-tree and in-memory cache), then redo data mutations — insert document versions into the primary B-tree; apply `IndexDelta` entries to secondary indexes via the buffer pool.
    - `IndexReady`: transition index state from `Building` to `Ready` in the catalog.
    - `Vacuum`: remove listed document versions and index keys (idempotent).
    - `Checkpoint`: no-op during replay (informational only).
@@ -1028,40 +1009,44 @@ Where `entity_id` is `collection_id` or `index_id` as big-endian u64.
 | `root_page` | `u32` | Root page of the secondary index B-tree |
 | `state` | `u8` | `Building` (0x01), `Ready` (0x02), `Dropping` (0x03) |
 
-**WAL record types** (per-database catalog — see section 2.8.5 for full binary layouts):
+**WAL record types** (per-database catalog):
+
+Catalog DDL is embedded in `TxCommit` records as `CatalogMutation` entries (see section 2.8.5). The only standalone catalog WAL record is:
 
 | Type | Code | Key Payload Fields |
 |------|------|--------------------|
-| `CreateCollection` | `0x03` | `collection_id`, `name` |
-| `DropCollection` | `0x04` | `collection_id` |
-| `CreateIndex` | `0x05` | `index_id`, `collection_id`, `name`, `field_paths` |
-| `DropIndex` | `0x06` | `index_id` |
 | `IndexReady` | `0x07` | `index_id` |
 
-**Lifecycle** (create collection):
+**Lifecycle** (create collection — transactional):
 
-1. Assign `collection_id` (monotonic within database).
-2. Allocate two new pages: one for the primary B-tree root (empty leaf), one for the `_created_at` index root (empty leaf).
-3. Write `CreateCollection` WAL record (2.8.5).
-4. Insert collection entry into the catalog B-tree via the buffer pool.
-5. Update in-memory cache.
+1. `tx.create_collection("name")`: allocate provisional `collection_id` from atomic counter, buffer `CatalogMutation::CreateCollection` in write set.
+2. Within the same transaction, the caller can immediately insert documents using the provisional collection ID.
+3. At commit time (inside CommitCoordinator):
+   a. Allocate two new pages: primary B-tree root (empty leaf) + `_created_at` index root (empty leaf).
+   b. Write `TxCommit` WAL record containing both the `CatalogMutation` and any data mutations.
+   c. Insert collection entry into the catalog B-tree via the buffer pool.
+   d. Update in-memory cache.
+   e. Apply data mutations.
 
-**Lifecycle** (create index):
+**Lifecycle** (create index — transactional):
 
-1. Assign `index_id` (monotonic within database).
-2. Allocate a new page for the secondary index B-tree root (empty leaf).
-3. Write `CreateIndex` WAL record (2.8.5).
-4. Insert index entry into the catalog B-tree with `state = Building`.
-5. Update in-memory cache.
-6. Begin background index build (see section 3.7).
-7. On completion: write `IndexReady` WAL record (2.8.5), update catalog entry to `state = Ready`.
+1. `tx.create_index(...)`: allocate provisional `index_id`, buffer `CatalogMutation::CreateIndex` in write set.
+2. At commit time:
+   a. Allocate a new page for the secondary index B-tree root (empty leaf).
+   b. Write `TxCommit` WAL record containing the `CatalogMutation`.
+   c. Insert index entry into the catalog B-tree with `state = Building`.
+   d. Update in-memory cache.
+3. After commit: begin background index build (see section 3.7).
+4. On build completion: write `IndexReady` WAL record (2.8.5), update catalog entry to `state = Ready`.
 
-**Lifecycle** (drop collection):
+**Lifecycle** (drop collection — transactional):
 
-1. Write `DropCollection` WAL record.
-2. Remove collection entry and all associated index entries from catalog B-tree.
-3. Reclaim all pages belonging to the collection's B-trees (primary + secondary indexes) via the free page list.
-4. Update in-memory cache.
+1. `tx.drop_collection("name")`: buffer `CatalogMutation::DropCollection` in write set.
+2. At commit time:
+   a. Write `TxCommit` WAL record containing the `CatalogMutation`.
+   b. Remove collection entry and all associated index entries from catalog B-tree.
+   c. Reclaim all pages belonging to the collection's B-trees (primary + secondary indexes) via the free page list.
+   d. Update in-memory cache.
 
 **Per-database startup sequence**:
 
@@ -1095,7 +1080,7 @@ Page 0 of every `data.db` file is reserved as the **file header**. It uses a fix
 └──────────────────────────────────────────┘
 ```
 
-The file header is updated during checkpointing (page count, free list head, checkpoint LSN) and during catalog mutations (catalog root page, ID allocators). Updates go through the buffer pool like any other page — the header page is pinned, modified, marked dirty, and flushed during checkpoint.
+The file header is updated during checkpointing (page count, free list head, checkpoint LSN) and during transactional catalog mutations at commit time (catalog root page, ID allocators). Updates go through the buffer pool like any other page — the header page is pinned, modified, marked dirty, and flushed during checkpoint.
 
 #### 2.12.4 In-Memory Catalog Cache
 

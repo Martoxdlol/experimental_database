@@ -13,7 +13,7 @@
 └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
 ├─────────────────────────────────────────────────────────┤
 │  Layer 6: Database Instance                             │
-│  (lifecycle, collections, indexes, transactions,        │
+│  (lifecycle, transactional DDL, transactions,           │
 │   catalog cache, replication hook trait, config)        │
 ├─────────────────────────────────────────────────────────┤
 │  Layer 5: Transaction Manager                           │
@@ -42,9 +42,10 @@ The database is designed as an **embedded library first**. The `Database` struct
 ```rust
 // Embedded usage — no server, no network, no Layer 7 or 8
 let db = Database::open("./mydata", config, None).await?;
-db.create_collection("users")?;
 
+// DDL is transactional — create collection + insert in one atomic commit
 let mut tx = db.begin_mutation()?;
+tx.create_collection("users")?;
 let id = tx.insert("users", json!({"name": "Alice"}))?;
 tx.commit(CommitOptions::default()).await?;
 
@@ -134,7 +135,7 @@ This enables `Database::open_in_memory()` at L6 for testing, temporary data, and
 
 | From → To | Interface | Data Exchanged |
 |-----------|-----------|---------------|
-| L8 → L6 | `Database`, `SystemDatabase` | all client operations (begin, insert, query, commit, etc.) |
+| L8 → L6 | `Database`, `SystemDatabase` | all client operations (begin, insert, query, commit, DDL, etc.) |
 | L6 → L5 | `CommitHandle`, `TsAllocator` | commit requests, timestamp allocation |
 | L6 → L3 | `PrimaryIndex`, `SecondaryIndex` | index handle management |
 | L6 → L2 | `StorageEngine` | lifecycle, catalog B-tree access |

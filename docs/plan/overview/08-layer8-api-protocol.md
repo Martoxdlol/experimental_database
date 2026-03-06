@@ -54,6 +54,8 @@ pub enum ClientMessage {
     Begin { database: String, readonly: bool, subscribe: bool, notify: bool },
     Commit { tx: TxId },
     Rollback { tx: TxId },
+
+    // --- Document operations (require active transaction) ---
     Insert { tx: TxId, collection: String, body: serde_json::Value },
     Get { tx: TxId, collection: String, doc_id: String },
     Replace { tx: TxId, collection: String, doc_id: String, body: serde_json::Value },
@@ -62,16 +64,21 @@ pub enum ClientMessage {
     Query { tx: TxId, collection: String, index: String,
             range: Vec<serde_json::Value>, filter: Option<serde_json::Value>,
             order: Option<String>, limit: Option<usize> },
+
+    // --- Collection/index DDL (require active mutation transaction) ---
+    // These are transactional: buffered in write set, applied at commit.
+    CreateCollection { tx: TxId, name: String },
+    DropCollection { tx: TxId, name: String },
+    ListCollections { tx: TxId },
+    CreateIndex { tx: TxId, collection: String, fields: Vec<serde_json::Value>,
+                  name: Option<String> },
+    DropIndex { tx: TxId, collection: String, name: String },
+    ListIndexes { tx: TxId, collection: String },
+
+    // --- Database management (not transactional — operates on SystemDatabase) ---
     CreateDatabase { name: String, config: Option<serde_json::Value> },
     DropDatabase { name: String },
     ListDatabases,
-    CreateCollection { database: String, name: String },
-    DropCollection { database: String, name: String },
-    ListCollections { database: String },
-    CreateIndex { database: String, collection: String, fields: Vec<serde_json::Value>,
-                  name: Option<String> },
-    DropIndex { database: String, collection: String, name: String },
-    ListIndexes { database: String, collection: String },
 }
 
 pub enum ServerMessage {

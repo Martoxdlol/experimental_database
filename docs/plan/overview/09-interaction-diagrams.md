@@ -227,8 +227,8 @@ Primary(L6)      PrimaryReplicator(L7)    Network         ReplicaClient(L7)    R
                     | WAL Replay   |  from checkpoint_lsn
                     |              |  forward:
                     | TxCommit ->  |  redo B-tree mutations
-                    | CreateColl ->|  update catalog B-tree
-                    | CreateIdx -> |  update catalog B-tree
+                    |              |  + catalog mutations
+                    |              |  (create/drop coll/idx)
                     | IndexReady ->|  Building -> Ready
                     | Vacuum ->    |  remove old versions
                     | Checkpoint ->|  no-op
@@ -261,19 +261,22 @@ Caller                          Database(L6)
   |                                |  recovery + catalog load + start tasks
   |<--Ok(Database)----------------|
   |                                |
-  |--create_collection("users")->|  WAL + catalog B-tree + cache
-  |<--Ok(CollectionId)-----------|
-  |                                |
   |--begin_mutation()----------->|  allocate begin_ts
   |<--Ok(MutationTransaction)----|
   |                                |
-  |--tx.insert("users", doc)---->|  buffer in write set
+  |--tx.create_collection------->|  buffer CatalogMutation in write set,
+  |      ("users")                |  return provisional CollectionId
+  |<--Ok(CollectionId)-----------|
+  |                                |
+  |--tx.insert("users", doc)---->|  resolve name via write set (pending create),
+  |                                |  buffer in write set
   |<--Ok(DocId)------------------|
   |                                |
   |--tx.get("users", &id)------->|  read-your-writes from write set
   |<--Ok(Some(doc))--------------|
   |                                |
-  |--tx.commit(opts)------------->|  OCC + WAL + materialize + replicate
+  |--tx.commit(opts)------------->|  OCC + WAL + catalog apply +
+  |                                |  data materialize + replicate
   |<--CommitResult::Success------|
   |                                |
   |--begin_readonly()----------->|  snapshot at visible_ts
@@ -301,13 +304,19 @@ Client              Session(L8)       Database(L6)
   |                     |<--tx-------------|
   |<--ok(tx:1)----------|                  |
   |                     |                  |
+  |--create_collection->|                  |
+  |   (tx:1,"users")   |--tx.create_coll->|  buffer CatalogMutation
+  |                     |<--coll_id--------|
+  |<--ok(coll_id)-------|                  |
+  |                     |                  |
   |--insert(tx:1,...)-->|                  |
   |                     |--tx.insert----->|  buffer in write set
   |                     |<--doc_id--------|
   |<--ok(doc_id)--------|                  |
   |                     |                  |
   |--commit(tx:1)------>|                  |
-  |                     |--tx.commit----->|  OCC + WAL + materialize
+  |                     |--tx.commit----->|  OCC + WAL + catalog +
+  |                     |                  |  materialize + replicate
   |                     |<--CommitResult--|
   |<--ok(commit_ts:42)--|                  |
   |                     |                  |
@@ -318,39 +327,64 @@ Client              Session(L8)       Database(L6)
   |                     |                  |  remove subscriptions
 ```
 
-## 9. Create Collection Flow
+## 9. Create Collection Flow (Transactional)
 
+Collection creation is a transactional operation. It goes through two phases:
+**buffering** (when `tx.create_collection()` is called) and **apply** (at commit time).
+
+### Phase 1: Buffer (tx.create_collection)
 ```
-Caller          Database(L6)    CatalogCache    WAL(L2)     StorageEngine(L2)    CatalogBTree(L2)
-   |               |               |             |               |                   |
-   |--create_coll->|               |             |               |                   |
-   |               |               |             |               |                   |
-   |               | 1. Assign collection_id     |               |                   |
-   |               |---next_id---->|             |               |                   |
-   |               |<--id----------|             |               |                   |
-   |               |               |             |               |                   |
-   |               | 2. Allocate pages           |               |                   |
-   |               |-----------------------------------create_btree()-->|             |
-   |               |   (primary root = empty leaf)     |<--root1------|             |
-   |               |-----------------------------------create_btree()-->|             |
-   |               |   (_created_at root)              |<--root2------|             |
-   |               |               |             |               |                   |
-   |               | 3. WAL record               |               |                   |
-   |               |------------------append---->|               |                   |
-   |               |   CreateCollection          |               |                   |
-   |               |<-----------------lsn--------|               |                   |
-   |               |               |             |               |                   |
-   |               | 4. Catalog B-tree insert    |               |                   |
-   |               |------------------------------------------------------insert---->|
-   |               |   by-id key + entry         |               |                   |
-   |               |------------------------------------------------------insert---->|
-   |               |   by-name key + id          |               |                   |
-   |               |               |             |               |                   |
-   |               | 5. Update in-memory cache   |               |                   |
-   |               |--add_coll---->|             |               |                   |
-   |               |               |             |               |                   |
-   |<--ok----------|               |             |               |                   |
+Caller          MutationTx(L6)    CatalogCache    WriteSet(L5)
+   |               |                  |               |
+   |--tx.create--->|                  |               |
+   |  _collection  |                  |               |
+   |  ("users")    |                  |               |
+   |               | 1. Check: name not in committed catalog
+   |               |---get_by_name--->|               |
+   |               |<--None-----------|               |
+   |               |                  |               |
+   |               | 2. Check: name not in pending creates
+   |               |---resolve_pending_collection---->|
+   |               |<--None---------------------------|
+   |               |                  |               |
+   |               | 3. Allocate provisional ID       |
+   |               |---next_coll_id-->|               |
+   |               |<--id------------|               |
+   |               |                  |               |
+   |               | 4. Buffer CatalogMutation        |
+   |               |---add_catalog_mutation---------->|
+   |               |   CreateCollection{name, id}     |
+   |               |                  |               |
+   |<--Ok(id)------|                  |               |
 ```
+
+### Phase 2: Apply (at commit, inside CommitCoordinator step 4a)
+```
+CommitCoord(L5)    StorageEngine(L2)    CatalogBTree(L2)    CatalogCache(L6)
+   |                    |                    |                   |
+   | For each CatalogMutation::CreateCollection:                |
+   |                    |                    |                   |
+   | 1. Allocate B-tree pages               |                   |
+   |---create_btree()-->|                    |                   |
+   |   (primary root)   |                    |                   |
+   |<--root1------------|                    |                   |
+   |---create_btree()-->|                    |                   |
+   |   (_created_at)    |                    |                   |
+   |<--root2------------|                    |                   |
+   |                    |                    |                   |
+   | 2. Catalog B-tree insert               |                   |
+   |--------------------------------------insert--------------->|
+   |   by-id key + entry                    |                   |
+   |--------------------------------------insert--------------->|
+   |   by-name key + id                     |                   |
+   |                    |                    |                   |
+   | 3. Update in-memory cache              |                   |
+   |--------------------------------------------------add_coll->|
+   |                    |                    |                   |
+   | (then proceed to step 4b: apply data mutations)            |
+```
+
+Note: The WAL record for the entire commit (step 3 of the commit protocol) includes both catalog mutations and data mutations in a single `TxCommit` record. On recovery, WAL replay re-executes both phases.
 
 ## 10. Document Insert: Layer 2 vs Layer 3 Boundary
 

@@ -68,19 +68,14 @@ impl Database {
     /// Returns error if replication hook reports no quorum or hold state.
     pub fn begin_mutation(&self) -> Result<MutationTransaction>;
 
-    // --- Collection Management ---
+    // --- Read-Only Catalog Access (outside transactions) ---
+    // These are convenience methods that read the current committed catalog state.
+    // They do NOT record catalog reads for OCC — use the transaction methods
+    // when catalog consistency with other operations is required.
 
-    pub fn create_collection(&self, name: &str) -> Result<CollectionId>;
-    pub fn drop_collection(&self, name: &str) -> Result<()>;
     pub fn list_collections(&self) -> Vec<CollectionMeta>;
     pub fn get_collection_by_name(&self, name: &str) -> Option<CollectionMeta>;
     pub fn get_collection_by_id(&self, id: CollectionId) -> Option<CollectionMeta>;
-
-    // --- Index Management ---
-
-    pub fn create_index(&self, collection: &str, name: &str,
-                        fields: Vec<FieldPath>) -> Result<IndexId>;
-    pub fn drop_index(&self, collection: &str, name: &str) -> Result<()>;
     pub fn list_indexes(&self, collection: &str) -> Vec<IndexMeta>;
     pub fn get_index_by_name(&self, collection_id: CollectionId,
                               name: &str) -> Option<IndexMeta>;
@@ -120,10 +115,17 @@ impl<'db> ReadonlyTransaction<'db> {
                  range: &[RangeExpr], filter: Option<&Filter>,
                  order: Option<ScanDirection>, limit: Option<usize>)
         -> Result<Vec<Document>>;
+
+    // --- Catalog reads (recorded in read set for subscriptions) ---
+    pub fn list_collections(&mut self) -> Vec<CollectionMeta>;
+    pub fn list_indexes(&mut self, collection: &str) -> Vec<IndexMeta>;
+
     pub fn rollback(self);  // explicit discard (also happens on drop)
 }
 
-/// Read-write transaction — OCC with write buffering
+/// Read-write transaction — OCC with write buffering.
+/// Supports both document mutations and catalog DDL operations.
+/// All operations are buffered and applied atomically at commit time.
 pub struct MutationTransaction<'db> {
     db: &'db Database,
     begin_ts: Ts,
@@ -132,6 +134,8 @@ pub struct MutationTransaction<'db> {
 }
 
 impl<'db> MutationTransaction<'db> {
+    // --- Document Operations ---
+
     pub fn insert(&mut self, collection: &str, body: serde_json::Value) -> Result<DocId>;
     pub fn replace(&mut self, collection: &str, doc_id: &DocId,
                    body: serde_json::Value) -> Result<()>;
@@ -143,6 +147,35 @@ impl<'db> MutationTransaction<'db> {
                  range: &[RangeExpr], filter: Option<&Filter>,
                  order: Option<ScanDirection>, limit: Option<usize>)
         -> Result<Vec<Document>>;
+
+    // --- Collection Management (DDL) ---
+    // These buffer CatalogMutation entries in the write set.
+    // Applied atomically with document mutations at commit time.
+
+    /// Create a collection. Returns a provisional CollectionId that can be
+    /// used immediately for inserts within this same transaction.
+    /// The ID is allocated eagerly from the atomic counter; on abort it is
+    /// simply never committed (harmless gap in the ID sequence).
+    pub fn create_collection(&mut self, name: &str) -> Result<CollectionId>;
+
+    /// Drop a collection. All documents in the collection become inaccessible
+    /// after commit. Records a CatalogRead::CollectionByName for OCC.
+    pub fn drop_collection(&mut self, name: &str) -> Result<()>;
+
+    // --- Index Management (DDL) ---
+
+    /// Create a secondary index. The index starts in Building state after commit.
+    /// A background task performs the backfill scan, then transitions to Ready.
+    pub fn create_index(&mut self, collection: &str, name: &str,
+                        fields: Vec<FieldPath>) -> Result<IndexId>;
+
+    /// Drop an index. The index is marked Dropping at commit time and
+    /// cleaned up by a background task.
+    pub fn drop_index(&mut self, collection: &str, name: &str) -> Result<()>;
+
+    // --- Catalog reads (recorded in read set for OCC) ---
+    pub fn list_collections(&mut self) -> Vec<CollectionMeta>;
+    pub fn list_indexes(&mut self, collection: &str) -> Vec<IndexMeta>;
 
     /// Commit the transaction (OCC validate + persist + materialize)
     pub async fn commit(self, options: CommitOptions) -> CommitResult;
@@ -333,9 +366,9 @@ pub struct TransactionConfig {
 // File-backed (durable) — data persists across restarts
 let db = Database::open("./mydata", DatabaseConfig::default(), None).await?;
 
-db.create_collection("users")?;
-
+// Create collection + insert documents atomically in one transaction
 let mut tx = db.begin_mutation()?;
+tx.create_collection("users")?;
 let id = tx.insert("users", json!({"name": "Alice", "age": 30}))?;
 let doc = tx.get("users", &id)?;
 tx.commit(CommitOptions::default()).await?;
@@ -350,20 +383,35 @@ db.close().await?;
 // In-memory (ephemeral) — no files, no I/O, data lost on close
 let db = Database::open_in_memory(DatabaseConfig::default(), None).await?;
 
-db.create_collection("cache")?;
 let mut tx = db.begin_mutation()?;
+tx.create_collection("cache")?;
 tx.insert("cache", json!({"key": "session_123", "data": "..."}))?;
 tx.commit(CommitOptions::default()).await?;
 // Same API — everything works, just no disk persistence
+```
+
+```rust
+// DDL and data in separate transactions also works
+let mut tx = db.begin_mutation()?;
+tx.create_collection("orders")?;
+tx.create_index("orders", "by_customer", vec![FieldPath::single("customer_id")])?;
+tx.commit(CommitOptions::default()).await?;
+
+let mut tx = db.begin_mutation()?;
+tx.insert("orders", json!({"customer_id": "c1", "total": 99.99}))?;
+tx.commit(CommitOptions::default()).await?;
 ```
 
 ## Startup Sequence (Embedded)
 
 ```
 1. StorageEngine::open() — includes DWB restore + WAL replay internally
+   (WAL replay handles TxCommit records that include catalog mutations:
+    allocate pages, update catalog B-tree — same as runtime commit step 4a)
 2. Scan catalog B-tree → build CatalogCache
 3. Open primary + secondary index B-tree handles
 4. Rollback vacuum: if committed ts > visible_ts, clean up un-replicated entries via WAL scan
+   (includes reverting catalog mutations from rolled-back commits)
 5. Create CommitCoordinator with ReplicationHook (or NoReplication)
 6. Start CommitCoordinator task
 7. Start checkpoint background task
@@ -384,13 +432,40 @@ tx.commit(CommitOptions::default()).await?;
 
 Note: Hold state is preserved across restart via `visible_ts` in the FileHeader. If the database shuts down while in hold state (quorum lost during commit), the persisted `visible_ts` will be behind the committed ts. On next startup, the rollback vacuum step (step 4) detects this gap and cleans up the un-replicated entries.
 
+## Transactional DDL
+
+Collection and index management (create, drop) are transactional operations performed within a `MutationTransaction`. This means:
+
+1. **Atomicity**: DDL and data mutations in the same transaction are applied or rolled back together. You can create a collection and insert documents into it in a single atomic commit.
+2. **Isolation**: Concurrent transactions that read the catalog (e.g., resolving a collection name for an insert) are validated against DDL commits via OCC. A transaction that read "users" exists will conflict if another transaction drops "users" concurrently.
+3. **Serialization**: All DDL flows through the `CommitCoordinator`'s single-writer loop, so catalog updates never race with each other or with data mutations.
+
+### Provisional IDs
+
+When `tx.create_collection("users")` is called, a `CollectionId` is allocated eagerly from the atomic counter and returned immediately. This allows the transaction to insert documents into the new collection before committing. On abort, the ID is simply never committed — a harmless gap in the ID sequence.
+
+Within the transaction, collection name resolution checks pending `CatalogMutation::CreateCollection` entries in the write set first, then falls back to the committed `CatalogCache`.
+
+### Catalog Read Tracking
+
+When a transaction resolves a collection or index name (e.g., `tx.insert("users", ...)` looks up "users" → CollectionId), a `CatalogRead::CollectionByName("users")` is recorded in the read set. At OCC validation, this is checked against concurrent commits' `CatalogMutation` entries:
+
+- `CatalogRead::CollectionByName("X")` conflicts with `CreateCollection{name: "X"}` or `DropCollection{name: "X"}` in any concurrent commit.
+- `CatalogRead::ListCollections` conflicts with **any** collection create or drop in any concurrent commit.
+- Index reads follow the same pattern scoped to a collection.
+
+This is conservative but correct, and DDL is rare enough that false conflicts are negligible.
+
 ## Catalog Consistency Invariant
 
-The in-memory `CatalogCache` is always consistent with the catalog B-tree. Both are updated atomically within the same commit path:
+The in-memory `CatalogCache` is always consistent with the catalog B-tree. Both are updated atomically within the commit coordinator's apply step (step 4a):
 
-1. WAL record written and fsynced
+1. WAL record written and fsynced (includes catalog mutations)
 2. Catalog B-tree updated via buffer pool
 3. In-memory cache updated
+4. Data mutations applied (step 4b)
+
+Since all catalog updates go through the single-writer commit coordinator, the CatalogCache RwLock only needs to serialize reads against the commit coordinator's writes — no concurrent DDL writers exist.
 
 If crash between steps 2 and 3: WAL replay reconstructs the B-tree, cache rebuilt on startup.
 
@@ -411,8 +486,8 @@ The file header (page 0) stores the root pages of both catalog B-trees.
 |-----------|---------|---------|
 | `Database::open/close` | L7 (replication), L8 (server) | Lifecycle |
 | `Database::begin_readonly/begin_mutation` | L8 (session) | Transaction access |
-| `Database::create/drop_collection` | L8 (session) | Schema management |
-| `Database::create/drop_index` | L8 (session) | Index management |
+| `MutationTransaction::create/drop_collection` | L8 (session) | Transactional schema management |
+| `MutationTransaction::create/drop_index` | L8 (session) | Transactional index management |
 | `Database::subscriptions()` | L8 (push notifications) | Subscription access |
 | `Database::storage()` | L7 (WAL streaming) | Storage access for replication |
 | `ReplicationHook` trait | L7 (implements) | Replication callback |

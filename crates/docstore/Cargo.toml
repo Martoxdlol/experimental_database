@@ -6,3 +6,8 @@ edition.workspace = true
 [dependencies]
 exdb-core = { workspace = true }
 exdb-storage = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["sync", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }

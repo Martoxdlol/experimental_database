@@ -1345,6 +1345,8 @@ version = "0.1.0"
 dependencies = [
  "exdb-core",
  "exdb-storage",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -37,6 +37,7 @@ pub fn ConsoleModule() -> Element {
         "freelist" => vec!["walk", "allocate", "deallocate"],
         "heap" => vec!["load", "store", "free"],
         "catalog" => vec!["list", "create_collection", "drop_collection", "create_index", "drop_index"],
+        "docstore" => vec!["scan", "versions", "decode_key", "encode_key", "secondary_scan"],
         _ => vec![],
     };
 
@@ -64,6 +65,7 @@ pub fn ConsoleModule() -> Element {
                                 option { value: "freelist", "freelist" }
                                 option { value: "heap", "heap" }
                                 option { value: "catalog", "catalog" }
+                                option { value: "docstore", "docstore" }
                             }
                         }
                         div {
@@ -388,6 +390,81 @@ fn execute_command(
             db.catalog_drop_index(idx_id)
                 .map(|_| format!("Dropped index #{idx_id}"))
                 .map_err(|e| e.to_string())
+        }
+        ("docstore", "scan") => {
+            let root = p1.parse::<u32>().map_err(|_| "Invalid root page in param1".to_string())?;
+            let read_ts = if p2.is_empty() || p2 == "max" {
+                u64::MAX
+            } else {
+                p2.parse::<u64>().map_err(|_| "Invalid read_ts in param2".to_string())?
+            };
+            let entries = db.docstore_scan(root, read_ts, 50).map_err(|e| e.to_string())?;
+            if entries.is_empty() {
+                Ok("No visible documents".into())
+            } else {
+                let lines: Vec<String> = entries.iter().map(|e| {
+                    let body = e.body_json.as_deref().unwrap_or("(binary)");
+                    let short = if body.len() > 60 { &body[..60] } else { body };
+                    format!("  {} ts={} {}", &e.doc_id_hex[..8.min(e.doc_id_hex.len())], e.version_ts, short)
+                }).collect();
+                Ok(format!("{} documents:\n{}", entries.len(), lines.join("\n")))
+            }
+        }
+        ("docstore", "versions") => {
+            // p1 = "root:doc_id_hex"
+            let parts: Vec<&str> = p1.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                return Err("Format: root_page:doc_id_hex".into());
+            }
+            let root = parts[0].parse::<u32>().map_err(|_| "Invalid root page".to_string())?;
+            let versions = db.docstore_versions(root, parts[1]).map_err(|e| e.to_string())?;
+            if versions.is_empty() {
+                Ok("No versions found".into())
+            } else {
+                let lines: Vec<String> = versions.iter().map(|v| {
+                    let marker = if v.is_tombstone { " [TOMBSTONE]" } else { "" };
+                    format!("  ts={}{} {}", v.ts, marker, v.body_preview)
+                }).collect();
+                Ok(format!("{} versions:\n{}", versions.len(), lines.join("\n")))
+            }
+        }
+        ("docstore", "decode_key") => {
+            let mode = if p2.is_empty() { "auto" } else { p2 };
+            db.decode_key_bytes(p1, mode).map_err(|e| e.to_string())
+        }
+        ("docstore", "encode_key") => {
+            // p1 = doc_id_hex, p2 = ts
+            let key = db.encode_key_bytes("primary", p1, p2, "")
+                .map_err(|e| e.to_string())?;
+            Ok(key)
+        }
+        ("docstore", "secondary_scan") => {
+            // p1 = "sec_root:primary_root", p2 = "scalars_json:read_ts"
+            let parts: Vec<&str> = p1.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                return Err("Format param1: sec_root:primary_root".into());
+            }
+            let sec_root = parts[0].parse::<u32>().map_err(|_| "Invalid sec_root".to_string())?;
+            let primary_root = parts[1].parse::<u32>().map_err(|_| "Invalid primary_root".to_string())?;
+
+            let parts2: Vec<&str> = p2.rsplitn(2, ':').collect();
+            let (scalars_json, read_ts) = if parts2.len() == 2 {
+                let ts = parts2[0].parse::<u64>().unwrap_or(u64::MAX);
+                (parts2[1], ts)
+            } else {
+                (p2, u64::MAX)
+            };
+
+            let hits = db.secondary_scan(sec_root, primary_root, scalars_json, read_ts, 50)
+                .map_err(|e| e.to_string())?;
+            if hits.is_empty() {
+                Ok("No results".into())
+            } else {
+                let lines: Vec<String> = hits.iter().map(|h| {
+                    format!("  {} ts={}", &h.doc_id_hex[..8.min(h.doc_id_hex.len())], h.version_ts)
+                }).collect();
+                Ok(format!("{} hits:\n{}", hits.len(), lines.join("\n")))
+            }
         }
         _ => Err(format!("Unknown command: {target}.{method}")),
     }

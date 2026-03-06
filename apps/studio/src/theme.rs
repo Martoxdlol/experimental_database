@@ -717,4 +717,69 @@ body {
 .page-link:hover {
     text-decoration: underline;
 }
+
+/* Layer Tab Bar */
+.layer-tabs {
+    display: flex;
+    gap: 0;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    padding: 0 8px;
+}
+
+.layer-tab {
+    padding: 6px 16px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.15s;
+    user-select: none;
+}
+
+.layer-tab:hover {
+    color: var(--text-primary);
+    background: rgba(122, 162, 247, 0.05);
+}
+
+.layer-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+}
+
+.layer-tab.disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+}
+
+/* Docstore badges */
+.tombstone-badge {
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: bold;
+    background: var(--page-deleted);
+    color: #fff;
+    margin-left: 6px;
+}
+
+.external-badge {
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: bold;
+    background: #bb9af7;
+    color: #000;
+    margin-left: 6px;
+}
+
+.scalar-tag {
+    padding: 1px 4px;
+    border-radius: 2px;
+    font-size: 10px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    margin-right: 4px;
+}
 "#;

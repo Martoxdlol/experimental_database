@@ -4,7 +4,7 @@ use std::sync::Arc;
 use dioxus::prelude::*;
 
 use crate::engine::DbHandle;
-use crate::state::{AppState, Module, OperationResult};
+use crate::state::{AppState, LayerTab, OperationResult};
 
 #[component]
 pub fn Toolbar() -> Element {
@@ -37,7 +37,7 @@ pub fn Toolbar() -> Element {
                                 match tokio::task::spawn_blocking(move || DbHandle::open(&path)).await {
                                     Ok(Ok(handle)) => {
                                         state.db.set(Some(Arc::new(handle)));
-                                        state.active_module.set(Module::Overview);
+                                        state.active_tab.set(LayerTab::Overview);
                                         state.breadcrumb.set(vec!["Database".to_string(), "Overview".to_string()]);
                                         state.write_enabled.set(false);
                                         state.last_result.set(Some(OperationResult::Success("Database opened".into())));
@@ -62,7 +62,7 @@ pub fn Toolbar() -> Element {
                                 match tokio::task::spawn_blocking(move || DbHandle::open(&path)).await {
                                     Ok(Ok(handle)) => {
                                         state.db.set(Some(Arc::new(handle)));
-                                        state.active_module.set(Module::Overview);
+                                        state.active_tab.set(LayerTab::Overview);
                                         state.breadcrumb.set(vec!["Database".to_string(), "Overview".to_string()]);
                                         state.write_enabled.set(true);
                                         state.last_result.set(Some(OperationResult::Success("New database created".into())));

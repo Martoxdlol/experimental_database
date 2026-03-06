@@ -1,7 +1,12 @@
 use std::io;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
+use exdb_core::types::{DocId, Scalar};
+use exdb_docstore::key_encoding;
+use exdb_docstore::{CellFlags, PrimaryIndex, SecondaryIndex};
+use exdb_storage::btree::ScanDirection;
 use exdb_storage::catalog_btree::{self, CatalogEntityType, CatalogIndexState};
 use exdb_storage::engine::{FileHeader, StorageConfig, StorageEngine};
 use exdb_storage::heap::HeapRef;
@@ -658,6 +663,458 @@ impl DbHandle {
     pub fn dirty_page_count(&self) -> usize {
         self.engine.buffer_pool().dirty_pages().len()
     }
+
+    // ─── L3 Docstore ───
+
+    fn make_primary_index(&self, root_page: u32) -> PrimaryIndex {
+        let btree = self.engine.open_btree(root_page);
+        PrimaryIndex::new(btree, self.engine.clone(), self.page_size / 2)
+    }
+
+    /// MVCC scan at read_ts, returning decoded documents.
+    pub fn docstore_scan(
+        &self,
+        root_page: u32,
+        read_ts: u64,
+        limit: usize,
+    ) -> io::Result<Vec<DocstoreEntry>> {
+        let primary = self.make_primary_index(root_page);
+        let scanner = primary.scan_at_ts(read_ts, ScanDirection::Forward);
+        let mut results = Vec::new();
+        for item in scanner {
+            let (doc_id, version_ts, body) = item?;
+            results.push(DocstoreEntry {
+                doc_id_hex: hex_encode(doc_id.as_bytes()),
+                version_ts,
+                is_tombstone: false,
+                is_external: false, // scan_at_ts resolves external refs
+                body_len: body.len() as u32,
+                body_json: decode_body_json(&body),
+            });
+            if results.len() >= limit {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
+    /// All versions of a single document (raw, no version resolution).
+    pub fn docstore_versions(
+        &self,
+        root_page: u32,
+        doc_id_hex: &str,
+    ) -> io::Result<Vec<VersionInfo>> {
+        let doc_id_bytes = parse_hex(doc_id_hex)
+            .ok_or_else(|| io::Error::other("invalid hex doc_id"))?;
+        if doc_id_bytes.len() != 16 {
+            return Err(io::Error::other("doc_id must be 16 bytes (32 hex chars)"));
+        }
+
+        // Scan the raw btree for keys with this doc_id prefix
+        let btree = self.engine.open_btree(root_page);
+        let mut prefix = [0u8; 16];
+        prefix.copy_from_slice(&doc_id_bytes);
+
+        let start = prefix.to_vec();
+        let mut end = prefix.to_vec();
+        // Increment last byte for exclusive upper bound
+        let mut i = end.len();
+        while i > 0 {
+            i -= 1;
+            if end[i] < 0xFF {
+                end[i] += 1;
+                break;
+            }
+            // overflow: set to 0 and carry
+            end[i] = 0;
+        }
+
+        let iter = btree.scan(
+            Bound::Included(start.as_slice()),
+            Bound::Excluded(end.as_slice()),
+            ScanDirection::Forward,
+        );
+
+        let mut versions = Vec::new();
+        for entry in iter {
+            let (key, value) = entry?;
+            if key.len() < 24 {
+                continue;
+            }
+            let (_, ts) = key_encoding::parse_primary_key(&key)
+                .map_err(io::Error::other)?;
+            let flags = CellFlags::from_byte(value[0]);
+            let body_preview = if flags.tombstone {
+                "(tombstone)".to_string()
+            } else if flags.external {
+                let body_len = u32::from_le_bytes(value[1..5].try_into().unwrap());
+                format!("(external, {} bytes)", body_len)
+            } else if value.len() > 5 {
+                let body = &value[5..];
+                match decode_body_json(body) {
+                    Some(json) => {
+                        if json.len() > 80 {
+                            format!("{}...", &json[..80])
+                        } else {
+                            json
+                        }
+                    }
+                    None => format!("{} bytes (binary)", body.len()),
+                }
+            } else {
+                "(empty)".to_string()
+            };
+            versions.push(VersionInfo {
+                ts,
+                is_tombstone: flags.tombstone,
+                body_preview,
+            });
+        }
+        Ok(versions)
+    }
+
+    /// Scan secondary index, returning verified (doc_id, ts) pairs.
+    pub fn secondary_scan(
+        &self,
+        sec_root: u32,
+        primary_root: u32,
+        scalars_json: &str,
+        read_ts: u64,
+        limit: usize,
+    ) -> io::Result<Vec<SecondaryHit>> {
+        let scalars = parse_scalar_array(scalars_json)
+            .map_err(io::Error::other)?;
+
+        let primary = Arc::new(self.make_primary_index(primary_root));
+        let sec_btree = self.engine.open_btree(sec_root);
+        let secondary = SecondaryIndex::new(sec_btree, primary);
+
+        let prefix = key_encoding::encode_key_prefix(&scalars);
+        let upper = key_encoding::successor_key(&prefix);
+
+        let scanner = secondary.scan_at_ts(
+            Bound::Included(prefix.as_slice()),
+            Bound::Excluded(upper.as_slice()),
+            read_ts,
+            ScanDirection::Forward,
+        );
+
+        let mut results = Vec::new();
+        for item in scanner {
+            let (doc_id, version_ts) = item?;
+            results.push(SecondaryHit {
+                doc_id_hex: hex_encode(doc_id.as_bytes()),
+                version_ts,
+            });
+            if results.len() >= limit {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
+    /// Decode key bytes according to mode.
+    pub fn decode_key_bytes(&self, hex: &str, mode: &str) -> Result<String, String> {
+        let bytes = parse_hex(hex).ok_or("invalid hex input")?;
+        if bytes.is_empty() {
+            return Err("empty input".into());
+        }
+
+        match mode {
+            "primary" => decode_primary(&bytes),
+            "secondary" => decode_secondary(&bytes),
+            "cell" => decode_cell(&bytes),
+            "scalar" => decode_scalar_display(&bytes),
+            "auto" => {
+                // Try primary (exactly 24 bytes), then secondary (>24), then cell, then scalar
+                if bytes.len() == 24
+                    && let Ok(r) = decode_primary(&bytes)
+                {
+                    return Ok(format!("[Primary Key]\n{r}"));
+                }
+                if bytes.len() > 24
+                    && let Ok(r) = decode_secondary(&bytes)
+                {
+                    return Ok(format!("[Secondary Key]\n{r}"));
+                }
+                if let Ok(r) = decode_cell(&bytes) {
+                    return Ok(format!("[Cell Value]\n{r}"));
+                }
+                if let Ok(r) = decode_scalar_display(&bytes) {
+                    return Ok(format!("[Scalar]\n{r}"));
+                }
+                Err("Could not auto-detect key format".into())
+            }
+            _ => Err(format!("unknown mode: {mode}")),
+        }
+    }
+
+    /// Encode key bytes according to mode.
+    pub fn encode_key_bytes(
+        &self,
+        mode: &str,
+        doc_id_hex: &str,
+        ts_str: &str,
+        scalars_json: &str,
+    ) -> Result<String, String> {
+        match mode {
+            "primary" => {
+                let doc_id = parse_doc_id(doc_id_hex)?;
+                let ts: u64 = ts_str.parse().map_err(|e| format!("invalid ts: {e}"))?;
+                let key = key_encoding::make_primary_key(&doc_id, ts);
+                Ok(hex_encode(&key))
+            }
+            "secondary" => {
+                let doc_id = parse_doc_id(doc_id_hex)?;
+                let ts: u64 = ts_str.parse().map_err(|e| format!("invalid ts: {e}"))?;
+                let scalars = parse_scalar_array(scalars_json)?;
+                let key = key_encoding::make_secondary_key(&scalars, &doc_id, ts);
+                Ok(hex_encode(&key))
+            }
+            "scalar" => {
+                let scalars = parse_scalar_array(scalars_json)?;
+                let mut out = Vec::new();
+                for s in &scalars {
+                    out.extend_from_slice(&key_encoding::encode_scalar(s));
+                }
+                Ok(hex_encode(&out))
+            }
+            _ => Err(format!("unknown mode: {mode}")),
+        }
+    }
+
+    /// Per-collection MVCC overhead stats.
+    pub fn vacuum_stats(&self) -> io::Result<Vec<VacuumStats>> {
+        let collections = self.list_collections()?;
+        let mut stats = Vec::new();
+
+        for col in &collections {
+            // Count raw B-tree entries
+            let btree = self.engine.open_btree(col.data_root_page);
+            let iter = btree.scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward);
+            let mut total_raw: u64 = 0;
+            let mut tombstone_count: u64 = 0;
+            for entry in iter {
+                let (_key, value) = entry?;
+                total_raw += 1;
+                if !value.is_empty() {
+                    let flags = CellFlags::from_byte(value[0]);
+                    if flags.tombstone {
+                        tombstone_count += 1;
+                    }
+                }
+            }
+
+            // Count visible docs via MVCC scan
+            let fh = self.engine.file_header();
+            let visible_ts = fh.visible_ts.get();
+            let read_ts = if visible_ts == 0 { u64::MAX } else { visible_ts };
+            let primary = self.make_primary_index(col.data_root_page);
+            let scanner = primary.scan_at_ts(read_ts, ScanDirection::Forward);
+            let mut visible: u64 = 0;
+            for item in scanner {
+                item?;
+                visible += 1;
+            }
+
+            let overhead = total_raw.saturating_sub(visible + tombstone_count);
+
+            stats.push(VacuumStats {
+                collection_name: col.name.clone(),
+                total_raw_entries: total_raw,
+                visible_docs: visible,
+                tombstones: tombstone_count,
+                version_overhead: overhead,
+            });
+        }
+
+        Ok(stats)
+    }
+}
+
+// ─── L3 Display Types ───
+
+pub struct DocstoreEntry {
+    pub doc_id_hex: String,
+    pub version_ts: u64,
+    pub is_tombstone: bool,
+    pub is_external: bool,
+    pub body_len: u32,
+    pub body_json: Option<String>,
+}
+
+pub struct VersionInfo {
+    pub ts: u64,
+    pub is_tombstone: bool,
+    pub body_preview: String,
+}
+
+pub struct SecondaryHit {
+    pub doc_id_hex: String,
+    pub version_ts: u64,
+}
+
+pub struct VacuumStats {
+    pub collection_name: String,
+    pub total_raw_entries: u64,
+    pub visible_docs: u64,
+    pub tombstones: u64,
+    pub version_overhead: u64,
+}
+
+// ─── L3 Helpers ───
+
+fn decode_body_json(body: &[u8]) -> Option<String> {
+    // Try exdb_core document decoding first, fall back to raw UTF-8 JSON
+    if let Ok(doc) = exdb_core::encoding::decode_document(body) {
+        Some(serde_json::to_string_pretty(&doc).unwrap_or_default())
+    } else if let Ok(text) = std::str::from_utf8(body) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(text) {
+            Some(serde_json::to_string_pretty(&json).unwrap_or_default())
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn parse_doc_id(hex: &str) -> Result<DocId, String> {
+    let bytes = parse_hex(hex).ok_or("invalid hex")?;
+    if bytes.len() != 16 {
+        return Err(format!("doc_id must be 16 bytes, got {}", bytes.len()));
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(&bytes);
+    Ok(DocId(arr))
+}
+
+fn parse_scalar_array(json: &str) -> Result<Vec<Scalar>, String> {
+    let json = json.trim();
+    if json.is_empty() {
+        return Ok(vec![]);
+    }
+    let arr: Vec<serde_json::Value> =
+        serde_json::from_str(json).map_err(|e| format!("invalid JSON array: {e}"))?;
+    arr.iter().map(json_to_scalar).collect()
+}
+
+fn json_to_scalar(v: &serde_json::Value) -> Result<Scalar, String> {
+    match v {
+        serde_json::Value::Null => Ok(Scalar::Null),
+        serde_json::Value::Bool(b) => Ok(Scalar::Boolean(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Scalar::Int64(i))
+            } else if let Some(f) = n.as_f64() {
+                Ok(Scalar::Float64(f))
+            } else {
+                Err("unsupported number".into())
+            }
+        }
+        serde_json::Value::String(s) => Ok(Scalar::String(s.clone())),
+        _ => Err("unsupported JSON type (expected scalar)".into()),
+    }
+}
+
+fn decode_primary(bytes: &[u8]) -> Result<String, String> {
+    let (doc_id, ts) = key_encoding::parse_primary_key(bytes)?;
+    Ok(format!(
+        "doc_id: {}\nts:     {}",
+        hex_encode(doc_id.as_bytes()),
+        ts
+    ))
+}
+
+fn decode_secondary(bytes: &[u8]) -> Result<String, String> {
+    if bytes.len() < 25 {
+        return Err("too short for secondary key".into());
+    }
+    let value_prefix = &bytes[..bytes.len() - 24];
+    let (doc_id, ts) = key_encoding::parse_secondary_key_suffix(bytes)?;
+
+    // Decode scalars from value prefix
+    let mut scalars = Vec::new();
+    let mut pos = 0;
+    while pos < value_prefix.len() {
+        match key_encoding::decode_scalar(&value_prefix[pos..]) {
+            Ok((scalar, consumed)) => {
+                scalars.push(format!("{scalar:?}"));
+                pos += consumed;
+            }
+            Err(_) => break,
+        }
+    }
+
+    Ok(format!(
+        "scalars: [{}]\ndoc_id:  {}\nts:      {}",
+        scalars.join(", "),
+        hex_encode(doc_id.as_bytes()),
+        ts
+    ))
+}
+
+fn decode_cell(bytes: &[u8]) -> Result<String, String> {
+    if bytes.is_empty() {
+        return Err("empty cell".into());
+    }
+    let flags = CellFlags::from_byte(bytes[0]);
+    if flags.tombstone {
+        return Ok("Tombstone (deleted)".into());
+    }
+    if bytes.len() < 5 {
+        return Err("cell too short for inline/external".into());
+    }
+    let body_len = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
+    if flags.external {
+        if bytes.len() < 11 {
+            return Err("cell too short for external ref".into());
+        }
+        let page_id = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
+        let slot_id = u16::from_le_bytes(bytes[9..11].try_into().unwrap());
+        Ok(format!(
+            "External\nbody_len:  {body_len}\nheap_page: {page_id}\nheap_slot: {slot_id}"
+        ))
+    } else {
+        let preview = if bytes.len() > 5 {
+            let body = &bytes[5..];
+            decode_body_json(body)
+                .unwrap_or_else(|| format!("{} bytes", body.len()))
+        } else {
+            "(empty)".into()
+        };
+        Ok(format!(
+            "Inline\nbody_len: {body_len}\npreview:  {preview}"
+        ))
+    }
+}
+
+fn decode_scalar_display(bytes: &[u8]) -> Result<String, String> {
+    let (scalar, consumed) = key_encoding::decode_scalar(bytes)?;
+    let remaining = bytes.len() - consumed;
+    let mut out = format!("{scalar:?}");
+    if remaining > 0 {
+        out.push_str(&format!("\n({remaining} bytes remaining)"));
+    }
+    Ok(out)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn parse_hex(s: &str) -> Option<Vec<u8>> {
+    let s = s.replace([' ', '\n'], "");
+    if s.is_empty() {
+        return Some(Vec::new());
+    }
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 fn wal_record_type_name(t: u8) -> String {

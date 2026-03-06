@@ -4,59 +4,110 @@ use dioxus::prelude::*;
 
 use crate::engine::DbHandle;
 
-/// Which module is currently active in the sidebar.
+/// Top-level layer tabs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Module {
+pub enum LayerTab {
     Overview,
-    Collections,
+    Storage,   // L2
+    Docstore,  // L3
+    Console,
+}
+
+impl LayerTab {
+    pub fn label(&self) -> &'static str {
+        match self {
+            LayerTab::Overview => "Overview",
+            LayerTab::Storage => "L2 Storage",
+            LayerTab::Docstore => "L3 Docstore",
+            LayerTab::Console => "Console",
+        }
+    }
+
+    pub const ALL: &[LayerTab] = &[
+        LayerTab::Overview,
+        LayerTab::Storage,
+        LayerTab::Docstore,
+        LayerTab::Console,
+    ];
+}
+
+/// Tools within the L2 Storage tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageTool {
     Pages,
     BTree,
     Wal,
     Heap,
     FreeList,
     Catalog,
-    Console,
 }
 
-impl Module {
+impl StorageTool {
     pub fn label(&self) -> &'static str {
         match self {
-            Module::Overview => "Ovw",
-            Module::Collections => "Cols",
-            Module::Pages => "Pgs",
-            Module::BTree => "BTree",
-            Module::Wal => "WAL",
-            Module::Heap => "Heap",
-            Module::FreeList => "Free",
-            Module::Catalog => "Cat",
-            Module::Console => "Cons",
+            StorageTool::Pages => "Pages",
+            StorageTool::BTree => "BTree",
+            StorageTool::Wal => "WAL",
+            StorageTool::Heap => "Heap",
+            StorageTool::FreeList => "Free",
+            StorageTool::Catalog => "Catalog",
         }
     }
 
     pub fn icon(&self) -> &'static str {
         match self {
-            Module::Overview => "\u{1F4CA}",   // bar chart
-            Module::Collections => "\u{1F4C1}", // folder
-            Module::Pages => "\u{1F4C4}",      // page
-            Module::BTree => "\u{1F333}",      // tree
-            Module::Wal => "\u{1F4DD}",        // memo
-            Module::Heap => "\u{1F4E6}",       // package
-            Module::FreeList => "\u{1F517}",   // link
-            Module::Catalog => "\u{1F4D6}",    // book
-            Module::Console => "\u{1F4BB}",    // laptop
+            StorageTool::Pages => "\u{1F4C4}",
+            StorageTool::BTree => "\u{1F333}",
+            StorageTool::Wal => "\u{1F4DD}",
+            StorageTool::Heap => "\u{1F4E6}",
+            StorageTool::FreeList => "\u{1F517}",
+            StorageTool::Catalog => "\u{1F4D6}",
         }
     }
 
-    pub const ALL: &[Module] = &[
-        Module::Overview,
-        Module::Collections,
-        Module::Pages,
-        Module::BTree,
-        Module::Wal,
-        Module::Heap,
-        Module::FreeList,
-        Module::Catalog,
-        Module::Console,
+    pub const ALL: &[StorageTool] = &[
+        StorageTool::Pages,
+        StorageTool::BTree,
+        StorageTool::Wal,
+        StorageTool::Heap,
+        StorageTool::FreeList,
+        StorageTool::Catalog,
+    ];
+}
+
+/// Tools within the L3 Docstore tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocstoreTool {
+    Documents,
+    SecondaryIndexes,
+    KeyTools,
+    Vacuum,
+}
+
+impl DocstoreTool {
+    pub fn label(&self) -> &'static str {
+        match self {
+            DocstoreTool::Documents => "Docs",
+            DocstoreTool::SecondaryIndexes => "Indexes",
+            DocstoreTool::KeyTools => "Keys",
+            DocstoreTool::Vacuum => "Vacuum",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            DocstoreTool::Documents => "\u{1F4C1}",
+            DocstoreTool::SecondaryIndexes => "\u{1F50D}",
+            DocstoreTool::KeyTools => "\u{1F511}",
+            DocstoreTool::Vacuum => "\u{1F9F9}",
+        }
+    }
+
+    pub const ALL: &[DocstoreTool] = &[
+        DocstoreTool::Documents,
+        DocstoreTool::SecondaryIndexes,
+        DocstoreTool::KeyTools,
+        DocstoreTool::Vacuum,
     ];
 }
 
@@ -72,8 +123,12 @@ pub enum OperationResult {
 pub struct AppState {
     /// Currently open database handle.
     pub db: Signal<Option<Arc<DbHandle>>>,
-    /// Active sidebar module.
-    pub active_module: Signal<Module>,
+    /// Active layer tab.
+    pub active_tab: Signal<LayerTab>,
+    /// Active tool within Storage tab.
+    pub storage_tool: Signal<StorageTool>,
+    /// Active tool within Docstore tab.
+    pub docstore_tool: Signal<DocstoreTool>,
     /// Breadcrumb trail.
     pub breadcrumb: Signal<Vec<String>>,
     /// Read-write lock. false = locked (read-only), true = writes allowed.
@@ -82,8 +137,7 @@ pub struct AppState {
     pub dirty_page_count: Signal<usize>,
     /// Last operation result for toast display.
     pub last_result: Signal<Option<OperationResult>>,
-    /// Monotonic revision counter — bumped on every write mutation.
-    /// `use_resource` closures read this to re-fetch data after mutations.
+    /// Monotonic revision counter -- bumped on every write mutation.
     pub revision: Signal<u64>,
 }
 
@@ -91,7 +145,9 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             db: Signal::new(None),
-            active_module: Signal::new(Module::Overview),
+            active_tab: Signal::new(LayerTab::Overview),
+            storage_tool: Signal::new(StorageTool::Pages),
+            docstore_tool: Signal::new(DocstoreTool::Documents),
             breadcrumb: Signal::new(vec!["Database".to_string()]),
             write_enabled: Signal::new(false),
             dirty_page_count: Signal::new(0),
@@ -108,7 +164,6 @@ impl AppState {
     /// Call after any successful write mutation to refresh all data views.
     pub fn notify_mutation(&mut self) {
         self.revision.set(self.revision.cloned() + 1);
-        // Update dirty page count
         if let Some(db) = self.db.read().as_ref() {
             self.dirty_page_count.set(db.dirty_page_count());
         }

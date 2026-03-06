@@ -1395,6 +1395,8 @@ name = "exdb-studio"
 version = "0.1.0"
 dependencies = [
  "dioxus",
+ "exdb-core",
+ "exdb-docstore",
  "exdb-storage",
  "parking_lot",
  "rfd 0.15.4",

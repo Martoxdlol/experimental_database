@@ -1,12 +1,15 @@
 use dioxus::prelude::*;
 
-use crate::components::{Breadcrumb, Sidebar, Toast, Toolbar};
+use crate::components::{Breadcrumb, LayerTabBar, Sidebar, Toast, Toolbar};
 use crate::modules::{
-    btree::BTreeModule, catalog::CatalogModule, collections::CollectionsModule,
-    console::ConsoleModule, freelist::FreeListModule, heap::HeapModule, overview::OverviewModule,
-    pages::PagesModule, wal::WalModule,
+    console::ConsoleModule,
+    docstore::{DocumentsModule, KeyToolsModule, SecondaryIndexModule, VacuumModule},
+    overview::OverviewModule,
+    storage::{
+        BTreeModule, CatalogModule, FreeListModule, HeapModule, PagesModule, WalModule,
+    },
 };
-use crate::state::{AppState, Module};
+use crate::state::{AppState, DocstoreTool, LayerTab, StorageTool};
 use crate::theme::STYLESHEET;
 
 #[component]
@@ -18,6 +21,7 @@ pub fn App() -> Element {
         style { "{STYLESHEET}" }
         div { class: "app-container",
             Toolbar {}
+            LayerTabBar {}
             div { class: "main-layout",
                 Sidebar {}
                 div { class: "content",
@@ -33,7 +37,7 @@ pub fn App() -> Element {
 #[component]
 fn ModuleContent() -> Element {
     let state = use_context::<AppState>();
-    let active = *state.active_module.read();
+    let active_tab = *state.active_tab.read();
     let db_open = state.is_open();
 
     if !db_open {
@@ -50,15 +54,28 @@ fn ModuleContent() -> Element {
         };
     }
 
-    match active {
-        Module::Overview => rsx! { OverviewModule {} },
-        Module::Collections => rsx! { CollectionsModule {} },
-        Module::Pages => rsx! { PagesModule {} },
-        Module::BTree => rsx! { BTreeModule {} },
-        Module::Wal => rsx! { WalModule {} },
-        Module::Heap => rsx! { HeapModule {} },
-        Module::FreeList => rsx! { FreeListModule {} },
-        Module::Catalog => rsx! { CatalogModule {} },
-        Module::Console => rsx! { ConsoleModule {} },
+    match active_tab {
+        LayerTab::Overview => rsx! { OverviewModule {} },
+        LayerTab::Console => rsx! { ConsoleModule {} },
+        LayerTab::Storage => {
+            let tool = *state.storage_tool.read();
+            match tool {
+                StorageTool::Pages => rsx! { PagesModule {} },
+                StorageTool::BTree => rsx! { BTreeModule {} },
+                StorageTool::Wal => rsx! { WalModule {} },
+                StorageTool::Heap => rsx! { HeapModule {} },
+                StorageTool::FreeList => rsx! { FreeListModule {} },
+                StorageTool::Catalog => rsx! { CatalogModule {} },
+            }
+        }
+        LayerTab::Docstore => {
+            let tool = *state.docstore_tool.read();
+            match tool {
+                DocstoreTool::Documents => rsx! { DocumentsModule {} },
+                DocstoreTool::SecondaryIndexes => rsx! { SecondaryIndexModule {} },
+                DocstoreTool::KeyTools => rsx! { KeyToolsModule {} },
+                DocstoreTool::Vacuum => rsx! { VacuumModule {} },
+            }
+        }
     }
 }

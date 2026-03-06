@@ -27,8 +27,10 @@ pub type Ts = u64;
 /// Transaction identifier
 pub type TxId = u64;
 
-/// Scalar values for index comparisons and filter evaluation
+/// Scalar values for index comparisons and filter evaluation.
+/// Ordering matches TypeTag order: Undefined < Null < Int64 < ... < Id.
 pub enum Scalar {
+    Undefined,        // field absent from document (distinct from null)
     Null,
     Int64(i64),
     Float64(f64),

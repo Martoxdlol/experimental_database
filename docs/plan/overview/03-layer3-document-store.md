@@ -110,11 +110,12 @@ pub struct SecondaryIndex {
 impl SecondaryIndex {
     pub fn new(btree: BTreeHandle, primary: Arc<PrimaryIndex>) -> Self;
 
-    /// Insert a secondary index entry for a document version
-    pub fn insert_entry(&self, encoded_key: &[u8], doc_id: &DocId, ts: Ts) -> Result<()>;
+    /// Insert a secondary index entry for a document version.
+    /// encoded_key is the full key (prefix + doc_id + inv_ts). Value is empty.
+    pub fn insert_entry(&self, encoded_key: &[u8]) -> Result<()>;
 
-    /// Remove a secondary index entry
-    pub fn remove_entry(&self, encoded_key: &[u8], doc_id: &DocId, ts: Ts) -> Result<()>;
+    /// Remove a secondary index entry.
+    pub fn remove_entry(&self, encoded_key: &[u8]) -> Result<bool>;
 
     /// Scan with version resolution (section 3.5)
     /// For each (doc_id, inv_ts):
@@ -138,22 +139,35 @@ impl Iterator for SecondaryScanner {
 
 ```rust
 /// Given a stream of (doc_id, ts) pairs from a B-tree scan,
-/// resolve to the latest visible version per doc_id at read_ts
+/// resolve to the latest visible version per doc_id at read_ts.
+/// Direction-aware: handles both forward (descending ts) and
+/// backward (ascending ts) entry ordering within doc_id groups.
 pub struct VersionResolver {
     read_ts: Ts,
+    direction: ScanDirection,
     current_doc_id: Option<DocId>,
-    found_visible: bool,
+    found_visible: bool,       // forward mode
+    best_visible_ts: Option<Ts>, // backward mode
 }
 
 impl VersionResolver {
-    pub fn new(read_ts: Ts) -> Self;
+    pub fn new(read_ts: Ts, direction: ScanDirection) -> Self;
 
-    /// Process next entry. Returns Some(ts) if this is the visible version,
-    /// None if it should be skipped.
-    pub fn process(&mut self, doc_id: &DocId, ts: Ts) -> Option<Ts>;
+    /// Process next entry. Returns verdict indicating what the caller should do.
+    pub fn process(&mut self, doc_id: &DocId, ts: Ts) -> Verdict;
+
+    /// Call after the last entry. In backward mode, returns the final group's
+    /// visible (doc_id, ts) if any.
+    pub fn finish(&mut self) -> Option<(DocId, Ts)>;
 
     /// Check if a version is visible at read_ts
     pub fn is_visible(ts: Ts, read_ts: Ts) -> bool { ts <= read_ts }
+}
+
+pub enum Verdict {
+    Visible,                       // yield this entry (forward mode)
+    Skip,                          // skip this entry
+    EmitPrevious(DocId, Ts),       // yield the previous doc_id group's result (backward mode)
 }
 ```
 

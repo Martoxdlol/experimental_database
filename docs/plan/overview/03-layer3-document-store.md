@@ -23,16 +23,25 @@ pub fn make_primary_key(doc_id: &DocId, ts: Ts) -> [u8; 24];
 /// Parse a primary key back into components
 pub fn parse_primary_key(key: &[u8]) -> Result<(DocId, Ts)>;
 
-/// Construct secondary index key: type_tag[1] || encoded_value || doc_id[16] || inv_ts[8]
+/// Construct secondary index key from typed scalars
 pub fn make_secondary_key(values: &[Scalar], doc_id: &DocId, ts: Ts) -> Vec<u8>;
+
+/// Construct secondary index key from pre-encoded prefix (used by IndexBuilder)
+pub fn make_secondary_key_from_prefix(prefix: &[u8], doc_id: &DocId, ts: Ts) -> Vec<u8>;
 
 /// Parse secondary key suffix to extract doc_id and ts
 pub fn parse_secondary_key_suffix(key: &[u8]) -> Result<(DocId, Ts)>;
 
+/// Encode prefix portion of secondary key (without doc_id/inv_ts suffix)
+pub fn encode_key_prefix(values: &[Scalar]) -> Vec<u8>;
+
 /// Compute inverted timestamp for descending sort within doc_id group
 pub fn inv_ts(ts: Ts) -> u64 { u64::MAX - ts }
 
-/// Compute successor key for range bounds
+/// Smallest key strictly greater than input (append 0x00). For exclusive lower bounds.
+pub fn prefix_successor(key: &[u8]) -> Vec<u8>;
+
+/// Next key at same length (increment last byte). For exclusive upper bounds in prefix scans.
 pub fn successor_key(key: &[u8]) -> Vec<u8>;
 ```
 
@@ -122,7 +131,7 @@ impl SecondaryIndex {
     ///   - Skip if version_ts > read_ts
     ///   - Within same doc_id: take first (highest ts <= read_ts), skip rest
     ///   - Verify against primary index (skip stale entries)
-    pub fn scan_at_ts(&self, lower: &[u8], upper: Bound<&[u8]>,
+    pub fn scan_at_ts(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>,
                       read_ts: Ts, direction: ScanDirection) -> SecondaryScanner;
 }
 
@@ -196,17 +205,18 @@ pub fn compute_index_entries(
 ```rust
 pub struct IndexBuilder {
     primary: Arc<PrimaryIndex>,
-    secondary: SecondaryIndex,
+    secondary: Arc<SecondaryIndex>,
     field_paths: Vec<FieldPath>,
 }
 
 impl IndexBuilder {
-    pub fn new(primary: Arc<PrimaryIndex>, secondary: SecondaryIndex,
+    pub fn new(primary: Arc<PrimaryIndex>, secondary: Arc<SecondaryIndex>,
                field_paths: Vec<FieldPath>) -> Self;
 
     /// Run background build: scan primary at build_snapshot_ts,
-    /// insert entries into secondary index
-    pub async fn build(&self, build_snapshot_ts: Ts) -> Result<()>;
+    /// insert entries into secondary index.
+    /// Returns the number of entries inserted.
+    pub async fn build(&self, build_snapshot_ts: Ts) -> Result<u64>;
 }
 ```
 
@@ -220,8 +230,8 @@ Instead of periodically scanning the entire primary B-tree to find reclaimable o
    vacuum_safe_ts = min(oldest_active_read_ts, visible_ts)
    ```
    where `oldest_active_read_ts` comes from L5 (TxManager) and `visible_ts` is the latest replicated timestamp (see Layer 5, Visibility Fence). `visible_ts` is the latest replicated timestamp. Un-replicated commits (`ts > visible_ts`) may have replaced versions that readers at `visible_ts` still need. Using `min()` ensures we never vacuum versions that are still the "latest visible" at either the oldest active reader's snapshot or the visibility fence.
-3. **Drain eligible entries**: any pending entry where `old_ts` is older than the most recent version visible at `vacuum_safe_ts` is safe to remove.
-4. **Execute**: write a `Vacuum` WAL record (0x08) with the entries, then call Layer 2's `VacuumTask.remove_entries()` to perform the actual B-tree key deletions.
+3. **Drain eligible entries**: any pending entry where `superseding_ts <= vacuum_safe_ts` is safe to remove. This means the superseding version is visible to all current readers, so no reader can still need the old version.
+4. **Execute**: write a `Vacuum` WAL record (0x08) with the entries, then call `btree().delete()` on each primary and secondary key to perform the actual B-tree key deletions.
 
 **Advantages over B-tree scan**:
 - Work proportional to write rate, not database size — a 100 GB database with 1 write/sec does minimal vacuum work
@@ -262,27 +272,30 @@ This is a specialized vacuum that removes entries written by commits that were n
 - After rollback vacuum, the database state is identical to what replicas see
 
 ```rust
-pub struct RollbackVacuum {
-    primary_indexes: HashMap<CollectionId, Arc<PrimaryIndex>>,
-    secondary_indexes: HashMap<IndexId, Arc<SecondaryIndex>>,
-}
+/// Unit struct — all methods are stateless, indexes passed as parameters.
+/// This avoids L3 depending on L5 types (WriteSet, IndexDelta).
+pub struct RollbackVacuum;
 
 impl RollbackVacuum {
-    /// Live rollback: undo a single failed commit using its in-memory write set
+    /// Live rollback: undo a single failed commit.
+    /// L5 decomposes its WriteSet into plain (CollectionId, DocId) tuples
+    /// and IndexDelta into (IndexId, Option<Vec<u8>>) before calling this.
     pub fn rollback_commit(
-        &self,
         commit_ts: Ts,
-        write_set: &WriteSet,
-        index_deltas: &[IndexDelta],
+        mutations: &[(CollectionId, DocId)],
+        index_deltas: &[(IndexId, Option<Vec<u8>>)],
+        primary_indexes: &HashMap<CollectionId, Arc<PrimaryIndex>>,
+        secondary_indexes: &HashMap<IndexId, Arc<SecondaryIndex>>,
     ) -> Result<()>;
 
-    /// Startup cleanup: undo all commits with ts > visible_ts using WAL
+    /// Startup cleanup: undo all commits with ts > visible_ts.
+    /// L5/L6 parses WAL records into WalCommitInfo before calling this.
     pub fn rollback_from_wal(
-        &self,
         visible_ts: Ts,
-        wal_reader: &WalReader,
-        checkpoint_lsn: Lsn,
-    ) -> Result<u64>;  // returns number of rolled-back commits
+        wal_commits: &[WalCommitInfo],
+        primary_indexes: &HashMap<CollectionId, Arc<PrimaryIndex>>,
+        secondary_indexes: &HashMap<IndexId, Arc<SecondaryIndex>>,
+    ) -> Result<u64>;
 }
 ```
 

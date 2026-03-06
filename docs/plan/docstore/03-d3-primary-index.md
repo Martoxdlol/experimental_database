@@ -7,7 +7,7 @@ Document store built on top of the clustered primary B-tree. Adds MVCC version s
 ## Dependencies
 
 - **D1 (Key Encoding)**: `make_primary_key`, `parse_primary_key`, `inv_ts`
-- **D2 (Version Resolution)**: `VersionResolver`, `Verdict`, `ScanDirection`
+- **D2 (Version Resolution)**: `VersionResolver`, `Verdict`
 - **L2 (Storage Engine)**: `BTreeHandle`, `ScanIterator`, `ScanDirection`, `Heap`, `HeapRef`
 - **L1 (Core Types)**: `DocId`, `Ts`
 

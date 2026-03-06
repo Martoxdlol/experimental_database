@@ -9,7 +9,7 @@ Background index building: scans the primary B-tree at a snapshot timestamp and 
 - **D3 (Primary Index)**: `PrimaryIndex`, `PrimaryScanner` (snapshot scan source)
 - **D4 (Secondary Index)**: `SecondaryIndex` (target for entries)
 - **D5 (Array Indexing)**: `compute_index_entries` (key generation per document)
-- **D1 (Key Encoding)**: `make_secondary_key`
+- **D1 (Key Encoding)**: `make_secondary_key_from_prefix`
 - **L1 (Core Types)**: `DocId`, `Ts`, `FieldPath`
 - **L1 (Core Encoding)**: `decode_document` (BSON → JSON for field extraction)
 

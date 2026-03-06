@@ -12,7 +12,7 @@ Layer 3: Document Store & Indexing. Adds document/MVCC semantics on top of Layer
 | # | Sub-Layer | File | Dependencies | Testable Alone? |
 |---|-----------|------|-------------|-----------------|
 | D1 | Key Encoding | `key_encoding.rs` | L1 (types) | Yes |
-| D2 | Version Resolution | `version_resolution.rs` | L1 (types) | Yes |
+| D2 | Version Resolution | `version_resolution.rs` | L1 (types), L2 (ScanDirection enum) | Yes |
 | D3 | Primary Index | `primary_index.rs` | D1, D2, L2 (BTreeHandle, Heap) | Yes |
 | D4 | Secondary Index | `secondary_index.rs` | D1, D2, D3 | Yes |
 | D5 | Array Indexing | `array_indexing.rs` | D1, L1 (encoding) | Yes |
@@ -55,7 +55,7 @@ D6 (IndexBuilder) ──→ D5, D4, D3
 D5 (ArrayIndexing) ──→ D1
 D4 (SecondaryIndex) ──→ D3, D2, D1
 D3 (PrimaryIndex) ──→ D2, D1, L2
-D2 (VersionResolution) ──→ L1
+D2 (VersionResolution) ──→ L1, L2 (enum only)
 D1 (KeyEncoding) ──→ L1
 ```
 

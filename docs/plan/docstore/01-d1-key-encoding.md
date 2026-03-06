@@ -65,15 +65,19 @@ pub fn parse_secondary_key_suffix(key: &[u8]) -> Result<(DocId, Ts)>;
 /// inv_ts = u64::MAX - ts
 pub fn inv_ts(ts: Ts) -> u64;
 
-/// Append a 0x00 byte to create a key that is just past the original
-/// in byte ordering. Used for prefix-based exclusive upper bounds
-/// (e.g., all keys starting with a given prefix).
+/// Append a 0x00 byte to create the smallest key strictly greater than
+/// the input. Used for exclusive lower bounds (e.g., scan starting just
+/// after a specific key) or for constructing a key that is minimally
+/// past a given point.
+/// NOTE: This is NOT suitable as an upper bound for prefix range scans.
+/// For "all keys starting with prefix P", use Excluded(successor_key(P)).
 pub fn prefix_successor(key: &[u8]) -> Vec<u8>;
 
 /// Increment the key to produce the next key at the same length.
 /// Increments the last byte; on overflow (0xFF), truncates and increments
 /// the previous byte, etc. If all bytes are 0xFF, appends 0x00.
-/// Used for point exclusive upper bounds.
+/// Used for exclusive upper bounds in prefix range scans:
+///   all keys starting with P are in [Included(P), Excluded(successor_key(P))).
 pub fn successor_key(key: &[u8]) -> Vec<u8>;
 
 /// Encode the prefix portion of a secondary key (without doc_id/inv_ts suffix).

@@ -208,7 +208,7 @@ use std::ops::Bound;
 
 /// Execute a query plan against the indexes at the given read timestamp.
 ///
-/// Returns an iterator that lazily produces documents. The iterator:
+/// Returns a stream that lazily produces documents. The stream:
 /// 1. Drives the L3 scanner (PrimaryScanner or SecondaryScanner).
 /// 2. Fetches document bodies from the primary index.
 /// 3. Decodes JSON (via exdb_core::encoding::decode_document).
@@ -217,17 +217,17 @@ use std::ops::Bound;
 ///
 /// The read set interval is computed from the plan bounds (not from results)
 /// and is available immediately via read_interval().
-pub fn execute_scan(
+pub async fn execute_scan(
     plan: &AccessMethod,
     primary_index: &PrimaryIndex,
     secondary_indexes: &HashMap<IndexId, SecondaryIndex>,
     read_ts: Ts,
-) -> Result<QueryScanner>;
+) -> Result<QueryScanStream>;
 
-/// Lazy iterator over query results.
-pub struct QueryScanner { /* ... */ }
+/// Lazy stream over query results.
+pub struct QueryScanStream { /* ... */ }
 
-impl Iterator for QueryScanner {
+impl Stream for QueryScanStream {
     type Item = Result<ScanRow>;
 }
 
@@ -238,7 +238,7 @@ pub struct ScanRow {
     pub doc: serde_json::Value,
 }
 
-impl QueryScanner {
+impl QueryScanStream {
     /// The read set interval for this scan, computed from the plan bounds.
     /// Available before iteration begins.
     pub fn read_interval(&self) -> ReadIntervalInfo;
@@ -293,8 +293,8 @@ pub struct MergeView<'a> {
 /// write-set documents so they merge into the correct position.
 /// `range_lower`/`range_upper`: the scan bounds (value prefix only),
 /// used to check if write-set inserts fall within the scan range.
-pub fn merge_with_writes<I>(
-    snapshot: I,
+pub async fn merge_with_writes<S>(
+    snapshot: S,
     merge_view: &MergeView<'_>,
     sort_fields: &[FieldPath],
     range_lower: Bound<&[u8]>,
@@ -304,7 +304,7 @@ pub fn merge_with_writes<I>(
     limit: Option<usize>,
 ) -> std::io::Result<Vec<ScanRow>>
 where
-    I: Iterator<Item = std::io::Result<ScanRow>>;
+    S: Stream<Item = std::io::Result<ScanRow>>;
 ```
 
 ## Interfaces Exposed to Higher Layers
@@ -312,7 +312,7 @@ where
 | Interface | Used By | Purpose |
 |-----------|---------|---------|
 | `resolve_access` | L6 (transaction query method) | Query planning |
-| `execute_scan` | L6 (transaction query method) | Scan execution (returns iterator) |
+| `execute_scan` | L6 (transaction query method) | Scan execution (returns stream, async) |
 | `merge_with_writes` | L6 (read-your-writes in mutation txns) | Write set overlay |
 | `filter_matches` | L4 internal (post-filter), L6 (subscription eval) | Filter evaluation |
 | `compare_scalars` | L4 internal, L6 | Scalar comparison |

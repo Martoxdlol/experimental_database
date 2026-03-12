@@ -23,8 +23,8 @@ A page-oriented storage engine library providing B+ trees, heap storage, write-a
 ├──────────┴──────────┴───────────┴───────────────────┤
 │  SlottedPage / PageHeader (zerocopy, little-endian) │  ← On-disk page format
 ├─────────────────────────────────────────────────────┤
-│    PageStorage (trait)    │    WalStorage (trait)    │  ← Backend abstraction
-│    File / Memory          │    File / Memory         │
+│  PageStorage (async trait) │  WalStorage (async trait) │  ← Backend abstraction
+│    File / Memory           │    File / Memory          │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -32,7 +32,7 @@ A page-oriented storage engine library providing B+ trees, heap storage, write-a
 
 | Module | File | Purpose |
 |--------|------|---------|
-| **backend** | `backend.rs` | `PageStorage` and `WalStorage` traits + File/Memory implementations |
+| **backend** | `backend.rs` | `PageStorage` and `WalStorage` async traits (`#[async_trait]`) + File/Memory implementations |
 | **page** | `page.rs` | `PageHeader` (32-byte zerocopy), `PageType` enum, `SlottedPage` (mutable), `SlottedPageRef` (read-only), CRC-32C checksum |
 | **buffer_pool** | `buffer_pool.rs` | In-memory page cache with clock (second-chance) eviction. RAII guards: `SharedPageGuard`, `ExclusivePageGuard`. Pin count as `AtomicU32` outside frame lock. |
 | **free_list** | `free_list.rs` | LIFO page allocator. Pops from head or extends file. Page 0 is never freed. |
@@ -154,7 +154,7 @@ let engine = StorageEngine::open(
     std::path::Path::new("/tmp/mydb"),
     config,
     &mut handler,
-).unwrap();
+).await.unwrap();
 
 assert!(engine.is_durable());
 ```
@@ -164,7 +164,7 @@ assert!(engine.is_durable());
 ```rust
 use storage::engine::{StorageConfig, StorageEngine};
 
-let engine = StorageEngine::open_in_memory(StorageConfig::default()).unwrap();
+let engine = StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap();
 assert!(!engine.is_durable());
 ```
 
@@ -183,7 +183,7 @@ let engine = StorageEngine::open_with_backend(
     wal_storage,
     StorageConfig::default(),
     None, // no WalRecordHandler for fresh database
-).unwrap();
+).await.unwrap();
 ```
 
 ### B-Tree Operations
@@ -193,28 +193,32 @@ use std::ops::Bound;
 use storage::btree::ScanDirection;
 
 // Create a new B-tree (allocates a root page).
-let handle = engine.create_btree().unwrap();
+let handle = engine.create_btree().await.unwrap();
 
 // Insert key-value pairs (keys and values are raw bytes).
-handle.insert(b"user:001", b"Alice").unwrap();
-handle.insert(b"user:002", b"Bob").unwrap();
-handle.insert(b"user:003", b"Charlie").unwrap();
+handle.insert(b"user:001", b"Alice").await.unwrap();
+handle.insert(b"user:002", b"Bob").await.unwrap();
+handle.insert(b"user:003", b"Charlie").await.unwrap();
 
 // Point lookup.
-let value = handle.get(b"user:002").unwrap();
+let value = handle.get(b"user:002").await.unwrap();
 assert_eq!(value, Some(b"Bob".to_vec()));
 
 // Delete.
-let deleted = handle.delete(b"user:003").unwrap();
+let deleted = handle.delete(b"user:003").await.unwrap();
 assert!(deleted);
 
 // Range scan (forward, inclusive bounds).
+use tokio_stream::StreamExt;
 let results: Vec<_> = handle
     .scan(
         Bound::Included(b"user:001".as_slice()),
         Bound::Included(b"user:002".as_slice()),
         ScanDirection::Forward,
     )
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
 
@@ -225,6 +229,9 @@ assert_eq!(results[1].0, b"user:002");
 // Backward scan.
 let results: Vec<_> = handle
     .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Backward)
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
 // Results are in descending key order.
@@ -235,7 +242,7 @@ let root_page = handle.root_page();
 
 // Reopen an existing B-tree by root page.
 let handle2 = engine.open_btree(root_page);
-assert_eq!(handle2.get(b"user:001").unwrap(), Some(b"Alice".to_vec()));
+assert_eq!(handle2.get(b"user:001").await.unwrap(), Some(b"Alice".to_vec()));
 ```
 
 ### Heap Storage (Large Blobs)
@@ -243,24 +250,24 @@ assert_eq!(handle2.get(b"user:001").unwrap(), Some(b"Alice".to_vec()));
 ```rust
 // Store a large value in the heap.
 let large_data = vec![0u8; 50_000];
-let href = engine.heap_store(&large_data).unwrap();
+let href = engine.heap_store(&large_data).await.unwrap();
 
 // Load it back.
-let loaded = engine.heap_load(href).unwrap();
+let loaded = engine.heap_load(href).await.unwrap();
 assert_eq!(loaded, large_data);
 
 // Store the HeapRef in a B-tree for later retrieval.
-let btree = engine.create_btree().unwrap();
-btree.insert(b"doc:big", &href.to_bytes()).unwrap();
+let btree = engine.create_btree().await.unwrap();
+btree.insert(b"doc:big", &href.to_bytes()).await.unwrap();
 
 // Later: retrieve HeapRef from B-tree, load from heap.
 use storage::heap::HeapRef;
-let href_bytes = btree.get(b"doc:big").unwrap().unwrap();
+let href_bytes = btree.get(b"doc:big").await.unwrap().unwrap();
 let href = HeapRef::from_bytes(href_bytes[..6].try_into().unwrap());
-let data = engine.heap_load(href).unwrap();
+let data = engine.heap_load(href).await.unwrap();
 
 // Free when no longer needed.
-engine.heap_free(href).unwrap();
+engine.heap_free(href).await.unwrap();
 ```
 
 ### Write-Ahead Log
@@ -317,7 +324,7 @@ let engine = StorageEngine::open(
     std::path::Path::new("/tmp/mydb"),
     StorageConfig::default(),
     &mut MyHandler,
-).unwrap();
+).await.unwrap();
 ```
 
 ### Vacuum (Garbage Collection)
@@ -325,9 +332,9 @@ let engine = StorageEngine::open(
 ```rust
 use storage::vacuum::VacuumEntry;
 
-let btree = engine.create_btree().unwrap();
-btree.insert(b"key1", b"val1").unwrap();
-btree.insert(b"key2", b"val2").unwrap();
+let btree = engine.create_btree().await.unwrap();
+btree.insert(b"key1", b"val1").await.unwrap();
+btree.insert(b"key2", b"val2").await.unwrap();
 
 // Remove entries from B-trees in batch (idempotent).
 let entries = vec![
@@ -336,7 +343,7 @@ let entries = vec![
         key: b"key1".to_vec(),
     },
 ];
-let removed = engine.vacuum(&entries).unwrap();
+let removed = engine.vacuum(&entries).await.unwrap();
 assert_eq!(removed, 1);
 ```
 
@@ -373,10 +380,10 @@ let col = CollectionEntry {
 };
 
 let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, col.collection_id);
-catalog.insert(&id_key, &catalog_btree::serialize_collection(&col)).unwrap();
+catalog.insert(&id_key, &catalog_btree::serialize_collection(&col)).await.unwrap();
 
 let name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, &col.name);
-name_idx.insert(&name_key, &catalog_btree::serialize_name_value(col.collection_id)).unwrap();
+name_idx.insert(&name_key, &catalog_btree::serialize_name_value(col.collection_id)).await.unwrap();
 
 // Register an index (same pattern — insert into both catalogs).
 let idx = IndexEntry {
@@ -392,10 +399,10 @@ let idx = IndexEntry {
 };
 
 let idx_id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx.index_id);
-catalog.insert(&idx_id_key, &catalog_btree::serialize_index(&idx)).unwrap();
+catalog.insert(&idx_id_key, &catalog_btree::serialize_index(&idx)).await.unwrap();
 
 let idx_name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Index, &idx.name);
-name_idx.insert(&idx_name_key, &catalog_btree::serialize_name_value(idx.index_id)).unwrap();
+name_idx.insert(&idx_name_key, &catalog_btree::serialize_name_value(idx.index_id)).await.unwrap();
 ```
 
 #### Looking up by name after reopen
@@ -408,17 +415,17 @@ let name_idx = engine.open_btree(fh.catalog_name_root_page.get());
 
 // name → id
 let lookup = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, "users");
-let id_bytes = name_idx.get(&lookup).unwrap().expect("not found");
+let id_bytes = name_idx.get(&lookup).await.unwrap().expect("not found");
 let collection_id = catalog_btree::deserialize_name_value(&id_bytes);
 
 // id → full entry
 let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, collection_id);
-let col_bytes = catalog.get(&id_key).unwrap().expect("not found");
+let col_bytes = catalog.get(&id_key).await.unwrap().expect("not found");
 let col = catalog_btree::deserialize_collection(&col_bytes).unwrap();
 
 // full entry → open data B-tree
 let data_btree = engine.open_btree(col.primary_root_page);
-let val = data_btree.get(b"some_key").unwrap();
+let val = data_btree.get(b"some_key").await.unwrap();
 ```
 
 #### Enumerating all collections or indexes
@@ -426,6 +433,8 @@ let val = data_btree.get(b"some_key").unwrap();
 ```rust
 use std::ops::Bound;
 use storage::btree::ScanDirection;
+
+use tokio_stream::StreamExt;
 
 // Scan all collections (prefix 0x01 in the ID catalog).
 let prefix = catalog_btree::collection_id_scan_prefix();
@@ -436,6 +445,9 @@ let collections: Vec<_> = catalog
         ScanDirection::Forward,
     )
     .take_while(|r| r.as_ref().map(|(k, _)| k[0] == prefix[0]).unwrap_or(true))
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
 
@@ -448,6 +460,9 @@ let indexes: Vec<_> = catalog
         ScanDirection::Forward,
     )
     .take_while(|r| r.as_ref().map(|(k, _)| k[0] == idx_prefix[0]).unwrap_or(true))
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
 ```

@@ -56,7 +56,7 @@ pub struct MergeView<'a> {
 ///   - Result maintains index sort order.
 ///
 /// Parameters:
-/// - `snapshot`: lazy iterator from execute_scan (Q4).
+/// - `snapshot`: async stream from execute_scan (Q4).
 /// - `merge_view`: decomposed write set for this collection.
 /// - `sort_fields`: index field paths for sort key extraction.
 /// - `range_lower`/`range_upper`: scan bounds (value prefix only).
@@ -68,8 +68,8 @@ pub struct MergeView<'a> {
 /// Returns a Vec because the merge requires buffering write-set inserts
 /// to merge-sort with snapshot results. For transactions with small write sets
 /// (the common case), this is efficient.
-pub fn merge_with_writes<I>(
-    snapshot: I,
+pub async fn merge_with_writes<S>(
+    mut snapshot: S,
     merge_view: &MergeView<'_>,
     sort_fields: &[FieldPath],
     range_lower: Bound<&[u8]>,
@@ -79,7 +79,7 @@ pub fn merge_with_writes<I>(
     limit: Option<usize>,
 ) -> std::io::Result<Vec<ScanRow>>
 where
-    I: Iterator<Item = std::io::Result<ScanRow>>;
+    S: futures_core::Stream<Item = std::io::Result<ScanRow>> + Unpin;
 ```
 
 ## Implementation Details
@@ -90,7 +90,7 @@ where
 1. Build a HashSet<DocId> from deletes for O(1) lookup.
 2. Build a HashMap<DocId, &Value> from replaces for O(1) lookup.
 
-3. Consume snapshot iterator, applying delete/replace overlay:
+3. Consume snapshot stream (via StreamExt::next().await), applying delete/replace overlay:
    for each ScanRow from snapshot:
      a. If doc_id is in deletes → skip.
      b. If doc_id is in replaces:
@@ -156,15 +156,15 @@ fn key_in_range(key: &[u8], lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
 }
 ```
 
-### Why Vec and not Iterator
+### Why Vec and not Stream
 
-The merge returns a `Vec` rather than a lazy iterator because:
-1. Write-set inserts need to be sorted into the snapshot stream. A true merge-sort iterator is possible but complex (two ordered sources merged on-the-fly).
+The merge returns a `Vec` rather than a lazy stream because:
+1. Write-set inserts need to be sorted into the snapshot stream. A true merge-sort async stream is possible but complex (two ordered sources merged on-the-fly).
 2. Write sets are typically small (dozens to hundreds of entries). Materializing them is cheap.
-3. The snapshot iterator is consumed once and can't be rewound.
+3. The snapshot stream is consumed once and can't be rewound.
 4. L6 needs the full result for limit-aware interval tightening (DESIGN.md section 5.6.3).
 
-If performance becomes an issue for large write sets, this can be changed to a merge iterator later.
+If performance becomes an issue for large write sets, this can be changed to a merge stream later.
 
 ### Get-by-ID (not handled here)
 
@@ -172,7 +172,7 @@ Per DESIGN.md section 5.4, get-by-ID checks the write set first, then falls thro
 
 ```rust
 // In L6 (not L4):
-fn get(&self, collection: &str, doc_id: &DocId) -> Result<Option<Value>> {
+async fn get(&self, collection: &str, doc_id: &DocId) -> Result<Option<Value>> {
     // Check write set first
     if let Some(entry) = self.write_set.get(collection_id, doc_id) {
         match entry.op {
@@ -181,7 +181,7 @@ fn get(&self, collection: &str, doc_id: &DocId) -> Result<Option<Value>> {
         }
     }
     // Fall through to snapshot
-    primary_index.get_at_ts(doc_id, self.begin_ts)
+    primary_index.get_at_ts(doc_id, self.begin_ts).await
 }
 ```
 

@@ -10,6 +10,7 @@ pub enum LayerTab {
     Overview,
     Storage,   // L2
     Docstore,  // L3
+    Query,     // L4
     Console,
 }
 
@@ -19,6 +20,7 @@ impl LayerTab {
             LayerTab::Overview => "Overview",
             LayerTab::Storage => "L2 Storage",
             LayerTab::Docstore => "L3 Docstore",
+            LayerTab::Query => "L4 Query",
             LayerTab::Console => "Console",
         }
     }
@@ -27,6 +29,7 @@ impl LayerTab {
         LayerTab::Overview,
         LayerTab::Storage,
         LayerTab::Docstore,
+        LayerTab::Query,
         LayerTab::Console,
     ];
 }
@@ -111,6 +114,38 @@ impl DocstoreTool {
     ];
 }
 
+/// Tools within the L4 Query tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryTool {
+    Scan,
+    FilterTest,
+    RangeTools,
+}
+
+impl QueryTool {
+    pub fn label(&self) -> &'static str {
+        match self {
+            QueryTool::Scan => "Scan",
+            QueryTool::FilterTest => "Filter",
+            QueryTool::RangeTools => "Range",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            QueryTool::Scan => "\u{1F50E}",
+            QueryTool::FilterTest => "\u{1F3AF}",
+            QueryTool::RangeTools => "\u{1F4CF}",
+        }
+    }
+
+    pub const ALL: &[QueryTool] = &[
+        QueryTool::Scan,
+        QueryTool::FilterTest,
+        QueryTool::RangeTools,
+    ];
+}
+
 /// Operation result for toast notifications.
 #[derive(Clone, Debug)]
 pub enum OperationResult {
@@ -129,6 +164,8 @@ pub struct AppState {
     pub storage_tool: Signal<StorageTool>,
     /// Active tool within Docstore tab.
     pub docstore_tool: Signal<DocstoreTool>,
+    /// Active tool within Query tab.
+    pub query_tool: Signal<QueryTool>,
     /// Breadcrumb trail.
     pub breadcrumb: Signal<Vec<String>>,
     /// Read-write lock. false = locked (read-only), true = writes allowed.
@@ -148,6 +185,7 @@ impl AppState {
             active_tab: Signal::new(LayerTab::Overview),
             storage_tool: Signal::new(StorageTool::Pages),
             docstore_tool: Signal::new(DocstoreTool::Documents),
+            query_tool: Signal::new(QueryTool::Scan),
             breadcrumb: Signal::new(vec!["Database".to_string()]),
             write_enabled: Signal::new(false),
             dirty_page_count: Signal::new(0),

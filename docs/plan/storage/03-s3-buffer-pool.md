@@ -91,17 +91,17 @@ impl BufferPool {
     pub fn new(config: BufferPoolConfig, page_storage: Arc<dyn PageStorage>) -> Self;
 
     /// Fetch a page for reading. Loads from backend on cache miss.
-    pub fn fetch_page_shared(&self, page_id: PageId) -> Result<SharedPageGuard>;
+    pub async fn fetch_page_shared(&self, page_id: PageId) -> Result<SharedPageGuard>;
 
     /// Fetch a page for writing. Loads from backend on cache miss.
-    pub fn fetch_page_exclusive(&self, page_id: PageId) -> Result<ExclusivePageGuard>;
+    pub async fn fetch_page_exclusive(&self, page_id: PageId) -> Result<ExclusivePageGuard>;
 
     /// Allocate a new page (from free list or file extension) and return exclusive guard.
     /// The page buffer is zero-filled.
-    pub fn new_page(&self, page_id: PageId) -> Result<ExclusivePageGuard>;
+    pub async fn new_page(&self, page_id: PageId) -> Result<ExclusivePageGuard>;
 
     /// Flush a specific page to the backend (for checkpoint use).
-    pub fn flush_page(&self, page_id: PageId) -> Result<()>;
+    pub async fn flush_page(&self, page_id: PageId) -> Result<()>;
 
     /// Snapshot all dirty frames: returns (page_id, page_data_copy, lsn) tuples.
     /// Does NOT clear dirty flags (checkpoint does that after DWB write).

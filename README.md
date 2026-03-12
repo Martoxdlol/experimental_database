@@ -86,14 +86,14 @@ exdb = { path = "crates/database" }
 use exdb::Database;
 
 let db = Database::open("./mydata", Default::default()).await?;
-db.create_collection("users")?;
+db.create_collection("users").await?;
 
-let mut tx = db.begin_mutation()?;
-tx.insert("users", serde_json::json!({"name": "Alice", "age": 30}))?;
+let mut tx = db.begin_mutation().await?;
+tx.insert("users", serde_json::json!({"name": "Alice", "age": 30})).await?;
 tx.commit().await?;
 
-let tx = db.begin_readonly();
-let results = tx.query("users", &[])?;
+let tx = db.begin_readonly().await;
+let results = tx.query("users", &[]).await?;
 db.close().await?;
 ```
 

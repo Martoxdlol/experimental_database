@@ -11,10 +11,10 @@ The query engine sits between the document store (L3) and the transaction layer 
 L6 (Database) ─── calls ──→ L4 (Query Engine) ─── drives ──→ L3 (Docstore)
                                 │
                                 ├── resolve_access   → selects access method
-                                ├── execute_scan     → drives L3 iterators
+                                ├── execute_scan     → drives L3 streams (async)
                                 ├── filter_matches   → post-filter evaluation
                                 ├── encode_range     → byte interval encoding
-                                └── merge_with_writes → read-your-writes overlay
+                                └── merge_with_writes → read-your-writes overlay (async)
 ```
 
 **Depends on:** L1 (Core Types), L3 (Document Store).
@@ -28,8 +28,8 @@ plain slices via `MergeView`, not as L5 types.
 | `post_filter` | Evaluate `Filter` expressions against JSON documents |
 | `range_encoder` | Validate and encode `RangeExpr` into byte intervals |
 | `access` | Resolve the access method (IndexScan, TableScan, PrimaryGet) |
-| `scan` | Execute access methods via the Source → PostFilter → Terminal pipeline |
-| `merge` | Overlay write-set mutations onto snapshot scan results |
+| `scan` | Execute access methods via the Source → PostFilter → Terminal async stream pipeline |
+| `merge` | Overlay write-set mutations onto snapshot scan stream (async) |
 
 The `Filter` and `RangeExpr` AST types live in `exdb-core::filter` and are
 re-exported from this crate for convenience.
@@ -39,10 +39,10 @@ re-exported from this crate for convenience.
 ```
 1. Caller builds RangeExpr + Filter from the user query
 2. resolve_access() validates the range and selects IndexScan or TableScan
-3. execute_scan() creates a lazy QueryScanner
-4. Iterator::next() drives the pipeline:
-   Source (L3 SecondaryScanner) → PostFilter → Limit check → ScanRow
-5. (Optional) merge_with_writes() overlays in-transaction mutations
+3. execute_scan() creates a lazy ScanStream (async)
+4. Stream::next().await drives the pipeline:
+   Source (L3 SecondaryScanner stream) → PostFilter → Limit check → ScanRow
+5. (Optional) merge_with_writes() overlays in-transaction mutations (async, takes Stream)
 ```
 
 ## Usage
@@ -90,18 +90,19 @@ let method = resolve_access(
 // Execute against indexes at a read timestamp
 let read_ts = 42;
 let secondary_indexes: HashMap<IndexId, _> = /* ... */;
-let scanner = execute_scan(
+let mut stream = execute_scan(
     &method,
     &primary_index,
     &secondary_indexes,
     read_ts,
-).expect("scan started");
+).await.expect("scan started");
 
 // Read interval is available immediately (before iterating)
-let interval = scanner.read_interval();
+let interval = stream.read_interval();
 
-// Lazily consume results
-for result in scanner {
+// Lazily consume results via async stream
+use tokio_stream::StreamExt;
+while let Some(result) = stream.next().await {
     let row = result.expect("no I/O error");
     println!("doc_id={:?} ts={} body={}", row.doc_id, row.version_ts, row.doc);
 }
@@ -193,7 +194,7 @@ let merge_view = MergeView {
 };
 
 let merged = merge_with_writes(
-    snapshot.into_iter(),
+    tokio_stream::iter(snapshot),
     &merge_view,
     &[FieldPath::single("x")], // sort fields
     Bound::Unbounded,
@@ -201,7 +202,7 @@ let merged = merge_with_writes(
     None,                        // no post-filter
     ScanDirection::Forward,
     None,                        // no limit
-).unwrap();
+).await.unwrap();
 ```
 
 ## Key Design Decisions
@@ -209,8 +210,8 @@ let merged = merge_with_writes(
 1. **No L5 dependency** — The merge layer receives a `MergeView` (plain slices),
    not L5 `WriteSet`. This keeps the dependency chain strict: L4 → L3 → L2 → L1.
 
-2. **Iterator-based scan** — `execute_scan` returns a `QueryScanner` implementing
-   `Iterator<Item = io::Result<ScanRow>>`. Documents are produced lazily through the
+2. **Stream-based scan** — `execute_scan` returns a `ScanStream` implementing
+   `Stream<Item = io::Result<ScanRow>>`. Documents are produced lazily through the
    Source → PostFilter → Limit pipeline.
 
 3. **Read interval from access method bounds** — The read interval is computed from the

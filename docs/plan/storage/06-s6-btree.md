@@ -34,7 +34,7 @@ pub struct BTree {
 impl BTree {
     /// Create a new B-tree with an empty leaf root page.
     /// Allocates one page from the buffer pool.
-    pub fn create(buffer_pool: Arc<BufferPool>, free_list: &mut FreeList) -> Result<Self>;
+    pub async fn create(buffer_pool: Arc<BufferPool>, free_list: &mut FreeList) -> Result<Self>;
 
     /// Open an existing B-tree rooted at `root_page`.
     pub fn open(root_page: PageId, buffer_pool: Arc<BufferPool>) -> Self;
@@ -43,23 +43,23 @@ impl BTree {
     pub fn root_page(&self) -> PageId;
 
     /// Point lookup. Returns value bytes if found, None if not.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
     /// Insert or update a key-value pair.
     /// If key exists, the value is replaced.
-    pub fn insert(&self, key: &[u8], value: &[u8],
+    pub async fn insert(&self, key: &[u8], value: &[u8],
                   free_list: &mut FreeList) -> Result<()>;
 
     /// Delete a key. Returns true if the key was found and deleted.
-    pub fn delete(&self, key: &[u8], free_list: &mut FreeList) -> Result<bool>;
+    pub async fn delete(&self, key: &[u8], free_list: &mut FreeList) -> Result<bool>;
 
     /// Range scan with bounds and direction.
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>,
-                direction: ScanDirection) -> ScanIterator;
+                direction: ScanDirection) -> ScanStream;
 }
 
-/// Iterator over (key, value) pairs from a range scan.
-pub struct ScanIterator {
+/// Stream over (key, value) pairs from a range scan.
+pub struct ScanStream {
     buffer_pool: Arc<BufferPool>,
     current_page: Option<PageId>,
     current_slot: u16,
@@ -70,7 +70,7 @@ pub struct ScanIterator {
     done: bool,
 }
 
-impl Iterator for ScanIterator {
+impl Stream for ScanStream {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
 }
 ```

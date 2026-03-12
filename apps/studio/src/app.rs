@@ -5,11 +5,12 @@ use crate::modules::{
     console::ConsoleModule,
     docstore::{DocumentsModule, KeyToolsModule, SecondaryIndexModule, VacuumModule},
     overview::OverviewModule,
+    query::{QueryScanModule, FilterTestModule, RangeToolsModule},
     storage::{
         BTreeModule, CatalogModule, FreeListModule, HeapModule, PagesModule, WalModule,
     },
 };
-use crate::state::{AppState, DocstoreTool, LayerTab, StorageTool};
+use crate::state::{AppState, DocstoreTool, LayerTab, QueryTool, StorageTool};
 use crate::theme::STYLESHEET;
 
 #[component]
@@ -75,6 +76,14 @@ fn ModuleContent() -> Element {
                 DocstoreTool::SecondaryIndexes => rsx! { SecondaryIndexModule {} },
                 DocstoreTool::KeyTools => rsx! { KeyToolsModule {} },
                 DocstoreTool::Vacuum => rsx! { VacuumModule {} },
+            }
+        }
+        LayerTab::Query => {
+            let tool = *state.query_tool.read();
+            match tool {
+                QueryTool::Scan => rsx! { QueryScanModule {} },
+                QueryTool::FilterTest => rsx! { FilterTestModule {} },
+                QueryTool::RangeTools => rsx! { RangeToolsModule {} },
             }
         }
     }

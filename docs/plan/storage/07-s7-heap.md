@@ -45,13 +45,13 @@ impl Heap {
 
     /// Store a blob. Returns a HeapRef for later retrieval.
     /// Handles single-page and multi-page (overflow chain) blobs.
-    pub fn store(&mut self, data: &[u8], free_list: &mut FreeList) -> Result<HeapRef>;
+    pub async fn store(&mut self, data: &[u8], free_list: &mut FreeList) -> Result<HeapRef>;
 
     /// Load a blob by reference. Reassembles overflow chains.
-    pub fn load(&self, href: HeapRef) -> Result<Vec<u8>>;
+    pub async fn load(&self, href: HeapRef) -> Result<Vec<u8>>;
 
     /// Free a blob and reclaim its pages.
-    pub fn free(&mut self, href: HeapRef, free_list: &mut FreeList) -> Result<()>;
+    pub async fn free(&mut self, href: HeapRef, free_list: &mut FreeList) -> Result<()>;
 
     /// Rebuild the free space map by scanning all heap pages.
     /// Called on startup after recovery.

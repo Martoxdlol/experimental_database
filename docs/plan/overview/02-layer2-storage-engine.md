@@ -8,21 +8,25 @@ The storage engine is **backend-agnostic**. All physical I/O is behind two trait
 
 ```rust
 /// Page-level I/O backend. Implementations handle actual storage.
+/// All methods are async (#[async_trait]).
+#[async_trait]
 pub trait PageStorage: Send + Sync {
-    fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> Result<()>;
-    fn write_page(&self, page_id: PageId, buf: &[u8]) -> Result<()>;
-    fn sync(&self) -> Result<()>;
-    fn page_count(&self) -> u64;
-    fn extend(&self, new_count: u64) -> Result<()>;
+    async fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> Result<()>;
+    async fn write_page(&self, page_id: PageId, buf: &[u8]) -> Result<()>;
+    async fn sync(&self) -> Result<()>;
+    async fn page_count(&self) -> u64;
+    async fn extend(&self, new_count: u64) -> Result<()>;
 }
 
 /// WAL I/O backend. Implementations handle log persistence.
+/// All methods are async (#[async_trait]).
+#[async_trait]
 pub trait WalStorage: Send + Sync {
-    fn append(&self, data: &[u8]) -> Result<u64>;       // returns offset
-    fn sync(&self) -> Result<()>;
-    fn read_from(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
-    fn truncate_before(&self, offset: u64) -> Result<()>;
-    fn size(&self) -> u64;
+    async fn append(&self, data: &[u8]) -> Result<u64>;       // returns offset
+    async fn sync(&self) -> Result<()>;
+    async fn read_from(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
+    async fn truncate_before(&self, offset: u64) -> Result<()>;
+    async fn size(&self) -> u64;
 }
 
 /// File-backed storage (durable, crash-safe)
@@ -31,8 +35,8 @@ pub struct FileWalStorage { dir: PathBuf, segment_size: usize }
 
 /// In-memory storage (ephemeral, zero I/O)
 /// No fsync, no DWB, no crash recovery — data lives only in RAM.
-pub struct MemoryPageStorage { pages: RwLock<Vec<Vec<u8>>>, page_size: usize }
-pub struct MemoryWalStorage { log: RwLock<Vec<u8>> }
+pub struct MemoryPageStorage { pages: tokio::sync::RwLock<Vec<Vec<u8>>>, page_size: usize }
+pub struct MemoryWalStorage { log: tokio::sync::RwLock<Vec<u8>> }
 ```
 
 **Design rules:**
@@ -49,40 +53,40 @@ pub struct MemoryWalStorage { log: RwLock<Vec<u8>> }
 pub struct StorageEngine { /* ... */ }
 
 impl StorageEngine {
-    // Lifecycle — file-backed (durable)
-    pub fn open(path: &Path, config: StorageConfig) -> Result<Self>;
+    // Lifecycle — file-backed (durable), all async
+    pub async fn open(path: &Path, config: StorageConfig) -> Result<Self>;
 
     // Lifecycle — in-memory (ephemeral)
-    pub fn open_in_memory(config: StorageConfig) -> Result<Self>;
+    pub async fn open_in_memory(config: StorageConfig) -> Result<Self>;
 
     // Lifecycle — custom backend
-    pub fn open_with_backend(
+    pub async fn open_with_backend(
         page_storage: Arc<dyn PageStorage>,
         wal_storage: Arc<dyn WalStorage>,
         config: StorageConfig,
     ) -> Result<Self>;
 
-    pub fn close(&mut self) -> Result<()>;
+    pub async fn close(&mut self) -> Result<()>;
 
     /// Returns true if this engine uses durable (file-backed) storage
     pub fn is_durable(&self) -> bool;
 
-    // B-tree management
-    pub fn create_btree(&self) -> Result<BTreeHandle>;
-    pub fn open_btree(&self, root_page: PageId) -> BTreeHandle;
+    // B-tree management (async)
+    pub async fn create_btree(&self) -> Result<BTreeHandle>;
+    pub async fn open_btree(&self, root_page: PageId) -> BTreeHandle;
 
-    // Large value storage
-    pub fn heap_store(&self, data: &[u8]) -> Result<HeapRef>;
-    pub fn heap_load(&self, href: HeapRef) -> Result<Vec<u8>>;
-    pub fn heap_free(&self, href: HeapRef) -> Result<()>;
+    // Large value storage (async)
+    pub async fn heap_store(&self, data: &[u8]) -> Result<HeapRef>;
+    pub async fn heap_load(&self, href: HeapRef) -> Result<Vec<u8>>;
+    pub async fn heap_free(&self, href: HeapRef) -> Result<()>;
 
-    // WAL
-    pub fn append_wal(&self, record_type: u8, payload: &[u8]) -> Result<Lsn>;
-    pub fn read_wal_from(&self, lsn: Lsn) -> WalIterator;
+    // WAL (async)
+    pub async fn append_wal(&self, record_type: u8, payload: &[u8]) -> Result<Lsn>;
+    pub fn read_wal_from(&self, lsn: Lsn) -> WalStream;
 
-    // Maintenance
-    pub fn checkpoint(&self) -> Result<()>;  // no-op for in-memory
-    pub fn recover(&mut self) -> Result<()>; // no-op for in-memory
+    // Maintenance (async)
+    pub async fn checkpoint(&self) -> Result<()>;  // no-op for in-memory
+    pub async fn recover(&mut self) -> Result<()>; // no-op for in-memory
 
     // Internal access (for integration layer)
     pub fn buffer_pool(&self) -> &BufferPool;
@@ -92,11 +96,11 @@ impl StorageEngine {
 pub struct BTreeHandle { /* ... */ }
 
 impl BTreeHandle {
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
-    pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<()>;
-    pub fn delete(&self, key: &[u8]) -> Result<bool>;
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()>;
+    pub async fn delete(&self, key: &[u8]) -> Result<bool>;
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>,
-                direction: ScanDirection) -> ScanIterator;
+                direction: ScanDirection) -> ScanStream;
     pub fn root_page(&self) -> PageId;
 }
 ```
@@ -159,7 +163,7 @@ impl<'a> SlottedPage<'a> {
 
 ```rust
 pub struct BufferPool {
-    page_table: RwLock<HashMap<PageId, FrameId>>,
+    page_table: tokio::sync::RwLock<HashMap<PageId, FrameId>>,
     frames: Vec<FrameSlot>,
     clock_hand: AtomicU32,
     page_storage: Arc<dyn PageStorage>,  // backend-agnostic
@@ -167,7 +171,7 @@ pub struct BufferPool {
 }
 
 pub struct FrameSlot {
-    lock: parking_lot::RwLock<FrameData>,
+    lock: tokio::sync::RwLock<FrameData>,
 }
 
 struct FrameData {
@@ -195,10 +199,10 @@ impl ExclusivePageGuard<'_> {
 
 impl BufferPool {
     pub fn new(config: BufferPoolConfig, page_storage: Arc<dyn PageStorage>) -> Self;
-    pub fn fetch_page_shared(&self, page_id: PageId) -> Result<SharedPageGuard>;
-    pub fn fetch_page_exclusive(&self, page_id: PageId) -> Result<ExclusivePageGuard>;
-    pub fn new_page(&self) -> Result<ExclusivePageGuard>;
-    pub fn flush_page(&self, page_id: PageId) -> Result<()>;
+    pub async fn fetch_page_shared(&self, page_id: PageId) -> Result<SharedPageGuard>;
+    pub async fn fetch_page_exclusive(&self, page_id: PageId) -> Result<ExclusivePageGuard>;
+    pub async fn new_page(&self) -> Result<ExclusivePageGuard>;
+    pub async fn flush_page(&self, page_id: PageId) -> Result<()>;
     pub fn dirty_frames(&self) -> Vec<(PageId, Vec<u8>)>;  // snapshot for checkpoint
 }
 ```
@@ -210,8 +214,8 @@ impl BufferPool {
 ```rust
 pub enum ScanDirection { Forward, Backward }
 
-pub struct ScanIterator { /* ... */ }
-impl Iterator for ScanIterator {
+pub struct ScanStream { /* ... */ }
+impl Stream for ScanStream {
     type Item = Result<(Vec<u8>, Vec<u8>)>;  // (key, value) pairs
 }
 
@@ -221,14 +225,14 @@ pub struct BTree {
 }
 
 impl BTree {
-    pub fn new(buffer_pool: Arc<BufferPool>) -> Result<Self>;  // allocates root
+    pub async fn new(buffer_pool: Arc<BufferPool>) -> Result<Self>;  // allocates root
     pub fn open(root_page: PageId, buffer_pool: Arc<BufferPool>) -> Self;
     pub fn root_page(&self) -> PageId;
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
-    pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<()>;
-    pub fn delete(&self, key: &[u8]) -> Result<bool>;
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()>;
+    pub async fn delete(&self, key: &[u8]) -> Result<bool>;
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>,
-                dir: ScanDirection) -> ScanIterator;
+                dir: ScanDirection) -> ScanStream;
 
     // Internal operations
     fn search_leaf(&self, key: &[u8]) -> Result<SharedPageGuard>;
@@ -268,18 +272,19 @@ pub struct WalWriter {
 impl WalWriter {
     pub fn new(storage: Arc<dyn WalStorage>, config: WalConfig) -> Result<Self>;
     pub async fn append(&self, record_type: u8, payload: &[u8]) -> Result<Lsn>;
-    pub fn append_raw_frame(&self, raw: &[u8]) -> Result<Lsn>;  // for replication
+    pub async fn append_raw_frame(&self, raw: &[u8]) -> Result<Lsn>;  // for replication
+    pub async fn shutdown(&self) -> Result<()>;
 }
 
 pub struct WalReader { /* ... */ }
 impl WalReader {
     pub fn open(storage: Arc<dyn WalStorage>) -> Result<Self>;
-    pub fn read_from(&self, lsn: Lsn) -> WalIterator;
+    pub fn read_from(&self, lsn: Lsn) -> WalStream;
     pub fn latest_lsn(&self) -> Lsn;
 }
 
-pub struct WalIterator { /* ... */ }
-impl Iterator for WalIterator {
+pub struct WalStream { /* ... */ }
+impl Stream for WalStream {
     type Item = Result<WalRecord>;
 }
 ```
@@ -302,10 +307,10 @@ pub struct Heap {
 
 impl Heap {
     pub fn new(buffer_pool: Arc<BufferPool>) -> Self;
-    pub fn store(&mut self, data: &[u8]) -> Result<HeapRef>;
-    pub fn load(&self, href: HeapRef) -> Result<Vec<u8>>;
-    pub fn free(&mut self, href: HeapRef) -> Result<()>;
-    pub fn rebuild_free_space_map(&mut self) -> Result<()>;  // on startup
+    pub async fn store(&mut self, data: &[u8]) -> Result<HeapRef>;
+    pub async fn load(&self, href: HeapRef) -> Result<Vec<u8>>;
+    pub async fn free(&mut self, href: HeapRef) -> Result<()>;
+    pub async fn rebuild_free_space_map(&mut self) -> Result<()>;  // on startup
 }
 ```
 
@@ -321,8 +326,9 @@ pub struct FreeList {
 
 impl FreeList {
     pub fn new(head: PageId, buffer_pool: Arc<BufferPool>) -> Self;
-    pub fn allocate(&mut self) -> Result<PageId>;  // pop from list, or extend file
-    pub fn deallocate(&mut self, page_id: PageId) -> Result<()>;  // push to list
+    pub async fn allocate(&mut self) -> Result<PageId>;  // pop from list, or extend file
+    pub async fn deallocate(&mut self, page_id: PageId) -> Result<()>;  // push to list
+    pub async fn count(&self) -> Result<usize>;
     pub fn head(&self) -> PageId;
 }
 ```
@@ -360,7 +366,7 @@ pub struct Checkpoint {
 
 impl Checkpoint {
     pub fn new(bp: Arc<BufferPool>, dwb: DoubleWriteBuffer, wal: WalWriter) -> Self;
-    pub async fn run(&self) -> Result<Lsn>;  // returns checkpoint_lsn
+    pub async fn run(&self) -> Result<Lsn>;  // returns checkpoint_lsn (async)
     // Steps: snapshot dirty → DWB write → scatter-write → mark clean → WAL record
 }
 ```
@@ -379,8 +385,9 @@ pub struct Recovery {
 }
 
 impl Recovery {
-    pub fn run(path: &Path, config: StorageConfig,
+    pub async fn run(path: &Path, config: StorageConfig,
                handler: &mut dyn WalRecordHandler) -> Result<StorageEngine>;
+    pub async fn needs_recovery(path: &Path) -> Result<bool>;
     // Steps: read meta.json → DWB recovery → open data.db → WAL replay
 }
 ```
@@ -483,7 +490,7 @@ pub struct FileHeader {
 |-----------|---------|---------|
 | `StorageEngine` | L3, L6 (Database) | Full storage facade |
 | `BTreeHandle` | L3 (PrimaryIndex, SecondaryIndex) | Raw byte B-tree ops |
-| `ScanIterator` | L3, L4 | Range scan results |
+| `ScanStream` | L3, L4 | Range scan results |
 | `HeapRef`, `heap_store/load/free` | L3 (large doc storage) | External blob storage |
 | `WalWriter`, `WalReader`, `WalRecord` | L5 (commit), L7 (replication) | Durable logging |
 | `Lsn` | L5, L7 | WAL position tracking |

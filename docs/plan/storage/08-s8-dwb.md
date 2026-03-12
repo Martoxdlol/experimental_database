@@ -51,11 +51,11 @@ impl DoubleWriteBuffer {
     ///   4. page_storage.sync()
     ///   5. Truncate dwb_path to 0
     ///   6. fsync dwb_path (the truncation)
-    pub fn write_pages(&self, pages: &[(PageId, Vec<u8>)]) -> Result<()>;
+    pub async fn write_pages(&self, pages: &[(PageId, Vec<u8>)]) -> Result<()>;
 
     /// Recover from a crash: restore any torn pages in page_storage from DWB.
     /// Returns the number of pages restored.
-    pub fn recover(&self) -> Result<u32>;
+    pub async fn recover(&self) -> Result<u32>;
 
     /// Truncate the DWB file to zero (called after successful checkpoint).
     pub fn truncate(&self) -> Result<()>;

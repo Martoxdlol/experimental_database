@@ -8,13 +8,13 @@ Document store built on top of the clustered primary B-tree. Adds MVCC version s
 
 - **D1 (Key Encoding)**: `make_primary_key`, `parse_primary_key`, `inv_ts`
 - **D2 (Version Resolution)**: `VersionResolver`, `Verdict`
-- **L2 (Storage Engine)**: `BTreeHandle`, `ScanIterator`, `ScanDirection`, `Heap`, `HeapRef`
+- **L2 (Storage Engine)**: `BTreeHandle`, `ScanStream`, `ScanDirection`, `Heap`, `HeapRef`
 - **L1 (Core Types)**: `DocId`, `Ts`
 
 ## Rust Types
 
 ```rust
-use crate::storage::{BTreeHandle, Heap, HeapRef, ScanDirection};
+use crate::storage::{BTreeHandle, Heap, HeapRef, ScanDirection, ScanStream};
 use crate::core::types::{DocId, Ts};
 use crate::docstore::key_encoding::{make_primary_key, parse_primary_key, inv_ts};
 use crate::docstore::version_resolution::{VersionResolver, Verdict};
@@ -51,26 +51,26 @@ impl PrimaryIndex {
     /// key = doc_id || inv_ts(commit_ts)
     /// value = flags[1] || body_len[4] || body (inline) or heap_ref (external)
     /// body = None means tombstone (delete).
-    pub fn insert_version(
+    pub async fn insert_version(
         &self,
         doc_id: &DocId,
         commit_ts: Ts,
         body: Option<&[u8]>,
-    ) -> Result<()>;
+    ) -> std::io::Result<()>;
 
     /// Get the latest visible version of a document at read_ts.
     /// Seeks to doc_id || inv_ts(read_ts), takes first entry with ts <= read_ts.
     /// Returns None if tombstone or doc doesn't exist.
-    pub fn get_at_ts(&self, doc_id: &DocId, read_ts: Ts) -> Result<Option<Vec<u8>>>;
+    pub async fn get_at_ts(&self, doc_id: &DocId, read_ts: Ts) -> std::io::Result<Option<Vec<u8>>>;
 
     /// Get the latest visible version's timestamp (for secondary index verification).
     /// Returns None if doc doesn't exist or is a tombstone at read_ts.
-    pub fn get_version_ts(&self, doc_id: &DocId, read_ts: Ts) -> Result<Option<Ts>>;
+    pub async fn get_version_ts(&self, doc_id: &DocId, read_ts: Ts) -> std::io::Result<Option<Ts>>;
 
     /// Scan all visible documents at read_ts.
-    /// Returns an iterator yielding (doc_id, version_ts, body) for each visible
+    /// Returns a stream yielding (doc_id, version_ts, body) for each visible
     /// non-tombstone document.
-    pub fn scan_at_ts(&self, read_ts: Ts, direction: ScanDirection) -> PrimaryScanner;
+    pub fn scan_at_ts(&self, read_ts: Ts, direction: ScanDirection) -> PrimaryScanStream;
 
     /// Access the underlying B-tree handle (for vacuum and index builder).
     pub fn btree(&self) -> &BTreeHandle;
@@ -79,14 +79,14 @@ impl PrimaryIndex {
     pub fn heap(&self) -> &Arc<Heap>;
 }
 
-/// Iterator over visible documents in the primary index.
-pub struct PrimaryScanner {
-    inner: ScanIterator,
+/// Stream over visible documents in the primary index.
+pub struct PrimaryScanStream {
+    inner: ScanStream,
     resolver: VersionResolver,
     heap: Arc<Heap>,
 }
 
-impl Iterator for PrimaryScanner {
+impl Stream for PrimaryScanStream {
     /// (doc_id, version_ts, body_bytes)
     type Item = Result<(DocId, Ts, Vec<u8>)>;
 }
@@ -135,9 +135,9 @@ The B-tree value for each entry follows this layout:
    - If `data.len() <= external_threshold`:
      - value = `[flags_byte, body_len_le_bytes..., data...]`
    - Else (external):
-     - Store in heap: `let href = self.heap.store(data)?`
+     - Store in heap: `let href = self.heap.store(data).await?`
      - value = `[flags_byte, body_len_le_bytes..., href.page_id_le, href.slot_id_le]`
-4. Call `self.btree.insert(&key, &value)`.
+4. Call `self.btree.insert(&key, &value).await`.
 
 ### get_at_ts()
 
@@ -162,8 +162,8 @@ Same as `get_at_ts()` but returns `Some(ts)` instead of the body. Used by second
 ### scan_at_ts()
 
 1. Create a B-tree scan with `Unbounded` bounds (or bounded for specific doc_id ranges).
-2. Wrap in `PrimaryScanner` with a `VersionResolver` pinned at `read_ts`.
-3. The scanner's `next()` implementation handles all three verdict variants:
+2. Wrap in `PrimaryScanStream` with a `VersionResolver` pinned at `read_ts`.
+3. The stream's `poll_next()` implementation handles all three verdict variants:
 
    **Forward mode** (`Visible` / `Skip`):
    - Read next entry from inner B-tree scan.
@@ -187,7 +187,7 @@ Same as `get_at_ts()` but returns `Some(ts)` instead of the body. Used by second
 3. Read body_len from value[1..5].
 4. If external flag set:
    - Read heap_page_id from value[5..9], heap_slot_id from value[9..11].
-   - `self.heap.load(HeapRef { page_id, slot_id })`
+   - `self.heap.load(HeapRef { page_id, slot_id }).await`
 5. Else (inline):
    - Copy `value[5..5+body_len]`.
 

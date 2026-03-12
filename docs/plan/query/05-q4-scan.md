@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Executes an `AccessMethod` by driving Layer 3 iterators through the three-stage pipeline: Source → PostFilter → Terminal. Returns a lazy iterator over matching documents. Computes read set intervals from access method bounds.
+Executes an `AccessMethod` by driving Layer 3 async streams through the three-stage pipeline: Source → PostFilter → Terminal. Returns an async stream over matching documents. Computes read set intervals from access method bounds.
 
 Corresponds to DESIGN.md sections 4.1, 4.2, 4.5.
 
@@ -55,29 +55,20 @@ pub struct ScanStats {
 
 /// Execute a query plan against the indexes at the given read timestamp.
 ///
-/// Returns a QueryScanner that lazily produces documents through the
-/// Source → PostFilter → Terminal pipeline.
-pub fn execute_scan(
-    plan: &AccessMethod,
-    primary_index: &PrimaryIndex,
-    secondary_indexes: &HashMap<IndexId, SecondaryIndex>,
+/// Returns a QueryScanStream that lazily produces documents through the
+/// Source → PostFilter → Terminal pipeline, along with the ReadIntervalInfo.
+pub async fn execute_scan<'a>(
+    method: &'a AccessMethod,
+    primary_index: &'a PrimaryIndex,
+    secondary_indexes: &'a HashMap<IndexId, SecondaryIndex>,
     read_ts: Ts,
-) -> std::io::Result<QueryScanner>;
+) -> std::io::Result<(QueryScanStream<'a>, ReadIntervalInfo)>;
 
-/// Lazy iterator over query results.
-pub struct QueryScanner { /* internal state */ }
+/// Async stream over query results.
+pub struct QueryScanStream<'a> { /* internal state */ }
 
-impl Iterator for QueryScanner {
+impl<'a> futures_core::Stream for QueryScanStream<'a> {
     type Item = std::io::Result<ScanRow>;
-}
-
-impl QueryScanner {
-    /// The read set interval for this scan.
-    /// Computed from the plan bounds, available before iteration.
-    pub fn read_interval(&self) -> &ReadIntervalInfo;
-
-    /// Accumulated scan statistics.
-    pub fn stats(&self) -> &ScanStats;
 }
 ```
 
@@ -85,21 +76,21 @@ impl QueryScanner {
 
 ### execute_scan()
 
-Constructs a `QueryScanner` based on the plan variant:
+Constructs a `QueryScanStream` based on the plan variant:
 
 ```rust
-pub fn execute_scan(
-    plan: &AccessMethod,
-    primary_index: &PrimaryIndex,
-    secondary_indexes: &HashMap<IndexId, SecondaryIndex>,
+pub async fn execute_scan<'a>(
+    method: &'a AccessMethod,
+    primary_index: &'a PrimaryIndex,
+    secondary_indexes: &'a HashMap<IndexId, SecondaryIndex>,
     read_ts: Ts,
-) -> std::io::Result<QueryScanner> {
-    match plan {
+) -> std::io::Result<(QueryScanStream<'a>, ReadIntervalInfo)> {
+    match method {
         AccessMethod::PrimaryGet { collection_id, doc_id } => {
-            // Point lookup — not a scan, but we wrap it as a single-element iterator.
-            let body = primary_index.get_at_ts(doc_id, read_ts)?;
-            let ts = primary_index.get_version_ts(doc_id, read_ts)?;
-            // ... construct single-row or empty scanner
+            // Point lookup — not a scan, but we wrap it as a single-element stream.
+            let body = primary_index.get_at_ts(doc_id, read_ts).await?;
+            let ts = primary_index.get_version_ts(doc_id, read_ts).await?;
+            // ... construct single-row or empty stream + read interval
         }
 
         AccessMethod::IndexScan {
@@ -109,14 +100,14 @@ pub fn execute_scan(
             let sec_index = secondary_indexes.get(index_id)
                 .ok_or_else(|| io::Error::other("index not found"))?;
 
-            let scanner = sec_index.scan_at_ts(
+            let stream = sec_index.scan_at_ts(
                 bound_as_ref(lower),
                 bound_as_ref(upper),
                 read_ts,
                 *direction,
             );
 
-            // Wrap in QueryScanner with post_filter + limit + primary fetch
+            // Wrap in QueryScanStream with post_filter + limit + primary fetch
         }
 
         AccessMethod::TableScan {
@@ -126,55 +117,54 @@ pub fn execute_scan(
             let sec_index = secondary_indexes.get(index_id)
                 .ok_or_else(|| io::Error::other("_created_at index not found"))?;
 
-            let scanner = sec_index.scan_at_ts(
+            let stream = sec_index.scan_at_ts(
                 Bound::Unbounded,
                 Bound::Unbounded,
                 read_ts,
                 *direction,
             );
 
-            // Wrap in QueryScanner with post_filter + limit + primary fetch
+            // Wrap in QueryScanStream with post_filter + limit + primary fetch
         }
     }
 }
 ```
 
-### QueryScanner internals
+### QueryScanStream internals
 
-The scanner wraps the L3 iterator and adds three stages:
+The stream wraps the L3 async stream and adds three stages:
 
 ```rust
-enum ScanSource {
+enum ScanSource<'a> {
     /// Point lookup result (0 or 1 documents).
     Point(Option<ScanRow>),
     /// Secondary index scan — yields (doc_id, ts), needs primary fetch.
     Secondary {
-        inner: SecondaryScanner,
-        primary: &PrimaryIndex,
+        inner: SecondaryStream<'a>,
+        primary: &'a PrimaryIndex,
     },
 }
 
-struct QueryScanner {
-    source: ScanSource,
+struct QueryScanStream<'a> {
+    source: ScanSource<'a>,
     post_filter: Option<Filter>,
     limit: Option<usize>,
-    read_interval: ReadIntervalInfo,
     stats: ScanStats,
 }
 ```
 
-### QueryScanner::next()
+### QueryScanStream::poll_next()
 
 ```
-1. Check limit: if returned_docs >= limit, return None.
+1. Check limit: if returned_docs >= limit, return Poll::Ready(None).
 
-2. Pull next from source:
+2. Pull next from source (async):
    a. Point: take the Option<ScanRow>, return it (single shot).
    b. Secondary:
-      - Call inner.next() to get (doc_id, version_ts).
-        Note: SecondaryScanner yields (DocId, Ts) — the Ts is the version
+      - Poll inner stream to get (doc_id, version_ts).
+        Note: SecondaryStream yields (DocId, Ts) — the Ts is the version
         timestamp from primary verification. Use this directly for ScanRow.version_ts.
-      - Fetch document body: primary.get_at_ts(doc_id, read_ts).
+      - Fetch document body: primary.get_at_ts(doc_id, read_ts).await.
       - If get_at_ts returns None, skip (tombstone race — shouldn't happen
         normally but handle defensively).
       - Decode body: decode_document(body_bytes) → serde_json::Value.
@@ -183,7 +173,7 @@ struct QueryScanner {
 3. Apply post-filter: if post_filter is Some, call filter_matches(doc, filter).
    If no match, go back to step 2.
 
-4. Increment returned_docs. Return Some(Ok(ScanRow { doc_id, version_ts, doc })).
+4. Increment returned_docs. Return Poll::Ready(Some(Ok(ScanRow { doc_id, version_ts, doc }))).
 ```
 
 ### Read interval computation
@@ -258,17 +248,17 @@ The `query_id` is used for subscription granularity (which queries were invalida
 
 ### Read set size limits (DESIGN.md section 5.6.5)
 
-The scanner tracks `scanned_docs` and `scanned_bytes` via `ScanStats`. However, L4 does **not** enforce the read set size limits (`max_intervals`, `max_scanned_bytes`, `max_scanned_docs`). These limits are transaction-scoped (accumulated across multiple queries), so they are enforced by L6 which checks `stats()` after each scan and aborts the transaction with `read_limit_exceeded` if any limit is exceeded.
+The stream tracks `scanned_docs` and `scanned_bytes` via `ScanStats`. However, L4 does **not** enforce the read set size limits (`max_intervals`, `max_scanned_bytes`, `max_scanned_docs`). These limits are transaction-scoped (accumulated across multiple queries), so they are enforced by L6 which inspects stats after consuming the stream and aborts the transaction with `read_limit_exceeded` if any limit is exceeded.
 
 ### Limit-aware interval tightening
 
-Per DESIGN.md section 5.6.3, when a query returns exactly `limit` results, the interval tightens to the last returned key. This is NOT done inside the scanner — it is done by L6 after the scan completes, because it requires knowing the last returned document's index key encoding. The scanner provides `stats().returned_docs` and the caller can compare against the limit.
+Per DESIGN.md section 5.6.3, when a query returns exactly `limit` results, the interval tightens to the last returned key. This is NOT done inside the stream — it is done by L6 after the stream is consumed, because it requires knowing the last returned document's index key encoding.
 
 ### Performance: avoiding unnecessary primary fetches
 
 For `PrimaryGet`, the body is fetched directly — no secondary index involved.
 
-For `IndexScan` / `TableScan`, each `SecondaryScanner` hit requires a primary fetch to get the document body (for post-filter evaluation and returning to the caller). This is inherent to the secondary index design — secondary entries contain only the key, not the body.
+For `IndexScan` / `TableScan`, each secondary stream hit requires an async primary fetch to get the document body (for post-filter evaluation and returning to the caller). This is inherent to the secondary index design — secondary entries contain only the key, not the body.
 
 If there's no post-filter, we still need the body for the response. The primary fetch is always needed.
 
@@ -318,4 +308,4 @@ fn bound_as_ref(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
 
 17. **Large scan**: insert 1000 docs, scan all, verify count and ordering.
 18. **Compound index scan**: index on [A, B], range eq(A, 1), verify only A=1 docs returned.
-19. **Iterator laziness**: start iteration, consume 2 of 100 results, drop iterator. Verify no crash and that not all 100 docs were fetched (if measurable).
+19. **Stream laziness**: start stream, consume 2 of 100 results, drop stream. Verify no crash and that not all 100 docs were fetched (if measurable).

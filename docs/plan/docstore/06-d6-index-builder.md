@@ -6,7 +6,7 @@ Background index building: scans the primary B-tree at a snapshot timestamp and 
 
 ## Dependencies
 
-- **D3 (Primary Index)**: `PrimaryIndex`, `PrimaryScanner` (snapshot scan source)
+- **D3 (Primary Index)**: `PrimaryIndex`, `PrimaryScanStream` (snapshot scan source)
 - **D4 (Secondary Index)**: `SecondaryIndex` (target for entries)
 - **D5 (Array Indexing)**: `compute_index_entries` (key generation per document)
 - **D1 (Key Encoding)**: `make_secondary_key_from_prefix`
@@ -68,11 +68,11 @@ impl IndexBuilder {
 ### build()
 
 ```
-1. Let scanner = self.primary.scan_at_ts(build_snapshot_ts, Forward);
+1. Let stream = self.primary.scan_at_ts(build_snapshot_ts, Forward);
 2. let mut entries_inserted: u64 = 0;
 3. let mut docs_scanned: u64 = 0;
 
-4. for (doc_id, version_ts, body_bytes) in scanner {
+4. while let Some((doc_id, version_ts, body_bytes)) = stream.next().await {
        docs_scanned += 1;
 
        // Decode BSON body to JSON for field extraction
@@ -84,7 +84,7 @@ impl IndexBuilder {
        // Insert one entry per key prefix
        for prefix in key_prefixes {
            let full_key = make_secondary_key_from_prefix(&prefix, &doc_id, version_ts);
-           self.secondary.insert_entry(&full_key)?;
+           self.secondary.insert_entry(&full_key).await?;
            entries_inserted += 1;
        }
 

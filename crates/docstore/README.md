@@ -58,11 +58,11 @@ use exdb_docstore::PrimaryIndex;
 
 // In-memory engine (for tests or ephemeral databases)
 let engine = Arc::new(
-    StorageEngine::open_in_memory(StorageConfig::default()).unwrap()
+    StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap()
 );
 
 // Create a primary index for a collection
-let btree = engine.create_btree().unwrap();
+let btree = engine.create_btree().await.unwrap();
 let primary = PrimaryIndex::new(
     btree,
     engine.clone(),
@@ -81,20 +81,20 @@ use exdb_core::types::DocId;
 let doc_id = DocId([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
 
 // Insert a document at timestamp 1
-primary.insert_version(&doc_id, 1, Some(b"{\"name\": \"Alice\"}")).unwrap();
+primary.insert_version(&doc_id, 1, Some(b"{\"name\": \"Alice\"}")).await.unwrap();
 
 // Update it at timestamp 5
-primary.insert_version(&doc_id, 5, Some(b"{\"name\": \"Bob\"}")).unwrap();
+primary.insert_version(&doc_id, 5, Some(b"{\"name\": \"Bob\"}")).await.unwrap();
 
 // Read at different points in time
-let v = primary.get_at_ts(&doc_id, 3).unwrap().unwrap();
+let v = primary.get_at_ts(&doc_id, 3).await.unwrap().unwrap();
 assert_eq!(v, b"{\"name\": \"Alice\"}");  // sees ts=1 version
 
-let v = primary.get_at_ts(&doc_id, 10).unwrap().unwrap();
+let v = primary.get_at_ts(&doc_id, 10).await.unwrap().unwrap();
 assert_eq!(v, b"{\"name\": \"Bob\"}");    // sees ts=5 version
 
 // Before any version exists → None
-assert!(primary.get_at_ts(&doc_id, 0).unwrap().is_none());
+assert!(primary.get_at_ts(&doc_id, 0).await.unwrap().is_none());
 ```
 
 ### Deleting documents (tombstones)
@@ -104,25 +104,27 @@ readers at timestamps before the delete still see the document.
 
 ```rust
 // Delete at timestamp 10
-primary.insert_version(&doc_id, 10, None).unwrap();
+primary.insert_version(&doc_id, 10, None).await.unwrap();
 
 // After the delete → None
-assert!(primary.get_at_ts(&doc_id, 15).unwrap().is_none());
+assert!(primary.get_at_ts(&doc_id, 15).await.unwrap().is_none());
 
 // Before the delete → still visible
-assert!(primary.get_at_ts(&doc_id, 7).unwrap().is_some());
+assert!(primary.get_at_ts(&doc_id, 7).await.unwrap().is_some());
 ```
 
 ### Scanning all visible documents
 
-`scan_at_ts` returns an iterator over all visible, non-tombstoned documents at a given
-timestamp. The iterator handles version resolution internally — if a document has 10
+`scan_at_ts` returns a stream over all visible, non-tombstoned documents at a given
+timestamp. The stream handles version resolution internally — if a document has 10
 versions, only the one visible at `read_ts` is yielded.
 
 ```rust
 use exdb_storage::btree::ScanDirection;
+use tokio_stream::StreamExt;
 
-for result in primary.scan_at_ts(100, ScanDirection::Forward) {
+let mut stream = primary.scan_at_ts(100, ScanDirection::Forward);
+while let Some(result) = stream.next().await {
     let (doc_id, version_ts, body) = result.unwrap();
     // doc_id:     which document
     // version_ts: the timestamp of the visible version
@@ -142,7 +144,7 @@ use exdb_core::types::Scalar;
 use std::ops::Bound;
 
 let primary = Arc::new(primary);  // secondary needs a shared reference
-let sec_btree = engine.create_btree().unwrap();
+let sec_btree = engine.create_btree().await.unwrap();
 let secondary = SecondaryIndex::new(sec_btree, primary.clone());
 
 // When committing a document with name="Alice", insert an index entry:
@@ -151,11 +153,13 @@ let key = make_secondary_key(
     &doc_id,
     5,  // the commit timestamp
 );
-secondary.insert_entry(&key).unwrap();
+secondary.insert_entry(&key).await.unwrap();
 
 // Scan for all documents where name="Alice":
 let prefix = encode_key_prefix(&[Scalar::String("Alice".into())]);
 let upper = successor_key(&prefix);
+
+use tokio_stream::StreamExt;
 
 let results: Vec<_> = secondary
     .scan_at_ts(
@@ -164,12 +168,15 @@ let results: Vec<_> = secondary
         100,  // read_ts
         ScanDirection::Forward,
     )
+    .collect::<Vec<_>>()
+    .await
+    .into_iter()
     .collect::<Result<Vec<_>, _>>()
     .unwrap();
 
 // Each result is (doc_id, version_ts) — fetch the body from the primary index
 for (doc_id, version_ts) in &results {
-    let body = primary.get_at_ts(doc_id, *version_ts).unwrap();
+    let body = primary.get_at_ts(doc_id, *version_ts).await.unwrap();
 }
 ```
 

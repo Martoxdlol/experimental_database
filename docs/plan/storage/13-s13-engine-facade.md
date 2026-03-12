@@ -24,7 +24,8 @@ use crate::storage::recovery::*;
 use crate::storage::vacuum::*;
 use crate::storage::catalog_btree::*;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::time::Duration;
 
 /// Storage engine configuration.
@@ -87,15 +88,15 @@ pub struct StorageEngine {
 
     // Sub-components
     buffer_pool: Arc<BufferPool>,
-    free_list: Mutex<FreeList>,
+    free_list: tokio::sync::Mutex<FreeList>,
     wal_writer: Arc<WalWriter>,
     wal_reader: WalReader,
-    heap: Mutex<Heap>,
+    heap: tokio::sync::Mutex<Heap>,
     checkpoint: Checkpoint,  // owns the DWB (if durable)
     vacuum_task: VacuumTask,
 
     // Metadata
-    file_header: Mutex<FileHeader>,
+    file_header: tokio::sync::Mutex<FileHeader>,
     config: StorageConfig,
     is_durable: bool,
     path: Option<PathBuf>,  // None for in-memory
@@ -107,7 +108,7 @@ pub struct StorageEngine {
 /// through the catalog, so a back-Arc would create a reference cycle).
 pub struct BTreeHandle {
     btree: BTree,
-    free_list: Arc<Mutex<FreeList>>,
+    free_list: Arc<tokio::sync::Mutex<FreeList>>,
     buffer_pool: Arc<BufferPool>,
 }
 
@@ -116,21 +117,21 @@ impl StorageEngine {
 
     /// Open a file-backed storage engine (durable).
     /// Runs recovery if needed.
-    pub fn open(
+    pub async fn open(
         path: &Path,
         config: StorageConfig,
         handler: &mut dyn WalRecordHandler,
     ) -> Result<Self>;
 
     /// Open an ephemeral in-memory storage engine.
-    pub fn open_in_memory(config: StorageConfig) -> Result<Self>;
+    pub async fn open_in_memory(config: StorageConfig) -> Result<Self>;
 
     /// Open with custom backends.
     /// If the backend is durable and `handler` is Some, runs recovery.
     /// If the backend is durable and `handler` is None, recovery is skipped
     /// (caller's responsibility to ensure consistency).
     /// If the backend is not durable, `handler` is ignored.
-    pub fn open_with_backend(
+    pub async fn open_with_backend(
         page_storage: Arc<dyn PageStorage>,
         wal_storage: Arc<dyn WalStorage>,
         config: StorageConfig,
@@ -138,7 +139,7 @@ impl StorageEngine {
     ) -> Result<Self>;
 
     /// Close the engine: final checkpoint, flush, shutdown WAL writer.
-    pub async fn close(&mut self) -> Result<()>;
+    pub async fn close(&self) -> Result<()>;
 
     /// Whether this engine uses durable storage.
     pub fn is_durable(&self) -> bool;
@@ -146,7 +147,7 @@ impl StorageEngine {
     // ─── B-Tree Management ───
 
     /// Create a new B-tree with an empty root. Returns a handle.
-    pub fn create_btree(&self) -> Result<BTreeHandle>;
+    pub async fn create_btree(&self) -> Result<BTreeHandle>;
 
     /// Open an existing B-tree by root page.
     pub fn open_btree(&self, root_page: PageId) -> BTreeHandle;
@@ -154,13 +155,13 @@ impl StorageEngine {
     // ─── Heap ───
 
     /// Store a blob in the heap. Returns a reference for later retrieval.
-    pub fn heap_store(&self, data: &[u8]) -> Result<HeapRef>;
+    pub async fn heap_store(&self, data: &[u8]) -> Result<HeapRef>;
 
     /// Load a blob from the heap.
-    pub fn heap_load(&self, href: HeapRef) -> Result<Vec<u8>>;
+    pub async fn heap_load(&self, href: HeapRef) -> Result<Vec<u8>>;
 
     /// Free a blob from the heap.
-    pub fn heap_free(&self, href: HeapRef) -> Result<()>;
+    pub async fn heap_free(&self, href: HeapRef) -> Result<()>;
 
     // ─── WAL ───
 
@@ -168,7 +169,7 @@ impl StorageEngine {
     pub async fn append_wal(&self, record_type: u8, payload: &[u8]) -> Result<Lsn>;
 
     /// Read WAL records starting from a given LSN.
-    pub fn read_wal_from(&self, lsn: Lsn) -> WalIterator;
+    pub fn read_wal_from(&self, lsn: Lsn) -> WalStream;
 
     // ─── Maintenance ───
 
@@ -176,24 +177,24 @@ impl StorageEngine {
     pub async fn checkpoint(&self) -> Result<()>;
 
     /// Vacuum entries from B-trees.
-    pub fn vacuum(&self, entries: &[VacuumEntry]) -> Result<usize>;
+    pub async fn vacuum(&self, entries: &[VacuumEntry]) -> Result<usize>;
 
     // ─── Accessors (for integration layer) ───
 
     pub fn buffer_pool(&self) -> &Arc<BufferPool>;
-    pub fn file_header(&self) -> FileHeader;
-    pub fn update_file_header<F>(&self, f: F) -> Result<()>
+    pub async fn file_header(&self) -> FileHeader;
+    pub async fn update_file_header<F>(&self, f: F) -> Result<()>
         where F: FnOnce(&mut FileHeader);
     pub fn wal_writer(&self) -> &Arc<WalWriter>;
     pub fn config(&self) -> &StorageConfig;
 }
 
 impl BTreeHandle {
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
-    pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<()>;
-    pub fn delete(&self, key: &[u8]) -> Result<bool>;
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()>;
+    pub async fn delete(&self, key: &[u8]) -> Result<bool>;
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>,
-                direction: ScanDirection) -> ScanIterator;
+                direction: ScanDirection) -> ScanStream;
     pub fn root_page(&self) -> PageId;
 }
 ```
@@ -305,22 +306,22 @@ BTreeHandle wraps a BTree and holds `Arc` references to the free list and buffer
 
 ```rust
 impl BTreeHandle {
-    pub fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        let mut free_list = self.free_list.lock().unwrap();
-        self.btree.insert(key, value, &mut free_list)
+    pub async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut free_list = self.free_list.lock().await;
+        self.btree.insert(key, value, &mut free_list).await
     }
 
-    pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        let mut free_list = self.free_list.lock().unwrap();
-        self.btree.delete(key, &mut free_list)
+    pub async fn delete(&self, key: &[u8]) -> Result<bool> {
+        let mut free_list = self.free_list.lock().await;
+        self.btree.delete(key, &mut free_list).await
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.btree.get(key)  // no free list needed for reads
+    pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.btree.get(key).await  // no free list needed for reads
     }
 
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>,
-                direction: ScanDirection) -> ScanIterator {
+                direction: ScanDirection) -> ScanStream {
         self.btree.scan(lower, upper, direction)
     }
 }

@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::state::{AppState, DocstoreTool, LayerTab, StorageTool};
+use crate::state::{AppState, DocstoreTool, LayerTab, QueryTool, StorageTool};
 
 #[component]
 pub fn Sidebar() -> Element {
@@ -16,6 +16,7 @@ pub fn Sidebar() -> Element {
     match active_tab {
         LayerTab::Storage => rsx! { StorageSidebar {} },
         LayerTab::Docstore => rsx! { DocstoreSidebar {} },
+        LayerTab::Query => rsx! { QuerySidebar {} },
         _ => rsx! {},
     }
 }
@@ -73,6 +74,39 @@ fn DocstoreSidebar() -> Element {
                                 state.breadcrumb.set(vec![
                                     "Database".to_string(),
                                     "L3 Docstore".to_string(),
+                                    t.label().to_string(),
+                                ]);
+                            },
+                            div { class: "sidebar-icon", "{t.icon()}" }
+                            "{t.label()}"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn QuerySidebar() -> Element {
+    let mut state = use_context::<AppState>();
+    let active = *state.query_tool.read();
+
+    rsx! {
+        div { class: "sidebar",
+            for tool in QueryTool::ALL {
+                {
+                    let t = *tool;
+                    let is_active = t == active;
+                    let class = if is_active { "sidebar-item active" } else { "sidebar-item" };
+                    rsx! {
+                        div {
+                            class: "{class}",
+                            onclick: move |_| {
+                                state.query_tool.set(t);
+                                state.breadcrumb.set(vec![
+                                    "Database".to_string(),
+                                    "L4 Query".to_string(),
                                     t.label().to_string(),
                                 ]);
                             },

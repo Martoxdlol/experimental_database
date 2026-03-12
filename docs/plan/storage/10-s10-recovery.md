@@ -43,18 +43,19 @@ impl Recovery {
     /// 3. Open WAL, replay from checkpoint_lsn
     /// 4. Call handler for each replayed record
     ///
-    /// Returns the LSN after the last valid record (new write position).
-    pub fn run(
+    /// Returns the LSN after the last valid record (new write position)
+    /// and recovery statistics.
+    pub async fn run(
         page_storage: &dyn PageStorage,
         wal_storage: &dyn WalStorage,
         dwb_path: Option<&Path>,   // None for in-memory
         checkpoint_lsn: Lsn,
         page_size: usize,
         handler: &mut dyn WalRecordHandler,
-    ) -> Result<Lsn>;
+    ) -> Result<(Lsn, RecoveryStats)>;
 
     /// Check if recovery is needed (DWB non-empty or WAL has records past checkpoint).
-    pub fn needs_recovery(
+    pub async fn needs_recovery(
         dwb_path: Option<&Path>,
         wal_storage: &dyn WalStorage,
         checkpoint_lsn: Lsn,

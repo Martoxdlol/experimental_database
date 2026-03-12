@@ -74,12 +74,12 @@ impl VacuumCoordinator {
     ///
     /// The caller (L5/L6) writes a Vacuum WAL record BEFORE calling this,
     /// so recovery can replay the removals.
-    pub fn execute(
+    pub async fn execute(
         &self,
         candidates: &[VacuumCandidate],
         primary_indexes: &HashMap<CollectionId, Arc<PrimaryIndex>>,
         secondary_indexes: &HashMap<IndexId, Arc<SecondaryIndex>>,
-    ) -> Result<u64>;
+    ) -> std::io::Result<u64>;
 
     /// Rebuild the pending queue from WAL replay.
     /// Called during recovery: each TxCommit with Replace/Delete generates
@@ -113,13 +113,13 @@ impl RollbackVacuum {
     ///   - The previous version is still in the B-tree, becomes "current" again
     ///
     /// O(write_set_size) -- no B-tree scan needed.
-    pub fn rollback_commit(
+    pub async fn rollback_commit(
         commit_ts: Ts,
         mutations: &[(CollectionId, DocId)],
         index_deltas: &[(IndexId, Option<Vec<u8>>)],  // (index_id, new_key to remove)
         primary_indexes: &HashMap<CollectionId, Arc<PrimaryIndex>>,
         secondary_indexes: &HashMap<IndexId, Arc<SecondaryIndex>>,
-    ) -> Result<()>;
+    ) -> std::io::Result<()>;
 
     /// Startup cleanup: undo all commits with ts > visible_ts using WAL.
     /// Called during recovery after WAL replay, if any commits exist
@@ -132,12 +132,12 @@ impl RollbackVacuum {
     /// Returns the number of rolled-back commits.
     ///
     /// O(WAL_records_after_visible_ts) -- reads only the WAL tail.
-    pub fn rollback_from_wal(
+    pub async fn rollback_from_wal(
         visible_ts: Ts,
         wal_commits: &[WalCommitInfo],
         primary_indexes: &HashMap<CollectionId, Arc<PrimaryIndex>>,
         secondary_indexes: &HashMap<IndexId, Arc<SecondaryIndex>>,
-    ) -> Result<u64>;
+    ) -> std::io::Result<u64>;
 }
 
 /// Information extracted from a TxCommit WAL record for rollback.
@@ -158,14 +158,14 @@ For each candidate:
 1. **Remove primary entry**:
    ```
    let key = make_primary_key(&candidate.doc_id, candidate.old_ts);
-   primary_indexes[&candidate.collection_id].btree().delete(&key)?;
+   primary_indexes[&candidate.collection_id].btree().delete(&key).await?;
    ```
    If the entry was external (heap-stored body), also free the heap ref. This requires reading the value first to check the external flag.
 
 2. **Remove secondary entries**:
    ```
    for (index_id, encoded_key) in &candidate.old_index_keys {
-       secondary_indexes[index_id].remove_entry(encoded_key)?;
+       secondary_indexes[index_id].remove_entry(encoded_key).await?;
    }
    ```
 
@@ -176,7 +176,7 @@ For each candidate:
 When vacuuming a primary entry that used external (heap) storage:
 
 1. Read the B-tree value to check the external flag.
-2. If external: parse the HeapRef, call `primary.heap().free(href)`.
+2. If external: parse the HeapRef, call `primary.heap().free(href).await`.
 3. Then delete the B-tree entry.
 
 ### drain_eligible()
@@ -196,11 +196,11 @@ Note: we check `superseding_ts`, not `old_ts`. Using `old_ts` would be wrong —
 ```
 for (collection_id, doc_id) in mutations {
     let key = make_primary_key(doc_id, commit_ts);
-    primary_indexes[collection_id].btree().delete(&key)?;
+    primary_indexes[collection_id].btree().delete(&key).await?;
 }
 for (index_id, new_key) in index_deltas {
     if let Some(key) = new_key {
-        secondary_indexes[index_id].remove_entry(key)?;
+        secondary_indexes[index_id].remove_entry(key).await?;
     }
 }
 ```

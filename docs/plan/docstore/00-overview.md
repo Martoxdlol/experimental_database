@@ -76,10 +76,10 @@ pub use key_encoding::{
 };
 
 // Primary index (used by L4 scan/get, L5 commit)
-pub use primary_index::{PrimaryIndex, PrimaryScanner, CellFlags};
+pub use primary_index::{PrimaryIndex, PrimaryScanStream, CellFlags};
 
 // Secondary index (used by L4 index scan, L5 commit)
-pub use secondary_index::{SecondaryIndex, SecondaryScanner};
+pub use secondary_index::{SecondaryIndex, SecondaryScanStream};
 
 // Version resolution (used internally by D3/D4)
 pub use version_resolution::VersionResolver;
@@ -100,7 +100,7 @@ Same as Layer 2: all public structs, enums, traits, and functions must have `///
 
 ## Key Design Decisions
 
-1. **No circular dependencies with L2**: Layer 3 consumes `BTreeHandle`, `Heap`, `HeapRef`, `ScanIterator` from L2. It never feeds back into L2.
+1. **No circular dependencies with L2**: Layer 3 consumes `BTreeHandle`, `Heap`, `HeapRef`, `ScanStream` from L2. It never feeds back into L2.
 
 2. **PrimaryIndex owns inline/external decision**: The threshold-based decision of whether to store a document body inline in the B-tree leaf cell or in the external heap is made here, not in L2. L2 provides raw `BTreeHandle` and `Heap`; L3 decides how to use them.
 

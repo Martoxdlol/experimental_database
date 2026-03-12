@@ -1436,6 +1436,7 @@ dependencies = [
  "dioxus",
  "exdb-core",
  "exdb-docstore",
+ "exdb-query",
  "exdb-storage",
  "futures-core",
  "parking_lot",

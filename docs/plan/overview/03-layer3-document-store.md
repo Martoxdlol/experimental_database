@@ -72,17 +72,17 @@ impl PrimaryIndex {
     /// Insert a new document version (used at commit time)
     /// Constructs key = doc_id || inv_ts(commit_ts)
     /// Value = flags[1] || body_len[4] || body (inline) or heap_ref (external)
-    pub fn insert_version(&self, doc_id: &DocId, commit_ts: Ts,
+    pub async fn insert_version(&self, doc_id: &DocId, commit_ts: Ts,
                           body: Option<&[u8]>) -> Result<()>;
     // body=None means tombstone (delete)
 
     /// Get the latest visible version of a document at read_ts
     /// Seeks to doc_id || inv_ts(read_ts), takes first entry with ts <= read_ts
     /// Returns None if tombstone or doc doesn't exist
-    pub fn get_at_ts(&self, doc_id: &DocId, read_ts: Ts) -> Result<Option<Vec<u8>>>;
+    pub async fn get_at_ts(&self, doc_id: &DocId, read_ts: Ts) -> Result<Option<Vec<u8>>>;
 
     /// Get the latest visible version's timestamp (for verification)
-    pub fn get_version_ts(&self, doc_id: &DocId, read_ts: Ts) -> Result<Option<Ts>>;
+    pub async fn get_version_ts(&self, doc_id: &DocId, read_ts: Ts) -> Result<Option<Ts>>;
 
     /// Scan all visible document versions at read_ts
     pub fn scan_at_ts(&self, read_ts: Ts, direction: ScanDirection) -> PrimaryScanner;
@@ -97,9 +97,9 @@ enum StoredBody {
     External(HeapRef),
 }
 
-/// Iterator over visible documents in primary index
+/// Stream over visible documents in primary index
 pub struct PrimaryScanner { /* ... */ }
-impl Iterator for PrimaryScanner {
+impl Stream for PrimaryScanner {
     type Item = Result<(DocId, Ts, Vec<u8>)>;  // (doc_id, version_ts, body)
 }
 ```
@@ -121,10 +121,10 @@ impl SecondaryIndex {
 
     /// Insert a secondary index entry for a document version.
     /// encoded_key is the full key (prefix + doc_id + inv_ts). Value is empty.
-    pub fn insert_entry(&self, encoded_key: &[u8]) -> Result<()>;
+    pub async fn insert_entry(&self, encoded_key: &[u8]) -> Result<()>;
 
     /// Remove a secondary index entry.
-    pub fn remove_entry(&self, encoded_key: &[u8]) -> Result<bool>;
+    pub async fn remove_entry(&self, encoded_key: &[u8]) -> Result<bool>;
 
     /// Scan with version resolution (section 3.5)
     /// For each (doc_id, inv_ts):
@@ -135,9 +135,9 @@ impl SecondaryIndex {
                       read_ts: Ts, direction: ScanDirection) -> SecondaryScanner;
 }
 
-/// Iterator yielding verified (doc_id, version_ts) pairs from secondary index
+/// Stream yielding verified (doc_id, version_ts) pairs from secondary index
 pub struct SecondaryScanner { /* ... */ }
-impl Iterator for SecondaryScanner {
+impl Stream for SecondaryScanner {
     type Item = Result<(DocId, Ts)>;
 }
 ```
@@ -280,7 +280,7 @@ impl RollbackVacuum {
     /// Live rollback: undo a single failed commit.
     /// L5 decomposes its WriteSet into plain (CollectionId, DocId) tuples
     /// and IndexDelta into (IndexId, Option<Vec<u8>>) before calling this.
-    pub fn rollback_commit(
+    pub async fn rollback_commit(
         commit_ts: Ts,
         mutations: &[(CollectionId, DocId)],
         index_deltas: &[(IndexId, Option<Vec<u8>>)],
@@ -290,7 +290,7 @@ impl RollbackVacuum {
 
     /// Startup cleanup: undo all commits with ts > visible_ts.
     /// L5/L6 parses WAL records into WalCommitInfo before calling this.
-    pub fn rollback_from_wal(
+    pub async fn rollback_from_wal(
         visible_ts: Ts,
         wal_commits: &[WalCommitInfo],
         primary_indexes: &HashMap<CollectionId, Arc<PrimaryIndex>>,

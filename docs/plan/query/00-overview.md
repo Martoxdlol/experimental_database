@@ -34,7 +34,7 @@ Build and test the range encoder that converts `[RangeExpr]` into `(Bound<Vec<u8
 Build the access resolver that selects access method and produces an `AccessMethod`. Light module — mostly wiring.
 
 ### Phase D: Scan Execution + Merge (Q4 + Q5) — Depends on Phase C + L3
-Build the scan executor that drives L3 iterators through the Source → PostFilter → Terminal pipeline. Then build the write-set merge layer. Both require L3 `PrimaryIndex` and `SecondaryIndex` for integration tests.
+Build the async scan executor that drives L3 async streams through the Source → PostFilter → Terminal pipeline. Then build the async write-set merge layer. Both require L3 `PrimaryIndex` and `SecondaryIndex` for integration tests.
 
 ## File Map
 
@@ -81,10 +81,10 @@ pub use range_encoder::{encode_range, validate_range, RangeShape, RangeError};
 // Access method resolution
 pub use access::{resolve_access, AccessMethod, IndexInfo, AccessError};
 
-// Scan execution
-pub use scan::{execute_scan, QueryScanner, ScanRow, ReadIntervalInfo, ScanStats};
+// Scan execution (async)
+pub use scan::{execute_scan, QueryScanStream, ScanRow, ReadIntervalInfo, ScanStats};
 
-// Write-set merge
+// Write-set merge (async)
 pub use merge::{merge_with_writes, MergeView};
 ```
 
@@ -93,8 +93,8 @@ pub use merge::{merge_with_writes, MergeView};
 All queries execute at a specific `read_ts: Ts` — the transaction's `begin_ts`. This timestamp flows as follows:
 
 - **Q0-Q3**: No timestamp needed. Filter ASTs, post-filter evaluation, range encoding, and planning are timestamp-independent.
-- **Q4 (`execute_scan`)**: Receives `read_ts` and passes it to `SecondaryIndex::scan_at_ts(lower, upper, read_ts, direction)` and `PrimaryIndex::get_at_ts(doc_id, read_ts)`. All MVCC visibility is resolved at this timestamp.
-- **Q5 (`merge_with_writes`)**: No timestamp needed. The snapshot iterator already has `read_ts` baked in. Write-set documents are always visible (they're in-transaction mutations).
+- **Q4 (`execute_scan`)**: Async. Receives `read_ts` and passes it to `SecondaryIndex::scan_at_ts(lower, upper, read_ts, direction)` and `PrimaryIndex::get_at_ts(doc_id, read_ts).await`. All MVCC visibility is resolved at this timestamp.
+- **Q5 (`merge_with_writes`)**: Async. No timestamp needed. The snapshot stream already has `read_ts` baked in. Write-set documents are always visible (they're in-transaction mutations).
 
 The `read_ts` is provided by L6 (which owns the transaction state). L4 has no concept of "current time" or timestamp generation.
 
@@ -102,9 +102,9 @@ The `read_ts` is provided by L6 (which owns the transaction state). L4 has no co
 
 1. **No L5 dependency**: L4 does not import `WriteSet`, `ReadSet`, or any L5 type. The merge layer receives a `MergeView` (plain slices of inserts/deletes/replaces) decomposed by L6 before calling into L4. This keeps the dependency chain strict: L4 → L3 → L2 → L1.
 
-2. **Iterator-based scan**: `execute_scan` returns a `QueryScanner` implementing `Iterator`, not a `Vec`. Documents are produced lazily through the Source → PostFilter → Limit pipeline. This avoids materializing large result sets and matches the DESIGN.md description of the source as a "stream of documents."
+2. **Stream-based scan**: `execute_scan` is async and returns a `QueryScanStream` implementing `futures_core::Stream`, not a `Vec`. Documents are produced lazily through the Source → PostFilter → Limit pipeline. This avoids materializing large result sets and matches the DESIGN.md description of the source as a "stream of documents."
 
-3. **Read set interval from plan bounds**: The read interval is computed from the `AccessMethod` bounds, not from scan results. It is available before iteration begins via `QueryScanner::read_interval()`. Limit-aware tightening (DESIGN.md section 5.6.3) is applied after iteration completes by L6.
+3. **Read set interval from plan bounds**: The read interval is computed from the `AccessMethod` bounds, not from scan results. It is returned alongside the `QueryScanStream` from `execute_scan`. Limit-aware tightening (DESIGN.md section 5.6.3) is applied after the stream is consumed by L6.
 
 4. **Table scan = `_created_at` index scan**: Per DESIGN.md section 4.2.3, a table scan is an unbounded scan on the `_created_at` secondary index. It is NOT a primary index scan.
 

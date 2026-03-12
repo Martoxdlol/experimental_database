@@ -31,16 +31,16 @@ impl FreeList {
 
     /// Allocate a page. Pops from the free list, or extends the file.
     /// Returns the allocated PageId.
-    pub fn allocate(&mut self) -> Result<PageId>;
+    pub async fn allocate(&mut self) -> Result<PageId>;
 
     /// Deallocate a page. Pushes it onto the free list.
-    pub fn deallocate(&mut self, page_id: PageId) -> Result<()>;
+    pub async fn deallocate(&mut self, page_id: PageId) -> Result<()>;
 
     /// Current head of the free list (0 = empty).
     pub fn head(&self) -> PageId;
 
     /// Count free pages (walks the list — O(n), for diagnostics only).
-    pub fn count(&self) -> Result<usize>;
+    pub async fn count(&self) -> Result<usize>;
 }
 ```
 

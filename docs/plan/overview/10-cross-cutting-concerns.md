@@ -6,15 +6,15 @@ All locks are acquired in this strict order. Never acquire a higher-numbered loc
 
 ```
 1. Writer lock         (tokio::sync::Mutex — outermost, async)
-2. Page table RwLock   (parking_lot::RwLock — brief, lookup/insert)
-3. Frame RwLock        (parking_lot::RwLock — per-frame, page access)
+2. Page table RwLock   (tokio::sync::RwLock — brief, lookup/insert)
+3. Frame RwLock        (tokio::sync::RwLock — per-frame, page access)
 ```
 
 **Rules:**
 - Multiple frame locks: acquire in ascending `page_id` order
 - Page table lock is never held while acquiring a frame lock or performing I/O
-- Frame locks are synchronous and never held across `.await` points
-- Writer lock is always outermost — no synchronous latch held while awaiting it
+- All locks are `tokio::sync` async locks
+- Writer lock is always outermost — no other lock held while awaiting it
 
 ## Error Handling Strategy
 
@@ -78,13 +78,13 @@ CRC-32C is hardware-accelerated via SSE 4.2 / ARM CRC instructions. ~1% CPU over
 ```
                 +----------+
                 |  tokio    |  async runtime
-                +-----+----+
+                +-----+----+  (Mutex, RwLock, channels, I/O)
                       |
   +-------------------+-------------------+
   |                   |                   |
   v                   v                   v
-parking_lot       crc32fast            bson
-(sync locks)      (checksums)       (encoding)
+async-trait       crc32fast            bson
+(async traits)    (checksums)       (encoding)
                       |
                       v
                 serde_json
@@ -92,8 +92,8 @@ parking_lot       crc32fast            bson
 ```
 
 External dependencies:
-- `tokio` — async runtime with full features
-- `parking_lot` — synchronous RwLock (no-await, low overhead)
+- `tokio` — async runtime with full features, including `tokio::sync::{Mutex, RwLock}` for all locking
+- `async-trait` — async methods in traits (`PageStorage`, `WalStorage`, `ReplicationHook`)
 - `crc32fast` — hardware-accelerated CRC-32C
 - `bson` — BSON encoding/decoding
 - `serde_json` — JSON encoding/decoding

@@ -2,16 +2,16 @@
 
 ## Purpose
 
-Define the locking hierarchy and rules to prevent deadlocks in the storage engine. All frame locks use `parking_lot::RwLock` (synchronous, not async).
+Define the locking hierarchy and rules to prevent deadlocks in the storage engine. Frame locks use `parking_lot::RwLock` (synchronous). Component-level mutexes use `tokio::sync::Mutex` (async).
 
 ## Latch Hierarchy (Strict Ordering)
 
 ```
-Level 1 (outermost):  free_list: Mutex<FreeList>
-                      heap: Mutex<Heap>
-                      file_header: Mutex<FileHeader>
+Level 1 (outermost):  free_list: tokio::sync::Mutex<FreeList>
+                      heap: tokio::sync::Mutex<Heap>
+                      file_header: tokio::sync::Mutex<FileHeader>
 Level 2:              page_table: RwLock<HashMap<PageId, FrameId>>
-Level 3 (innermost):  frame[i].lock: RwLock<FrameData>
+Level 3 (innermost):  frame[i].lock: parking_lot::RwLock<FrameData>
 ```
 
 **Rule 1**: When both a component mutex (free_list, heap, file_header) and frame locks are needed, acquire the component mutex FIRST, then frame locks.
@@ -35,11 +35,11 @@ Example (B-tree split needs parent + child):
 ```
 // CORRECT:
 if parent_page_id < child_page_id {
-    let parent = pool.fetch_page_exclusive(parent_page_id)?;
-    let child = pool.fetch_page_exclusive(child_page_id)?;
+    let parent = pool.fetch_page_exclusive(parent_page_id).await?;
+    let child = pool.fetch_page_exclusive(child_page_id).await?;
 } else {
-    let child = pool.fetch_page_exclusive(child_page_id)?;
-    let parent = pool.fetch_page_exclusive(parent_page_id)?;
+    let child = pool.fetch_page_exclusive(child_page_id).await?;
+    let parent = pool.fetch_page_exclusive(parent_page_id).await?;
 }
 
 // WRONG: always parent first regardless of page_id
@@ -65,7 +65,7 @@ if let Some(frame_id) = frame_id {
 
 // 2. Read from disk — NO LOCKS HELD
 let mut temp_buf = vec![0u8; self.page_size];
-self.page_storage.read_page(page_id, &mut temp_buf)?;
+self.page_storage.read_page(page_id, &mut temp_buf).await?;
 
 // 3. Find/evict frame and install (brief write lock on page_table)
 let frame_id = self.find_victim()?;
@@ -166,4 +166,4 @@ During a root split, a new root page is allocated (which may have a **higher** `
 | 3 | Multiple frames: ascending page_id order | Prevents A-B/B-A deadlock |
 | 4 | No frame locks across I/O or await | Prevents async deadlocks |
 | 5 | B-tree: latch coupling (one or two pages at a time) | Minimizes lock duration |
-| 6 | All frame locks: parking_lot::RwLock (sync) | Compatible with single-threaded async runtime |
+| 6 | Frame locks: parking_lot::RwLock (sync); component mutexes: tokio::sync::Mutex (async) | Frame locks are sync for performance; component mutexes are async-aware |

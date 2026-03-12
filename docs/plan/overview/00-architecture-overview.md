@@ -74,32 +74,32 @@ A single-node embedded database uses **Layers 1–6 only**.
 Layer 2 (Storage Engine) MUST be usable as a standalone generic storage library with **no document/MVCC knowledge**. Its public facade:
 
 ```rust
-// Lifecycle
-StorageEngine::open(path, config) → Result<StorageEngine>
-StorageEngine::close() → Result<()>
+// Lifecycle (all async)
+StorageEngine::open(path, config).await → Result<StorageEngine>
+StorageEngine::close().await → Result<()>
 
-// B-tree management
-StorageEngine::create_btree() → Result<BTreeHandle>        // allocates root page
-StorageEngine::open_btree(root_page: PageId) → BTreeHandle // opens existing tree
+// B-tree management (async)
+StorageEngine::create_btree().await → Result<BTreeHandle>        // allocates root page
+StorageEngine::open_btree(root_page: PageId).await → BTreeHandle // opens existing tree
 
-// Raw byte key/value ops
-BTreeHandle::get(key: &[u8]) → Result<Option<Vec<u8>>>
-BTreeHandle::insert(key: &[u8], value: &[u8]) → Result<()>
-BTreeHandle::delete(key: &[u8]) → Result<bool>
-BTreeHandle::scan(lower, upper, direction) → ScanIterator   // range scan on bytes
+// Raw byte key/value ops (async, scan returns ScanStream)
+BTreeHandle::get(key: &[u8]).await → Result<Option<Vec<u8>>>
+BTreeHandle::insert(key: &[u8], value: &[u8]).await → Result<()>
+BTreeHandle::delete(key: &[u8]).await → Result<bool>
+BTreeHandle::scan(lower, upper, direction) → ScanStream   // range scan on bytes
 
-// Large value storage
-StorageEngine::heap_store(data: &[u8]) → Result<HeapRef>
-StorageEngine::heap_load(href: HeapRef) → Result<Vec<u8>>
-StorageEngine::heap_free(href: HeapRef) → Result<()>
+// Large value storage (async)
+StorageEngine::heap_store(data: &[u8]).await → Result<HeapRef>
+StorageEngine::heap_load(href: HeapRef).await → Result<Vec<u8>>
+StorageEngine::heap_free(href: HeapRef).await → Result<()>
 
-// WAL
-StorageEngine::append_wal(record_type: u8, payload: &[u8]) → Result<Lsn>
-StorageEngine::read_wal_from(lsn: Lsn) → WalIterator
+// WAL (async)
+StorageEngine::append_wal(record_type: u8, payload: &[u8]).await → Result<Lsn>
+StorageEngine::read_wal_from(lsn: Lsn) → WalStream
 
-// Maintenance
-StorageEngine::checkpoint() → Result<()>
-StorageEngine::recover() → Result<()>  // DWB restore + WAL replay
+// Maintenance (async)
+StorageEngine::checkpoint().await → Result<()>
+StorageEngine::recover().await → Result<()>  // DWB restore + WAL replay
 ```
 
 **If any method requires importing a type from Layer 3+ (DocId, Ts, Document, Filter, etc.), the boundary is WRONG.**

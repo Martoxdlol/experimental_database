@@ -9,13 +9,13 @@ Secondary index wrapper around a B-tree with MVCC-aware scanning. Handles versio
 - **D1 (Key Encoding)**: `make_secondary_key`, `parse_secondary_key_suffix`, `inv_ts`
 - **D2 (Version Resolution)**: `VersionResolver`, `Verdict`
 - **D3 (Primary Index)**: `PrimaryIndex` (for verification of stale entries)
-- **L2 (Storage Engine)**: `BTreeHandle`, `ScanIterator`, `ScanDirection`
+- **L2 (Storage Engine)**: `BTreeHandle`, `ScanStream`, `ScanDirection`
 - **L1 (Core Types)**: `DocId`, `Ts`, `IndexId`
 
 ## Rust Types
 
 ```rust
-use crate::storage::{BTreeHandle, ScanDirection};
+use crate::storage::{BTreeHandle, ScanDirection, ScanStream};
 use crate::core::types::{DocId, Ts};
 use crate::docstore::key_encoding::{parse_secondary_key_suffix, inv_ts};
 use crate::docstore::version_resolution::{VersionResolver, Verdict};
@@ -40,10 +40,10 @@ impl SecondaryIndex {
     /// Insert a secondary index entry for a document version.
     /// `encoded_key`: the full secondary key (prefix + doc_id + inv_ts).
     /// Value is always empty.
-    pub fn insert_entry(&self, encoded_key: &[u8]) -> Result<()>;
+    pub async fn insert_entry(&self, encoded_key: &[u8]) -> std::io::Result<()>;
 
     /// Remove a secondary index entry.
-    pub fn remove_entry(&self, encoded_key: &[u8]) -> Result<bool>;
+    pub async fn remove_entry(&self, encoded_key: &[u8]) -> std::io::Result<bool>;
 
     /// Scan with MVCC version resolution and primary index verification.
     ///
@@ -60,21 +60,21 @@ impl SecondaryIndex {
         upper: Bound<&[u8]>,
         read_ts: Ts,
         direction: ScanDirection,
-    ) -> SecondaryScanner;
+    ) -> SecondaryScanStream;
 
     /// Access the underlying B-tree (for vacuum).
     pub fn btree(&self) -> &BTreeHandle;
 }
 
-/// Iterator yielding verified (doc_id, version_ts) pairs from a secondary index scan.
-pub struct SecondaryScanner {
-    inner: ScanIterator,
+/// Stream yielding verified (doc_id, version_ts) pairs from a secondary index scan.
+pub struct SecondaryScanStream {
+    inner: ScanStream,
     resolver: VersionResolver,
     primary: Arc<PrimaryIndex>,
     read_ts: Ts,
 }
 
-impl Iterator for SecondaryScanner {
+impl Stream for SecondaryScanStream {
     type Item = Result<(DocId, Ts)>;
 }
 ```
@@ -84,39 +84,40 @@ impl Iterator for SecondaryScanner {
 ### insert_entry()
 
 ```rust
-self.btree.insert(encoded_key, &[])  // empty value
+self.btree.insert(encoded_key, &[]).await  // empty value
 ```
 
 ### remove_entry()
 
 ```rust
-self.btree.delete(encoded_key)
+self.btree.delete(encoded_key).await
 ```
 
 ### scan_at_ts()
 
-Create a `SecondaryScanner` wrapping the B-tree scan with a `VersionResolver`.
+Create a `SecondaryScanStream` wrapping the B-tree scan with a `VersionResolver`.
 
-### SecondaryScanner::next()
+### SecondaryScanStream::poll_next()
 
-The scanner must handle all three `Verdict` variants. In forward mode, `EmitPrevious` never occurs. In backward mode, `Visible` never occurs.
+The stream must handle all three `Verdict` variants. In forward mode, `EmitPrevious` never occurs. In backward mode, `Visible` never occurs.
 
 ```
 // Helper: verify a (doc_id, ts) against the primary index
-fn verify(&self, doc_id: &DocId, ts: Ts) -> Result<Option<(DocId, Ts)>> {
-    match self.primary.get_version_ts(doc_id, self.read_ts)? {
+async fn verify(&self, doc_id: &DocId, ts: Ts) -> Result<Option<(DocId, Ts)>> {
+    match self.primary.get_version_ts(doc_id, self.read_ts).await? {
         Some(primary_ts) if primary_ts == ts => Ok(Some((*doc_id, ts))),
         _ => Ok(None),  // stale or tombstoned
     }
 }
 
-fn next(&mut self) -> Option<Result<(DocId, Ts)>> {
+// Conceptual async next (actual implementation uses poll_next + Pin)
+async fn next(&mut self) -> Option<Result<(DocId, Ts)>> {
     loop {
-        match self.inner.next() {
+        match self.inner.next().await {
             None => {
                 // End of stream — check finish() for backward mode
                 if let Some((doc_id, ts)) = self.resolver.finish() {
-                    match self.verify(&doc_id, ts) {
+                    match self.verify(&doc_id, ts).await {
                         Ok(Some(pair)) => return Some(Ok(pair)),
                         Ok(None) => return None,  // stale final entry
                         Err(e) => return Some(Err(e)),
@@ -134,7 +135,7 @@ fn next(&mut self) -> Option<Result<(DocId, Ts)>> {
                     Verdict::Skip => continue,
                     Verdict::Visible => {
                         // Forward mode: verify immediately
-                        match self.verify(&doc_id, ts) {
+                        match self.verify(&doc_id, ts).await {
                             Ok(Some(pair)) => return Some(Ok(pair)),
                             Ok(None) => continue,  // stale
                             Err(e) => return Some(Err(e)),
@@ -142,7 +143,7 @@ fn next(&mut self) -> Option<Result<(DocId, Ts)>> {
                     }
                     Verdict::EmitPrevious(prev_id, prev_ts) => {
                         // Backward mode: previous group resolved
-                        match self.verify(&prev_id, prev_ts) {
+                        match self.verify(&prev_id, prev_ts).await {
                             Ok(Some(pair)) => return Some(Ok(pair)),
                             Ok(None) => continue,  // stale, keep scanning
                             Err(e) => return Some(Err(e)),

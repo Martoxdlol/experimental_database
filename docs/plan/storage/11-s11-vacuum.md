@@ -35,7 +35,7 @@ impl VacuumTask {
 
     /// Remove a batch of entries from their respective B-trees.
     /// Returns the number of entries actually removed (some may not exist = idempotent).
-    pub fn remove_entries(
+    pub async fn remove_entries(
         &self,
         entries: &[VacuumEntry],
         free_list: &mut FreeList,
@@ -69,7 +69,7 @@ for entry in entries {
 for (root, keys) in by_tree {
     let btree = BTree::open(root, buffer_pool.clone());
     for key in keys {
-        if btree.delete(key, free_list)? {
+        if btree.delete(key, free_list).await? {
             removed += 1;
         }
     }

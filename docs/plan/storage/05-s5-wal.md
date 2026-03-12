@@ -124,23 +124,23 @@ pub struct WalReader {
 impl WalReader {
     pub fn new(storage: Arc<dyn WalStorage>) -> Self;
 
-    /// Create an iterator starting at the given LSN.
-    pub fn read_from(&self, lsn: Lsn) -> WalIterator;
+    /// Create a stream starting at the given LSN.
+    pub fn read_from(&self, lsn: Lsn) -> WalStream;
 
     /// Find the latest valid LSN by scanning from a starting point.
     /// Returns the LSN just past the last valid record.
     pub fn find_end(&self, start_lsn: Lsn) -> Result<Lsn>;
 }
 
-/// Iterator over WAL records.
+/// Stream over WAL records.
 /// Owns an Arc<dyn WalStorage> so it is self-contained and can be
 /// returned from functions without lifetime issues.
-pub struct WalIterator {
+pub struct WalStream {
     storage: Arc<dyn WalStorage>,
     current_lsn: Lsn,
 }
 
-impl Iterator for WalIterator {
+impl Stream for WalStream {
     type Item = Result<WalRecord>;
     // Reads next record, verifies CRC, advances position.
     // Returns None at end-of-log or on first corrupt record.
@@ -211,7 +211,7 @@ Next record's LSN = current LSN + 9 + payload_len.
 3. Send `WalWriteRequest::RawFrame { data: raw.to_vec(), response: tx }` to the writer channel.
 4. The writer task appends it to the batch buffer as-is.
 
-### WalIterator
+### WalStream
 
 1. Start at `current_lsn`.
 2. Read 9 bytes from `WalStorage::read_from(current_lsn)`.

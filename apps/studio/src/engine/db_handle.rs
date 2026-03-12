@@ -103,6 +103,11 @@ pub struct DbHandle {
 }
 
 impl DbHandle {
+    /// Access the underlying storage engine (for L4 query operations).
+    pub fn engine(&self) -> &Arc<StorageEngine> {
+        &self.engine
+    }
+
     /// Open a database directory with full read-write access.
     pub async fn open(path: &Path) -> io::Result<Self> {
         let config = StorageConfig::default();

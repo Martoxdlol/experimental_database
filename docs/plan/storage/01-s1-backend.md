@@ -13,6 +13,7 @@ None. This is the foundation layer.
 ```rust
 use std::path::{Path, PathBuf};
 use std::io::Result;
+use async_trait::async_trait;
 
 pub type PageId = u32;
 
@@ -20,24 +21,25 @@ pub type PageId = u32;
 
 /// Backend for fixed-size page I/O.
 /// Implementations must be thread-safe (Send + Sync).
+#[async_trait]
 pub trait PageStorage: Send + Sync {
     /// Read page `page_id` into `buf`. `buf.len() == page_size`.
     /// Returns IoError if page_id >= page_count (unless the impl auto-extends).
-    fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> Result<()>;
+    async fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> Result<()>;
 
     /// Write `buf` to page `page_id`. `buf.len() == page_size`.
-    fn write_page(&self, page_id: PageId, buf: &[u8]) -> Result<()>;
+    async fn write_page(&self, page_id: PageId, buf: &[u8]) -> Result<()>;
 
     /// Flush all pending writes to durable storage.
     /// No-op for in-memory backends.
-    fn sync(&self) -> Result<()>;
+    async fn sync(&self) -> Result<()>;
 
     /// Current number of allocated pages.
     fn page_count(&self) -> u64;
 
     /// Extend the store to at least `new_count` pages.
     /// Newly allocated pages are zero-filled.
-    fn extend(&self, new_count: u64) -> Result<()>;
+    async fn extend(&self, new_count: u64) -> Result<()>;
 
     /// Returns the page size this backend was configured with.
     fn page_size(&self) -> usize;
@@ -49,16 +51,17 @@ pub trait PageStorage: Send + Sync {
 // ─── WAL Storage Trait ───
 
 /// Backend for append-only WAL I/O.
+#[async_trait]
 pub trait WalStorage: Send + Sync {
     /// Append `data` to the log. Returns the byte offset where data was written.
-    fn append(&self, data: &[u8]) -> Result<u64>;
+    async fn append(&self, data: &[u8]) -> Result<u64>;
 
     /// Flush all pending appends to durable storage.
-    fn sync(&self) -> Result<()>;
+    async fn sync(&self) -> Result<()>;
 
     /// Read up to `buf.len()` bytes starting at `offset`.
     /// Returns number of bytes actually read.
-    fn read_from(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
+    async fn read_from(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
 
     /// Discard all data before `offset` (segment reclamation).
     ///
@@ -70,7 +73,7 @@ pub trait WalStorage: Send + Sync {
     /// - Snapshot checkpoints (for incremental restore)
     ///
     /// Do not call this with an offset that would discard data needed for recovery.
-    fn truncate_before(&self, offset: u64) -> Result<()>;
+    async fn truncate_before(&self, offset: u64) -> Result<()>;
 
     /// Returns the LSN of the oldest retained WAL segment.
     ///
@@ -110,7 +113,7 @@ pub struct FileWalStorage {
     dir: PathBuf,
     segment_size: usize,
     // Internal: manages active segment, segment list
-    inner: parking_lot::Mutex<FileWalInner>,
+    inner: tokio::sync::Mutex<FileWalInner>,
 }
 
 struct FileWalInner {
@@ -137,7 +140,7 @@ impl FileWalStorage {
 
 /// Ephemeral page storage. Data lives only in RAM.
 pub struct MemoryPageStorage {
-    pages: parking_lot::RwLock<Vec<Vec<u8>>>,
+    pages: tokio::sync::RwLock<Vec<Vec<u8>>>,
     page_size: usize,
 }
 
@@ -147,7 +150,7 @@ impl MemoryPageStorage {
 
 /// Ephemeral WAL storage. Append-only byte vector.
 pub struct MemoryWalStorage {
-    log: parking_lot::RwLock<Vec<u8>>,
+    log: tokio::sync::RwLock<Vec<u8>>,
 }
 
 impl MemoryWalStorage {
@@ -183,15 +186,15 @@ impl MemoryWalStorage {
 
 ### MemoryPageStorage
 
-1. **read_page()**: `pages.read()[page_id].clone_into(buf)`.
-2. **write_page()**: `pages.write()[page_id].copy_from_slice(buf)`.
+1. **read_page()**: `pages.read().await[page_id].clone_into(buf)`.
+2. **write_page()**: `pages.write().await[page_id].copy_from_slice(buf)`.
 3. **sync()**: No-op.
 4. **extend()**: Push zero-filled `Vec<u8>` entries.
 5. **is_durable()**: `false`.
 
 ### MemoryWalStorage
 
-1. **append()**: `log.write().extend_from_slice(data)`. Return previous length as offset.
+1. **append()**: `log.write().await.extend_from_slice(data)`. Return previous length as offset.
 2. **sync()**: No-op.
 3. **read_from()**: Slice from the log vector.
 4. **oldest_lsn()**: Return 0 if log is non-empty, `None` otherwise.

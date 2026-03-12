@@ -52,7 +52,7 @@ storage/
   buffer_pool.rs      — S3: BufferPool, SharedPageGuard, ExclusivePageGuard
   free_list.rs        — S4: FreeList
   wal.rs              — S5: WalWriter, WalReader, WalRecord
-  btree.rs            — S6: BTree, BTreeHandle, ScanIterator
+  btree.rs            — S6: BTree, BTreeHandle, ScanStream
   heap.rs             — S7: Heap, HeapRef
   dwb.rs              — S8: DoubleWriteBuffer
   checkpoint.rs       — S9: Checkpoint
@@ -82,31 +82,31 @@ All on-disk formats use **little-endian** byte order.
 
 ```rust
 // Lifecycle
-StorageEngine::open(path, config) → Result<Self>
-StorageEngine::open_in_memory(config) → Result<Self>
-StorageEngine::open_with_backend(page_storage, wal_storage, config) → Result<Self>
-StorageEngine::close() → Result<()>
+async StorageEngine::open(path, config) → Result<Self>
+async StorageEngine::open_in_memory(config) → Result<Self>
+async StorageEngine::open_with_backend(page_storage, wal_storage, config) → Result<Self>
+async StorageEngine::close() → Result<()>
 StorageEngine::is_durable() → bool
 
 // B-tree
-StorageEngine::create_btree() → Result<BTreeHandle>
+async StorageEngine::create_btree() → Result<BTreeHandle>
 StorageEngine::open_btree(root_page: PageId) → BTreeHandle
-BTreeHandle::get(key: &[u8]) → Result<Option<Vec<u8>>>
-BTreeHandle::insert(key: &[u8], value: &[u8]) → Result<()>
-BTreeHandle::delete(key: &[u8]) → Result<bool>
-BTreeHandle::scan(lower, upper, direction) → ScanIterator
+async BTreeHandle::get(key: &[u8]) → Result<Option<Vec<u8>>>
+async BTreeHandle::insert(key: &[u8], value: &[u8]) → Result<()>
+async BTreeHandle::delete(key: &[u8]) → Result<bool>
+BTreeHandle::scan(lower, upper, direction) → ScanStream
 
 // Heap
-StorageEngine::heap_store(data: &[u8]) → Result<HeapRef>
-StorageEngine::heap_load(href: HeapRef) → Result<Vec<u8>>
-StorageEngine::heap_free(href: HeapRef) → Result<()>
+async StorageEngine::heap_store(data: &[u8]) → Result<HeapRef>
+async StorageEngine::heap_load(href: HeapRef) → Result<Vec<u8>>
+async StorageEngine::heap_free(href: HeapRef) → Result<()>
 
 // WAL
-StorageEngine::append_wal(record_type: u8, payload: &[u8]) → Result<Lsn>
-StorageEngine::read_wal_from(lsn: Lsn) → WalIterator
+async StorageEngine::append_wal(record_type: u8, payload: &[u8]) → Result<Lsn>
+StorageEngine::read_wal_from(lsn: Lsn) → WalStream
 
 // Maintenance
-StorageEngine::checkpoint() → Result<()>
+async StorageEngine::checkpoint() → Result<()>
 // Note: recovery runs automatically inside open() — there is no public recover() method.
 ```
 
@@ -127,4 +127,4 @@ See [14-latch-protocol.md](14-latch-protocol.md) for full details.
 2. **Multiple frames**: always ascending page_id order
 3. **No latches across I/O**: read into temp buffer, then copy under latch
 4. **B-tree**: latch coupling (crab protocol) — hold parent until child is safe
-5. **All frame locks**: `parking_lot::RwLock` (synchronous, not async)
+5. **All frame locks**: `parking_lot::RwLock` for frame-level (synchronous), `tokio::sync::Mutex` for component-level

@@ -38,6 +38,7 @@ pub fn ConsoleModule() -> Element {
         "heap" => vec!["load", "store", "free"],
         "catalog" => vec!["list", "create_collection", "drop_collection", "create_index", "drop_index"],
         "docstore" => vec!["scan", "versions", "decode_key", "encode_key", "secondary_scan"],
+        "query" => vec!["resolve", "filter", "range_validate", "range_encode"],
         _ => vec![],
     };
 
@@ -66,6 +67,7 @@ pub fn ConsoleModule() -> Element {
                                 option { value: "heap", "heap" }
                                 option { value: "catalog", "catalog" }
                                 option { value: "docstore", "docstore" }
+                                option { value: "query", "query" }
                             }
                         }
                         div {
@@ -467,6 +469,96 @@ async fn execute_command(
                 }).collect();
                 Ok(format!("{} hits:\n{}", hits.len(), lines.join("\n")))
             }
+        }
+        ("query", "resolve") => {
+            // p1 = index_fields (comma-separated), p2 = range_json
+            if p1.is_empty() {
+                return Err("Param1: index fields (comma-separated). Param2: range JSON array".into());
+            }
+            let index_fields: Vec<exdb_core::field_path::FieldPath> = p1.split(',')
+                .map(|s| {
+                    let s = s.trim();
+                    let segs: Vec<String> = s.split('.').map(|p| p.to_string()).collect();
+                    if segs.len() == 1 { exdb_core::field_path::FieldPath::single(&segs[0]) }
+                    else { exdb_core::field_path::FieldPath::new(segs) }
+                })
+                .collect();
+
+            let range_exprs = super::query::scan::parse_range_exprs(if p2.is_empty() { "[]" } else { p2 })
+                .map_err(|e| format!("Range parse error: {e}"))?;
+
+            let index_info = exdb_query::IndexInfo {
+                index_id: exdb_core::types::IndexId(1),
+                field_paths: index_fields,
+                ready: true,
+            };
+            let method = exdb_query::resolve_access(
+                exdb_core::types::CollectionId(0),
+                &index_info,
+                &range_exprs,
+                None,
+                exdb_storage::btree::ScanDirection::Forward,
+                None,
+            ).map_err(|e| format!("{e:?}"))?;
+            Ok(format!("{method:?}"))
+        }
+        ("query", "filter") => {
+            // p1 = document JSON, p2 = filter JSON
+            if p1.is_empty() || p2.is_empty() {
+                return Err("Param1: document JSON. Param2: filter JSON".into());
+            }
+            let doc: serde_json::Value = serde_json::from_str(p1)
+                .map_err(|e| format!("Invalid document: {e}"))?;
+            let filter = super::query::scan::parse_filter(p2)
+                .map_err(|e| format!("Invalid filter: {e}"))?;
+            let matches = exdb_query::filter_matches(&doc, &filter);
+            Ok(if matches { "MATCH (true)" } else { "NO MATCH (false)" }.into())
+        }
+        ("query", "range_validate") => {
+            // p1 = index fields, p2 = range JSON
+            if p1.is_empty() {
+                return Err("Param1: index fields (comma-separated). Param2: range JSON".into());
+            }
+            let index_fields: Vec<exdb_core::field_path::FieldPath> = p1.split(',')
+                .map(|s| {
+                    let s = s.trim();
+                    let segs: Vec<String> = s.split('.').map(|p| p.to_string()).collect();
+                    if segs.len() == 1 { exdb_core::field_path::FieldPath::single(&segs[0]) }
+                    else { exdb_core::field_path::FieldPath::new(segs) }
+                })
+                .collect();
+            let range_exprs = super::query::scan::parse_range_exprs(if p2.is_empty() { "[]" } else { p2 })
+                .map_err(|e| format!("Range parse error: {e}"))?;
+            let shape = exdb_query::validate_range(&index_fields, &range_exprs)
+                .map_err(|e| format!("{e:?}"))?;
+            Ok(format!(
+                "RangeShape {{ eq_count: {}, range_field: {:?}, has_lower: {}, has_upper: {} }}",
+                shape.eq_count, shape.range_field, shape.has_lower, shape.has_upper
+            ))
+        }
+        ("query", "range_encode") => {
+            // p1 = index fields, p2 = range JSON
+            if p1.is_empty() {
+                return Err("Param1: index fields (comma-separated). Param2: range JSON".into());
+            }
+            let index_fields: Vec<exdb_core::field_path::FieldPath> = p1.split(',')
+                .map(|s| {
+                    let s = s.trim();
+                    let segs: Vec<String> = s.split('.').map(|p| p.to_string()).collect();
+                    if segs.len() == 1 { exdb_core::field_path::FieldPath::single(&segs[0]) }
+                    else { exdb_core::field_path::FieldPath::new(segs) }
+                })
+                .collect();
+            let range_exprs = super::query::scan::parse_range_exprs(if p2.is_empty() { "[]" } else { p2 })
+                .map_err(|e| format!("Range parse error: {e}"))?;
+            let (lower, upper) = exdb_query::encode_range(&index_fields, &range_exprs)
+                .map_err(|e| format!("{e:?}"))?;
+            let fmt_bound = |b: &std::ops::Bound<Vec<u8>>| match b {
+                std::ops::Bound::Unbounded => "Unbounded".to_string(),
+                std::ops::Bound::Included(v) => format!("Included({})", hex_short(v)),
+                std::ops::Bound::Excluded(v) => format!("Excluded({})", hex_short(v)),
+            };
+            Ok(format!("lower: {}\nupper: {}", fmt_bound(&lower), fmt_bound(&upper)))
         }
         _ => Err(format!("Unknown command: {target}.{method}")),
     }

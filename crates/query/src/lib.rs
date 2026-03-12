@@ -24,7 +24,7 @@ pub use range_encoder::{encode_range, validate_range, RangeError, RangeShape};
 pub use access::{resolve_access, AccessError, AccessMethod, IndexInfo};
 
 // Scan execution
-pub use scan::{execute_scan, QueryScanner, ReadIntervalInfo, ScanRow, ScanStats};
+pub use scan::{execute_scan, QueryScanStream, ReadIntervalInfo, ScanRow, ScanStats};
 
 // Write-set merge
 pub use merge::{merge_with_writes, MergeView};

@@ -19,12 +19,7 @@ pub fn DocumentsModule() -> Element {
     let collections = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db.clone();
-        async move {
-            tokio::task::spawn_blocking(move || db.list_collections())
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-        }
+        async move { db.list_collections().await.ok() }
     });
 
     let read_ts: u64 = {
@@ -119,12 +114,7 @@ fn DocumentBrowser(
     let documents = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db.clone();
-        async move {
-            tokio::task::spawn_blocking(move || db.docstore_scan(root_page, read_ts, 200))
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-        }
+        async move { db.docstore_scan(root_page, read_ts, 200).await.ok() }
     });
 
     let ts_label = if read_ts == u64::MAX {
@@ -215,12 +205,7 @@ fn VersionHistory(root_page: u32, doc_id_hex: String) -> Element {
     let versions = use_resource(move || {
         let db = db.clone();
         let did = doc_id_for_fetch.clone();
-        async move {
-            tokio::task::spawn_blocking(move || db.docstore_versions(root_page, &did))
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-        }
+        async move { db.docstore_versions(root_page, &did).await.ok() }
     });
 
     rsx! {

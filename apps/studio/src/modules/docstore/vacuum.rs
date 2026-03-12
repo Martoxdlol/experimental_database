@@ -11,19 +11,25 @@ pub fn VacuumModule() -> Element {
         return rsx! { div { class: "empty-state", "No database open" } };
     };
 
-    let fh = db.read_file_header();
-    let visible_ts = fh.visible_ts.get();
-
+    let db_for_header = db.clone();
     let db_for_stats = db.clone();
+
+    let header = use_resource(move || {
+        let _rev = *state.revision.read();
+        let db = db_for_header.clone();
+        async move { Some(db.read_file_header().await) }
+    });
+
+    let visible_ts = header
+        .read()
+        .as_ref()
+        .and_then(|fh| fh.as_ref().map(|h| h.visible_ts.get()))
+        .unwrap_or(0);
+
     let stats = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db_for_stats.clone();
-        async move {
-            tokio::task::spawn_blocking(move || db.vacuum_stats())
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-        }
+        async move { db.vacuum_stats().await.ok() }
     });
 
     rsx! {

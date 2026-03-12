@@ -21,10 +21,17 @@ pub fn BTreeModule() -> Element {
         let _rev = *state.revision.read();
         let db = db_for_catalog.clone();
         async move {
-            tokio::task::spawn_blocking(move || db.list_collections())
-                .await
-                .ok()
-                .and_then(|r| r.ok())
+            db.list_collections().await.ok()
+        }
+    });
+
+    // Load file header (async)
+    let db_for_fh = db.clone();
+    let file_header = use_resource(move || {
+        let _rev = *state.revision.read();
+        let db = db_for_fh.clone();
+        async move {
+            Some(db.read_file_header().await)
         }
     });
 
@@ -48,9 +55,11 @@ pub fn BTreeModule() -> Element {
                                 },
                                 option { value: "", "Choose a tree..." }
                                 {
-                                    let fh = db.read_file_header();
-                                    let cat_root = fh.catalog_root_page.get();
-                                    let name_root = fh.catalog_name_root_page.get();
+                                    let (cat_root, name_root) = if let Some(Some(fh)) = file_header.read().as_ref() {
+                                        (fh.catalog_root_page.get(), fh.catalog_name_root_page.get())
+                                    } else {
+                                        (0, 0)
+                                    };
                                     rsx! {
                                         if cat_root != 0 {
                                             option { value: "{cat_root}", "Catalog (by-id) - Page #{cat_root}" }
@@ -105,20 +114,22 @@ pub fn BTreeModule() -> Element {
                                 class: "btn btn-action",
                                 onclick: move |_| {
                                     let db = state.db.read().clone();
-                                    if let Some(db) = db {
-                                        match db.create_btree() {
-                                            Ok(root) => {
-                                                selected_root.set(Some(root));
-                                                state.last_result.set(Some(OperationResult::Success(
-                                                    format!("Created new B-tree with root page #{root}")
-                                                )));
-                                                state.notify_mutation();
-                                            }
-                                            Err(e) => {
-                                                state.last_result.set(Some(OperationResult::Error(e.to_string())));
+                                    spawn(async move {
+                                        if let Some(db) = db {
+                                            match db.create_btree().await {
+                                                Ok(root) => {
+                                                    selected_root.set(Some(root));
+                                                    state.last_result.set(Some(OperationResult::Success(
+                                                        format!("Created new B-tree with root page #{root}")
+                                                    )));
+                                                    state.notify_mutation();
+                                                }
+                                                Err(e) => {
+                                                    state.last_result.set(Some(OperationResult::Error(e.to_string())));
+                                                }
                                             }
                                         }
-                                    }
+                                    });
                                 },
                                 "+ New B-Tree"
                             }
@@ -149,10 +160,7 @@ fn BTreeView(root_page: u32, write_enabled: bool) -> Element {
         let _rev = *state.revision.read();
         let db = db.clone();
         async move {
-            tokio::task::spawn_blocking(move || db.read_btree_node(root_page))
-                .await
-                .ok()
-                .and_then(|r| r.ok())
+            db.read_btree_node(root_page).await.ok()
         }
     });
 
@@ -196,16 +204,19 @@ fn BTreeView(root_page: u32, write_enabled: bool) -> Element {
                                                                 onclick: move |e| {
                                                                     e.stop_propagation();
                                                                     let db = state.db.read().clone();
-                                                                    if let Some(db) = db {
-                                                                        match db.btree_delete(root_page, &key_clone) {
-                                                                            Ok(true) => {
-                                                                                state.last_result.set(Some(OperationResult::Success("Key deleted".into())));
-                                                                                state.notify_mutation();
+                                                                    let key_clone = key_clone.clone();
+                                                                    spawn(async move {
+                                                                        if let Some(db) = db {
+                                                                            match db.btree_delete(root_page, &key_clone).await {
+                                                                                Ok(true) => {
+                                                                                    state.last_result.set(Some(OperationResult::Success("Key deleted".into())));
+                                                                                    state.notify_mutation();
+                                                                                }
+                                                                                Ok(false) => state.last_result.set(Some(OperationResult::Error("Key not found".into()))),
+                                                                                Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                                             }
-                                                                            Ok(false) => state.last_result.set(Some(OperationResult::Error("Key not found".into()))),
-                                                                            Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                                         }
-                                                                    }
+                                                                    });
                                                                 },
                                                                 "\u{2717}"
                                                             }
@@ -315,19 +326,21 @@ fn InsertKvForm(root_page: u32) -> Element {
                             };
                             if let (Some(k), Some(v)) = (key, value) {
                                 let db = state.db.read().clone();
-                                if let Some(db) = db {
-                                    match db.btree_insert(root_page, &k, &v) {
-                                        Ok(()) => {
-                                            state.last_result.set(Some(OperationResult::Success("Key inserted".into())));
-                                            state.notify_mutation();
-                                            key_hex.set(String::new());
-                                            value_hex.set(String::new());
-                                        }
-                                        Err(e) => {
-                                            state.last_result.set(Some(OperationResult::Error(e.to_string())));
+                                spawn(async move {
+                                    if let Some(db) = db {
+                                        match db.btree_insert(root_page, &k, &v).await {
+                                            Ok(()) => {
+                                                state.last_result.set(Some(OperationResult::Success("Key inserted".into())));
+                                                state.notify_mutation();
+                                                key_hex.set(String::new());
+                                                value_hex.set(String::new());
+                                            }
+                                            Err(e) => {
+                                                state.last_result.set(Some(OperationResult::Error(e.to_string())));
+                                            }
                                         }
                                     }
-                                }
+                                });
                             } else {
                                 state.last_result.set(Some(OperationResult::Error("Invalid hex input".into())));
                             }

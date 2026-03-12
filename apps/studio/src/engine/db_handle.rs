@@ -12,6 +12,7 @@ use exdb_storage::engine::{FileHeader, StorageConfig, StorageEngine};
 use exdb_storage::heap::HeapRef;
 use exdb_storage::page::{PageType, SlottedPage, SlottedPageRef};
 use exdb_storage::recovery::NoOpHandler;
+use tokio_stream::StreamExt;
 
 // ─── Display types ───
 
@@ -103,10 +104,10 @@ pub struct DbHandle {
 
 impl DbHandle {
     /// Open a database directory with full read-write access.
-    pub fn open(path: &Path) -> io::Result<Self> {
+    pub async fn open(path: &Path) -> io::Result<Self> {
         let config = StorageConfig::default();
         let page_size = config.page_size;
-        let engine = StorageEngine::open(path, config, &mut NoOpHandler)?;
+        let engine = StorageEngine::open(path, config, &mut NoOpHandler).await?;
         Ok(Self {
             engine: Arc::new(engine),
             path: path.display().to_string(),
@@ -121,11 +122,11 @@ impl DbHandle {
 
     // ─── FileHeader ───
 
-    pub fn read_file_header(&self) -> FileHeader {
-        self.engine.file_header()
+    pub async fn read_file_header(&self) -> FileHeader {
+        self.engine.file_header().await
     }
 
-    pub fn update_file_header_field(&self, field: &str, value: u64) -> io::Result<()> {
+    pub async fn update_file_header_field(&self, field: &str, value: u64) -> io::Result<()> {
         use zerocopy::byteorder::LittleEndian;
         use zerocopy::U32;
         use zerocopy::U64;
@@ -144,7 +145,7 @@ impl DbHandle {
             "next_collection_id" => fh.next_collection_id = U64::<LittleEndian>::new(value),
             "next_index_id" => fh.next_index_id = U64::<LittleEndian>::new(value),
             _ => {}
-        })
+        }).await
     }
 
     // ─── Page Access ───
@@ -153,8 +154,8 @@ impl DbHandle {
         self.engine.buffer_pool().page_storage().page_count()
     }
 
-    pub fn read_page(&self, page_id: u32) -> io::Result<PageInfo> {
-        let guard = self.engine.buffer_pool().fetch_page_shared(page_id)?;
+    pub async fn read_page(&self, page_id: u32) -> io::Result<PageInfo> {
+        let guard = self.engine.buffer_pool().fetch_page_shared(page_id).await?;
         let data = guard.data();
         let raw_bytes = data.to_vec();
         let page = SlottedPageRef::from_buf(data)?;
@@ -199,11 +200,11 @@ impl DbHandle {
         })
     }
 
-    pub fn scan_page_types(&self) -> io::Result<Vec<(u32, Option<PageType>, u8)>> {
+    pub async fn scan_page_types(&self) -> io::Result<Vec<(u32, Option<PageType>, u8)>> {
         let count = self.page_count();
         let mut result = Vec::new();
         for i in 0..count as u32 {
-            let guard = self.engine.buffer_pool().fetch_page_shared(i)?;
+            let guard = self.engine.buffer_pool().fetch_page_shared(i).await?;
             let page = SlottedPageRef::from_buf(guard.data())?;
             let header = page.header();
             result.push((i, page.try_page_type(), header.page_type));
@@ -213,47 +214,47 @@ impl DbHandle {
 
     // ─── Page Write ───
 
-    pub fn init_page(&self, page_id: u32, page_type: PageType) -> io::Result<()> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id)?;
+    pub async fn init_page(&self, page_id: u32, page_type: PageType) -> io::Result<()> {
+        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
         let buf = guard.data_mut();
         SlottedPage::init(buf, page_id, page_type);
         Ok(())
     }
 
-    pub fn insert_slot(&self, page_id: u32, data: &[u8]) -> io::Result<u16> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id)?;
+    pub async fn insert_slot(&self, page_id: u32, data: &[u8]) -> io::Result<u16> {
+        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.insert_slot(data)
             .map_err(|e| io::Error::other(format!("{e:?}")))
     }
 
-    pub fn update_slot(&self, page_id: u32, slot: u16, data: &[u8]) -> io::Result<()> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id)?;
+    pub async fn update_slot(&self, page_id: u32, slot: u16, data: &[u8]) -> io::Result<()> {
+        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.update_slot(slot, data)
             .map_err(|e| io::Error::other(format!("{e:?}")))
     }
 
-    pub fn delete_slot(&self, page_id: u32, slot: u16) -> io::Result<()> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id)?;
+    pub async fn delete_slot(&self, page_id: u32, slot: u16) -> io::Result<()> {
+        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.delete_slot(slot);
         Ok(())
     }
 
-    pub fn compact_page(&self, page_id: u32) -> io::Result<()> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id)?;
+    pub async fn compact_page(&self, page_id: u32) -> io::Result<()> {
+        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.compact();
         Ok(())
     }
 
-    pub fn stamp_checksum(&self, page_id: u32) -> io::Result<()> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id)?;
+    pub async fn stamp_checksum(&self, page_id: u32) -> io::Result<()> {
+        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.stamp_checksum();
@@ -262,37 +263,35 @@ impl DbHandle {
 
     // ─── B-Tree ───
 
-    pub fn create_btree(&self) -> io::Result<u32> {
-        let handle = self.engine.create_btree()?;
+    pub async fn create_btree(&self) -> io::Result<u32> {
+        let handle = self.engine.create_btree().await?;
         Ok(handle.root_page())
     }
 
-    pub fn btree_insert(&self, root_page: u32, key: &[u8], value: &[u8]) -> io::Result<()> {
+    pub async fn btree_insert(&self, root_page: u32, key: &[u8], value: &[u8]) -> io::Result<()> {
         let handle = self.engine.open_btree(root_page);
-        handle.insert(key, value)
+        handle.insert(key, value).await
     }
 
-    pub fn btree_delete(&self, root_page: u32, key: &[u8]) -> io::Result<bool> {
+    pub async fn btree_delete(&self, root_page: u32, key: &[u8]) -> io::Result<bool> {
         let handle = self.engine.open_btree(root_page);
-        handle.delete(key)
+        handle.delete(key).await
     }
 
-    pub fn btree_get(&self, root_page: u32, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    pub async fn btree_get(&self, root_page: u32, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let handle = self.engine.open_btree(root_page);
-        handle.get(key)
+        handle.get(key).await
     }
 
-    pub fn btree_scan(
+    pub async fn btree_scan(
         &self,
         root_page: u32,
         limit: usize,
     ) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        use exdb_storage::btree::ScanDirection;
-        use std::ops::Bound;
         let handle = self.engine.open_btree(root_page);
-        let iter = handle.scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward);
+        let mut scanner = handle.scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward);
         let mut results = Vec::new();
-        for entry in iter {
+        while let Some(entry) = scanner.next().await {
             let (k, v) = entry?;
             results.push((k, v));
             if results.len() >= limit {
@@ -302,8 +301,8 @@ impl DbHandle {
         Ok(results)
     }
 
-    pub fn read_btree_node(&self, page_id: u32) -> io::Result<BTreeNodeInfo> {
-        let guard = self.engine.buffer_pool().fetch_page_shared(page_id)?;
+    pub async fn read_btree_node(&self, page_id: u32) -> io::Result<BTreeNodeInfo> {
+        let guard = self.engine.buffer_pool().fetch_page_shared(page_id).await?;
         let page = SlottedPageRef::from_buf(guard.data())?;
         let pt = page.try_page_type();
         let is_leaf = pt == Some(PageType::BTreeLeaf);
@@ -366,10 +365,11 @@ impl DbHandle {
         WalSegmentInfo { current_lsn }
     }
 
-    pub fn read_wal_frames(&self, from_lsn: u64, limit: usize) -> Vec<WalFrameInfo> {
-        let mut iter = self.engine.read_wal_from(from_lsn);
+    pub async fn read_wal_frames(&self, from_lsn: u64, limit: usize) -> Vec<WalFrameInfo> {
+        use tokio_stream::StreamExt;
+        let mut stream = self.engine.read_wal_from(from_lsn);
         let mut frames = Vec::new();
-        for record in &mut iter {
+        while let Some(record) = stream.next().await {
             match record {
                 Ok(r) => {
                     frames.push(WalFrameInfo {
@@ -394,31 +394,31 @@ impl DbHandle {
 
     // ─── Heap ───
 
-    pub fn heap_store(&self, data: &[u8]) -> io::Result<(u32, u16)> {
-        let href = self.engine.heap_store(data)?;
+    pub async fn heap_store(&self, data: &[u8]) -> io::Result<(u32, u16)> {
+        let href = self.engine.heap_store(data).await?;
         Ok((href.page_id, href.slot_id))
     }
 
-    pub fn heap_load(&self, page_id: u32, slot_id: u16) -> io::Result<Vec<u8>> {
+    pub async fn heap_load(&self, page_id: u32, slot_id: u16) -> io::Result<Vec<u8>> {
         let href = HeapRef { page_id, slot_id };
-        self.engine.heap_load(href)
+        self.engine.heap_load(href).await
     }
 
-    pub fn heap_free(&self, page_id: u32, slot_id: u16) -> io::Result<()> {
+    pub async fn heap_free(&self, page_id: u32, slot_id: u16) -> io::Result<()> {
         let href = HeapRef { page_id, slot_id };
-        self.engine.heap_free(href)
+        self.engine.heap_free(href).await
     }
 
     // ─── Free List ───
 
-    pub fn walk_free_list(&self) -> io::Result<FreeListInfo> {
-        let fh = self.engine.file_header();
+    pub async fn walk_free_list(&self) -> io::Result<FreeListInfo> {
+        let fh = self.engine.file_header().await;
         let head = fh.free_list_head.get();
         let mut chain = Vec::new();
         let mut current = head;
         while current != 0 {
             chain.push(current);
-            let guard = self.engine.buffer_pool().fetch_page_shared(current)?;
+            let guard = self.engine.buffer_pool().fetch_page_shared(current).await?;
             let page = SlottedPageRef::from_buf(guard.data())?;
             current = page.prev_or_ptr();
             if chain.len() > 10000 {
@@ -428,20 +428,20 @@ impl DbHandle {
         Ok(FreeListInfo { head, chain })
     }
 
-    pub fn free_list_allocate(&self) -> io::Result<u32> {
-        let mut fl = self.engine.free_list().lock();
-        fl.allocate()
+    pub async fn free_list_allocate(&self) -> io::Result<u32> {
+        let mut fl = self.engine.free_list().lock().await;
+        fl.allocate().await
     }
 
-    pub fn free_list_deallocate(&self, page_id: u32) -> io::Result<()> {
-        let mut fl = self.engine.free_list().lock();
-        fl.deallocate(page_id)
+    pub async fn free_list_deallocate(&self, page_id: u32) -> io::Result<()> {
+        let mut fl = self.engine.free_list().lock().await;
+        fl.deallocate(page_id).await
     }
 
     // ─── Catalog ───
 
-    pub fn list_collections(&self) -> io::Result<Vec<CollectionInfo>> {
-        let fh = self.engine.file_header();
+    pub async fn list_collections(&self) -> io::Result<Vec<CollectionInfo>> {
+        let fh = self.engine.file_header().await;
         let catalog_root = fh.catalog_root_page.get();
         if catalog_root == 0 {
             return Ok(Vec::new());
@@ -451,23 +451,22 @@ impl DbHandle {
         let mut collections = Vec::new();
 
         // Scan all entries with collection entity type prefix
-        use std::ops::Bound;
         let prefix = [CatalogEntityType::Collection as u8];
         let start = prefix.to_vec();
         let mut end = start.clone();
         end[0] += 1;
 
-        let iter = tree.scan(
+        let mut scanner = tree.scan(
             Bound::Included(&start[..]),
             Bound::Excluded(&end[..]),
             exdb_storage::btree::ScanDirection::Forward,
         );
 
-        for entry in iter {
+        while let Some(entry) = scanner.next().await {
             let (_key, value) = entry?;
             if let Ok(ce) = catalog_btree::deserialize_collection(&value) {
                 // Now find indexes for this collection
-                let indexes = self.list_indexes_for(catalog_root, ce.collection_id)?;
+                let indexes = self.list_indexes_for(catalog_root, ce.collection_id).await?;
                 collections.push(CollectionInfo {
                     id: ce.collection_id,
                     name: ce.name,
@@ -481,23 +480,22 @@ impl DbHandle {
         Ok(collections)
     }
 
-    fn list_indexes_for(&self, catalog_root: u32, collection_id: u64) -> io::Result<Vec<IndexInfo>> {
+    async fn list_indexes_for(&self, catalog_root: u32, collection_id: u64) -> io::Result<Vec<IndexInfo>> {
         let tree = self.engine.open_btree(catalog_root);
         let mut indexes = Vec::new();
 
-        use std::ops::Bound;
         let prefix = [CatalogEntityType::Index as u8];
         let start = prefix.to_vec();
         let mut end = start.clone();
         end[0] += 1;
 
-        let iter = tree.scan(
+        let mut scanner = tree.scan(
             Bound::Included(&start[..]),
             Bound::Excluded(&end[..]),
             exdb_storage::btree::ScanDirection::Forward,
         );
 
-        for entry in iter {
+        while let Some(entry) = scanner.next().await {
             let (_, value) = entry?;
             if let Ok(ie) = catalog_btree::deserialize_index(&value)
                 && ie.collection_id == collection_id {
@@ -520,30 +518,30 @@ impl DbHandle {
 
     // ─── Catalog Write ───
 
-    pub fn catalog_create_collection(&self, name: &str) -> io::Result<CollectionInfo> {
-        let fh = self.engine.file_header();
+    pub async fn catalog_create_collection(&self, name: &str) -> io::Result<CollectionInfo> {
+        let fh = self.engine.file_header().await;
         let mut catalog_root = fh.catalog_root_page.get();
         let mut name_root = fh.catalog_name_root_page.get();
 
         // Auto-create catalog B-trees if needed
         if catalog_root == 0 {
-            let tree = self.engine.create_btree()?;
+            let tree = self.engine.create_btree().await?;
             catalog_root = tree.root_page();
-            self.update_file_header_field("catalog_root_page", catalog_root as u64)?;
+            self.update_file_header_field("catalog_root_page", catalog_root as u64).await?;
         }
         if name_root == 0 {
-            let tree = self.engine.create_btree()?;
+            let tree = self.engine.create_btree().await?;
             name_root = tree.root_page();
-            self.update_file_header_field("catalog_name_root_page", name_root as u64)?;
+            self.update_file_header_field("catalog_name_root_page", name_root as u64).await?;
         }
 
         // Allocate IDs
-        let fh = self.engine.file_header();
+        let fh = self.engine.file_header().await;
         let col_id = fh.next_collection_id.get();
-        self.update_file_header_field("next_collection_id", col_id + 1)?;
+        self.update_file_header_field("next_collection_id", col_id + 1).await?;
 
         // Create data B-tree for the collection
-        let data_tree = self.engine.create_btree()?;
+        let data_tree = self.engine.create_btree().await?;
         let data_root = data_tree.root_page();
 
         let entry = catalog_btree::CollectionEntry {
@@ -557,13 +555,13 @@ impl DbHandle {
         let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, col_id);
         let value = catalog_btree::serialize_collection(&entry);
         let tree = self.engine.open_btree(catalog_root);
-        tree.insert(&id_key, &value)?;
+        tree.insert(&id_key, &value).await?;
 
         // Insert into by-name catalog
         let name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, name);
         let name_value = catalog_btree::serialize_name_value(col_id);
         let name_tree = self.engine.open_btree(name_root);
-        name_tree.insert(&name_key, &name_value)?;
+        name_tree.insert(&name_key, &name_value).await?;
 
         Ok(CollectionInfo {
             id: col_id,
@@ -574,8 +572,8 @@ impl DbHandle {
         })
     }
 
-    pub fn catalog_drop_collection(&self, collection_id: u64, name: &str) -> io::Result<()> {
-        let fh = self.engine.file_header();
+    pub async fn catalog_drop_collection(&self, collection_id: u64, name: &str) -> io::Result<()> {
+        let fh = self.engine.file_header().await;
         let catalog_root = fh.catalog_root_page.get();
         let name_root = fh.catalog_name_root_page.get();
         if catalog_root == 0 {
@@ -585,34 +583,34 @@ impl DbHandle {
         // Delete from by-id
         let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, collection_id);
         let tree = self.engine.open_btree(catalog_root);
-        tree.delete(&id_key)?;
+        tree.delete(&id_key).await?;
 
         // Delete from by-name
         if name_root != 0 {
             let name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, name);
             let name_tree = self.engine.open_btree(name_root);
-            name_tree.delete(&name_key)?;
+            name_tree.delete(&name_key).await?;
         }
 
         Ok(())
     }
 
-    pub fn catalog_create_index(
+    pub async fn catalog_create_index(
         &self,
         collection_id: u64,
         name: &str,
         field_paths: Vec<Vec<String>>,
     ) -> io::Result<IndexInfo> {
-        let fh = self.engine.file_header();
+        let fh = self.engine.file_header().await;
         let catalog_root = fh.catalog_root_page.get();
         if catalog_root == 0 {
             return Err(io::Error::other("No catalog"));
         }
 
         let idx_id = fh.next_index_id.get();
-        self.update_file_header_field("next_index_id", idx_id + 1)?;
+        self.update_file_header_field("next_index_id", idx_id + 1).await?;
 
-        let idx_tree = self.engine.create_btree()?;
+        let idx_tree = self.engine.create_btree().await?;
         let root_page = idx_tree.root_page();
 
         let entry = catalog_btree::IndexEntry {
@@ -630,7 +628,7 @@ impl DbHandle {
         let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx_id);
         let value = catalog_btree::serialize_index(&entry);
         let tree = self.engine.open_btree(catalog_root);
-        tree.insert(&id_key, &value)?;
+        tree.insert(&id_key, &value).await?;
 
         Ok(IndexInfo {
             id: idx_id,
@@ -641,8 +639,8 @@ impl DbHandle {
         })
     }
 
-    pub fn catalog_drop_index(&self, index_id: u64) -> io::Result<()> {
-        let fh = self.engine.file_header();
+    pub async fn catalog_drop_index(&self, index_id: u64) -> io::Result<()> {
+        let fh = self.engine.file_header().await;
         let catalog_root = fh.catalog_root_page.get();
         if catalog_root == 0 {
             return Err(io::Error::other("No catalog"));
@@ -650,7 +648,7 @@ impl DbHandle {
 
         let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, index_id);
         let tree = self.engine.open_btree(catalog_root);
-        tree.delete(&id_key)?;
+        tree.delete(&id_key).await?;
         Ok(())
     }
 
@@ -672,16 +670,16 @@ impl DbHandle {
     }
 
     /// MVCC scan at read_ts, returning decoded documents.
-    pub fn docstore_scan(
+    pub async fn docstore_scan(
         &self,
         root_page: u32,
         read_ts: u64,
         limit: usize,
     ) -> io::Result<Vec<DocstoreEntry>> {
         let primary = self.make_primary_index(root_page);
-        let scanner = primary.scan_at_ts(read_ts, ScanDirection::Forward);
+        let mut scanner = primary.scan_at_ts(read_ts, ScanDirection::Forward);
         let mut results = Vec::new();
-        for item in scanner {
+        while let Some(item) = scanner.next().await {
             let (doc_id, version_ts, body) = item?;
             results.push(DocstoreEntry {
                 doc_id_hex: hex_encode(doc_id.as_bytes()),
@@ -699,7 +697,7 @@ impl DbHandle {
     }
 
     /// All versions of a single document (raw, no version resolution).
-    pub fn docstore_versions(
+    pub async fn docstore_versions(
         &self,
         root_page: u32,
         doc_id_hex: &str,
@@ -729,14 +727,14 @@ impl DbHandle {
             end[i] = 0;
         }
 
-        let iter = btree.scan(
+        let mut scanner = btree.scan(
             Bound::Included(start.as_slice()),
             Bound::Excluded(end.as_slice()),
             ScanDirection::Forward,
         );
 
         let mut versions = Vec::new();
-        for entry in iter {
+        while let Some(entry) = scanner.next().await {
             let (key, value) = entry?;
             if key.len() < 24 {
                 continue;
@@ -774,7 +772,7 @@ impl DbHandle {
     }
 
     /// Scan secondary index, returning verified (doc_id, ts) pairs.
-    pub fn secondary_scan(
+    pub async fn secondary_scan(
         &self,
         sec_root: u32,
         primary_root: u32,
@@ -792,7 +790,7 @@ impl DbHandle {
         let prefix = key_encoding::encode_key_prefix(&scalars);
         let upper = key_encoding::successor_key(&prefix);
 
-        let scanner = secondary.scan_at_ts(
+        let mut scanner = secondary.scan_at_ts(
             Bound::Included(prefix.as_slice()),
             Bound::Excluded(upper.as_slice()),
             read_ts,
@@ -800,7 +798,7 @@ impl DbHandle {
         );
 
         let mut results = Vec::new();
-        for item in scanner {
+        while let Some(item) = scanner.next().await {
             let (doc_id, version_ts) = item?;
             results.push(SecondaryHit {
                 doc_id_hex: hex_encode(doc_id.as_bytes()),
@@ -884,17 +882,17 @@ impl DbHandle {
     }
 
     /// Per-collection MVCC overhead stats.
-    pub fn vacuum_stats(&self) -> io::Result<Vec<VacuumStats>> {
-        let collections = self.list_collections()?;
+    pub async fn vacuum_stats(&self) -> io::Result<Vec<VacuumStats>> {
+        let collections = self.list_collections().await?;
         let mut stats = Vec::new();
 
         for col in &collections {
             // Count raw B-tree entries
             let btree = self.engine.open_btree(col.data_root_page);
-            let iter = btree.scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward);
+            let mut scanner = btree.scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward);
             let mut total_raw: u64 = 0;
             let mut tombstone_count: u64 = 0;
-            for entry in iter {
+            while let Some(entry) = scanner.next().await {
                 let (_key, value) = entry?;
                 total_raw += 1;
                 if !value.is_empty() {
@@ -906,13 +904,13 @@ impl DbHandle {
             }
 
             // Count visible docs via MVCC scan
-            let fh = self.engine.file_header();
+            let fh = self.engine.file_header().await;
             let visible_ts = fh.visible_ts.get();
             let read_ts = if visible_ts == 0 { u64::MAX } else { visible_ts };
             let primary = self.make_primary_index(col.data_root_page);
-            let scanner = primary.scan_at_ts(read_ts, ScanDirection::Forward);
+            let mut mvcc_scanner = primary.scan_at_ts(read_ts, ScanDirection::Forward);
             let mut visible: u64 = 0;
-            for item in scanner {
+            while let Some(item) = mvcc_scanner.next().await {
                 item?;
                 visible += 1;
             }

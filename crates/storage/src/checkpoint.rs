@@ -75,7 +75,7 @@ impl Checkpoint {
                     .iter()
                     .map(|(page_id, data, _lsn)| (*page_id, data.clone()))
                     .collect();
-                dwb.write_pages(&pages_for_dwb)?;
+                dwb.write_pages(&pages_for_dwb).await?;
             }
 
         // Step 4: Mark flushed pages as clean.
@@ -104,18 +104,28 @@ mod tests {
     use crate::backend::{MemoryPageStorage, MemoryWalStorage, PageStorage, WalStorage};
     use crate::buffer_pool::{BufferPool, BufferPoolConfig};
     use crate::page::{PageType, SlottedPage};
-    use crate::wal::{WalConfig, WalReader, WalRecord, WAL_RECORD_CHECKPOINT, WAL_RECORD_TX_COMMIT};
+    use crate::wal::{WalConfig, WalReader, WalRecord, WalStream, WAL_RECORD_CHECKPOINT, WAL_RECORD_TX_COMMIT};
+    use tokio_stream::StreamExt;
+
+    /// Helper: collect all records from a WalStream into a Vec.
+    async fn collect_records(mut stream: WalStream) -> std::io::Result<Vec<WalRecord>> {
+        let mut records = Vec::new();
+        while let Some(result) = stream.next().await {
+            records.push(result?);
+        }
+        Ok(records)
+    }
 
     const PAGE_SIZE: usize = 4096;
 
     /// Helper: create a MemoryPageStorage with `n` initialized pages.
-    fn make_page_storage(n: u64) -> Arc<MemoryPageStorage> {
+    async fn make_page_storage(n: u64) -> Arc<MemoryPageStorage> {
         let storage = Arc::new(MemoryPageStorage::new(PAGE_SIZE));
-        storage.extend(n).unwrap();
+        storage.extend(n).await.unwrap();
         for i in 0..n {
             let mut buf = vec![0u8; PAGE_SIZE];
             SlottedPage::init(&mut buf, i as u32, PageType::Heap);
-            storage.write_page(i as u32, &buf).unwrap();
+            storage.write_page(i as u32, &buf).await.unwrap();
         }
         storage
     }
@@ -146,8 +156,8 @@ mod tests {
     const LSN_SIZE: usize = 8;
 
     /// Helper: write an LSN into a page buffer's header.
-    fn write_lsn_to_page(pool: &BufferPool, page_id: u32, lsn: u64) {
-        let mut guard = pool.fetch_page_exclusive(page_id).unwrap();
+    async fn write_lsn_to_page(pool: &BufferPool, page_id: u32, lsn: u64) {
+        let mut guard = pool.fetch_page_exclusive(page_id).await.unwrap();
         let buf = guard.data_mut();
         buf[LSN_OFFSET..LSN_OFFSET + LSN_SIZE].copy_from_slice(&lsn.to_le_bytes());
     }
@@ -157,13 +167,13 @@ mod tests {
 
     #[tokio::test]
     async fn clean_checkpoint() {
-        let page_storage = make_page_storage(4);
+        let page_storage = make_page_storage(4).await;
         let pool = make_pool(8, page_storage.clone());
         let (wal_writer, _wal_storage) = make_wal();
 
         // Dirty some pages.
-        write_lsn_to_page(&pool, 0, 10);
-        write_lsn_to_page(&pool, 1, 11);
+        write_lsn_to_page(&pool, 0, 10).await;
+        write_lsn_to_page(&pool, 1, 11).await;
 
         assert_eq!(pool.dirty_pages().len(), 2);
 
@@ -179,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_wal_record() {
-        let page_storage = make_page_storage(4);
+        let page_storage = make_page_storage(4).await;
         let pool = make_pool(8, page_storage.clone());
         let (wal_writer, wal_storage) = make_wal();
 
@@ -194,10 +204,7 @@ mod tests {
 
         // Read WAL and find the checkpoint record.
         let reader = WalReader::new(wal_storage.clone() as Arc<dyn WalStorage>);
-        let records: Vec<WalRecord> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records: Vec<WalRecord> = collect_records(reader.read_from(0)).await.unwrap();
 
         // Should have at least 2 records: the TX_COMMIT and the CHECKPOINT.
         assert!(records.len() >= 2, "expected at least 2 records, got {}", records.len());
@@ -220,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_no_dirty_pages() {
-        let page_storage = make_page_storage(4);
+        let page_storage = make_page_storage(4).await;
         let pool = make_pool(8, page_storage.clone());
         let (wal_writer, wal_storage) = make_wal();
 
@@ -229,10 +236,7 @@ mod tests {
 
         // Verify WAL record was still written.
         let reader = WalReader::new(wal_storage.clone() as Arc<dyn WalStorage>);
-        let records: Vec<WalRecord> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records: Vec<WalRecord> = collect_records(reader.read_from(0)).await.unwrap();
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record_type, WAL_RECORD_CHECKPOINT);
@@ -243,13 +247,13 @@ mod tests {
 
     #[tokio::test]
     async fn in_memory_checkpoint() {
-        let page_storage = make_page_storage(4);
+        let page_storage = make_page_storage(4).await;
         let pool = make_pool(8, page_storage.clone());
         let (wal_writer, wal_storage) = make_wal();
 
         // Dirty some pages.
-        write_lsn_to_page(&pool, 0, 10);
-        write_lsn_to_page(&pool, 1, 11);
+        write_lsn_to_page(&pool, 0, 10).await;
+        write_lsn_to_page(&pool, 1, 11).await;
 
         // In-memory: is_durable = false, no DWB.
         let checkpoint = Checkpoint::new(pool.clone(), None, wal_writer.clone(), false);
@@ -260,10 +264,7 @@ mod tests {
 
         // WAL record should be present.
         let reader = WalReader::new(wal_storage.clone() as Arc<dyn WalStorage>);
-        let records: Vec<WalRecord> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records: Vec<WalRecord> = collect_records(reader.read_from(0)).await.unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].record_type, WAL_RECORD_CHECKPOINT);
     }
@@ -274,12 +275,12 @@ mod tests {
 
     #[tokio::test]
     async fn mark_clean_concurrent_modification() {
-        let page_storage = make_page_storage(4);
+        let page_storage = make_page_storage(4).await;
         let pool = make_pool(8, page_storage.clone());
         let (_wal_writer, _wal_storage) = make_wal();
 
         // First modification: LSN = 10.
-        write_lsn_to_page(&pool, 0, 10);
+        write_lsn_to_page(&pool, 0, 10).await;
 
         // Create checkpoint but manually simulate the concurrent modification.
         // We can't easily interleave with the checkpoint, so we test mark_clean directly.
@@ -289,7 +290,7 @@ mod tests {
         assert_eq!(*original_lsn, 10);
 
         // Second modification: LSN = 20 (page modified since snapshot).
-        write_lsn_to_page(&pool, 0, 20);
+        write_lsn_to_page(&pool, 0, 20).await;
 
         // Mark clean with the OLD LSN. Should NOT clear dirty.
         pool.mark_clean(0, 10);
@@ -304,21 +305,21 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_checkpoints() {
-        let page_storage = make_page_storage(4);
+        let page_storage = make_page_storage(4).await;
         let pool = make_pool(8, page_storage.clone());
         let (wal_writer, wal_storage) = make_wal();
 
         let checkpoint = Checkpoint::new(pool.clone(), None, wal_writer.clone(), false);
 
         // Checkpoint 1: dirty pages 0, 1.
-        write_lsn_to_page(&pool, 0, 10);
-        write_lsn_to_page(&pool, 1, 11);
+        write_lsn_to_page(&pool, 0, 10).await;
+        write_lsn_to_page(&pool, 1, 11).await;
         assert_eq!(pool.dirty_pages().len(), 2);
         let _lsn1 = checkpoint.run().await.unwrap();
         assert_eq!(pool.dirty_pages().len(), 0);
 
         // Checkpoint 2: dirty page 2 only.
-        write_lsn_to_page(&pool, 2, 12);
+        write_lsn_to_page(&pool, 2, 12).await;
         assert_eq!(pool.dirty_pages().len(), 1);
         let _lsn2 = checkpoint.run().await.unwrap();
         assert_eq!(pool.dirty_pages().len(), 0);
@@ -330,10 +331,7 @@ mod tests {
 
         // Verify WAL has 3 checkpoint records.
         let reader = WalReader::new(wal_storage.clone() as Arc<dyn WalStorage>);
-        let records: Vec<WalRecord> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records: Vec<WalRecord> = collect_records(reader.read_from(0)).await.unwrap();
 
         let checkpoint_records: Vec<_> = records
             .iter()
@@ -347,7 +345,7 @@ mod tests {
 
     #[tokio::test]
     async fn checkpoint_lsn_advances() {
-        let page_storage = make_page_storage(4);
+        let page_storage = make_page_storage(4).await;
         let pool = make_pool(8, page_storage.clone());
         let (wal_writer, _wal_storage) = make_wal();
 

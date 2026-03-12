@@ -16,10 +16,7 @@ pub fn CatalogModule() -> Element {
         let _rev = *state.revision.read();
         let db = db.clone();
         async move {
-            tokio::task::spawn_blocking(move || db.list_collections())
-                .await
-                .ok()
-                .and_then(|r| r.ok())
+            db.list_collections().await.ok()
         }
     });
 
@@ -80,17 +77,20 @@ pub fn CatalogModule() -> Element {
                                                                 onclick: move |e| {
                                                                     e.stop_propagation();
                                                                     let db = state.db.read().clone();
-                                                                    if let Some(db) = db {
-                                                                        match db.catalog_drop_collection(col_id, &col_name) {
-                                                                            Ok(()) => {
-                                                                                state.last_result.set(Some(OperationResult::Success(
-                                                                                    format!("Dropped collection '{col_name}'")
-                                                                                )));
-                                                                                state.notify_mutation();
+                                                                    let col_name = col_name.clone();
+                                                                    spawn(async move {
+                                                                        if let Some(db) = db {
+                                                                            match db.catalog_drop_collection(col_id, &col_name).await {
+                                                                                Ok(()) => {
+                                                                                    state.last_result.set(Some(OperationResult::Success(
+                                                                                        format!("Dropped collection '{col_name}'")
+                                                                                    )));
+                                                                                    state.notify_mutation();
+                                                                                }
+                                                                                Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                                             }
-                                                                            Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                                         }
-                                                                    }
+                                                                    });
                                                                 },
                                                                 "\u{2717}"
                                                             }
@@ -171,17 +171,19 @@ pub fn CatalogModule() -> Element {
                                                                         onclick: move |e| {
                                                                             e.stop_propagation();
                                                                             let db = state.db.read().clone();
-                                                                            if let Some(db) = db {
-                                                                                match db.catalog_drop_index(idx_id) {
-                                                                                    Ok(()) => {
-                                                                                        state.last_result.set(Some(OperationResult::Success(
-                                                                                            format!("Dropped index #{idx_id}")
-                                                                                        )));
-                                                                                        state.notify_mutation();
+                                                                            spawn(async move {
+                                                                                if let Some(db) = db {
+                                                                                    match db.catalog_drop_index(idx_id).await {
+                                                                                        Ok(()) => {
+                                                                                            state.last_result.set(Some(OperationResult::Success(
+                                                                                                format!("Dropped index #{idx_id}")
+                                                                                            )));
+                                                                                            state.notify_mutation();
+                                                                                        }
+                                                                                        Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                                                     }
-                                                                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                                                 }
-                                                                            }
+                                                                            });
                                                                         },
                                                                         "\u{2717}"
                                                                     }
@@ -237,18 +239,20 @@ fn CreateCollectionForm() -> Element {
                                 return;
                             }
                             let db = state.db.read().clone();
-                            if let Some(db) = db {
-                                match db.catalog_create_collection(&name) {
-                                    Ok(info) => {
-                                        state.last_result.set(Some(OperationResult::Success(
-                                            format!("Created collection '{}' (id={}, root={})", info.name, info.id, info.data_root_page)
-                                        )));
-                                        state.notify_mutation();
-                                        name_input.set(String::new());
+                            spawn(async move {
+                                if let Some(db) = db {
+                                    match db.catalog_create_collection(&name).await {
+                                        Ok(info) => {
+                                            state.last_result.set(Some(OperationResult::Success(
+                                                format!("Created collection '{}' (id={}, root={})", info.name, info.id, info.data_root_page)
+                                            )));
+                                            state.notify_mutation();
+                                            name_input.set(String::new());
+                                        }
+                                        Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                     }
-                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                 }
-                            }
+                            });
                         },
                         "Create"
                     }
@@ -303,19 +307,21 @@ fn CreateIndexForm(collection_id: u64) -> Element {
                                 .map(|f| f.trim().split('.').map(|s| s.to_string()).collect())
                                 .collect();
                             let db = state.db.read().clone();
-                            if let Some(db) = db {
-                                match db.catalog_create_index(collection_id, &name, field_paths) {
-                                    Ok(info) => {
-                                        state.last_result.set(Some(OperationResult::Success(
-                                            format!("Created index '{}' (id={}, root={})", info.name, info.id, info.root_page)
-                                        )));
-                                        state.notify_mutation();
-                                        name_input.set(String::new());
-                                        fields_input.set(String::new());
+                            spawn(async move {
+                                if let Some(db) = db {
+                                    match db.catalog_create_index(collection_id, &name, field_paths).await {
+                                        Ok(info) => {
+                                            state.last_result.set(Some(OperationResult::Success(
+                                                format!("Created index '{}' (id={}, root={})", info.name, info.id, info.root_page)
+                                            )));
+                                            state.notify_mutation();
+                                            name_input.set(String::new());
+                                            fields_input.set(String::new());
+                                        }
+                                        Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                     }
-                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                 }
-                            }
+                            });
                         },
                         "Create Index"
                     }

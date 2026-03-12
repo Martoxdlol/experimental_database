@@ -39,3 +39,8 @@ parking_lot = "0.12"
 zerocopy    = { version = "0.8", features = ["derive"] }
 crc32fast   = "1"
 tempfile    = "3"
+async-trait = "0.1"
+futures-core = "0.3"
+async-stream = "0.3"
+pin-project-lite = "0.2"
+tokio-stream = "0.1"

@@ -5,9 +5,11 @@
 //! background task that batches writes through the [`WalStorage`] trait.
 
 use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use futures_core::Stream;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::backend::WalStorage;
@@ -61,6 +63,11 @@ pub struct WalRecord {
     /// Record payload bytes.
     pub payload: Vec<u8>,
 }
+
+// ─── WalStream ───
+
+/// Async stream of WAL records, replacing the sync `WalIterator`.
+pub type WalStream = Pin<Box<dyn Stream<Item = io::Result<WalRecord>> + Send>>;
 
 // ─── WalConfig ───
 
@@ -157,17 +164,17 @@ impl WalWriter {
     /// Background writer task. Batches incoming requests, performs a single
     /// `append` + `sync`, and responds with assigned LSNs.
     ///
-    /// The batch processing is wrapped in `catch_unwind` so that a panic
-    /// in storage I/O does not kill the task permanently. In-flight callers
-    /// of the panicked batch receive `WalShutDown` (their oneshot senders
-    /// are dropped), but the task continues for future requests.
+    /// Each batch is processed inside a `catch_unwind` boundary so that a
+    /// panic in storage I/O does not kill the task permanently. In-flight
+    /// callers of the panicked batch receive `WalShutDown` (their oneshot
+    /// senders are dropped), but the task continues for future requests.
     async fn background_task(
         storage: Arc<dyn WalStorage>,
         mut rx: mpsc::Receiver<WalWriteRequest>,
         current_lsn: Arc<AtomicU64>,
     ) {
         loop {
-            // Step 1: Block on the first request (outside catch_unwind — recv can't panic).
+            // Step 1: Block on the first request.
             let first = match rx.recv().await {
                 Some(req) => req,
                 None => return, // Channel closed -- shutdown.
@@ -179,29 +186,36 @@ impl WalWriter {
                 batch.push(req);
             }
 
-            // Step 3-6: Process batch (sync code, wrapped in catch_unwind).
+            // Step 3-6: Process batch (async, wrapped in catch_unwind).
+            let storage_ref = storage.clone();
+            let lsn_ref = current_lsn.clone();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Self::process_batch(&storage, batch, &current_lsn);
+                Self::process_batch(storage_ref, batch, lsn_ref)
             }));
 
-            if let Err(_panic) = result {
-                eprintln!(
-                    "WAL writer: caught panic in batch processing. \
-                     In-flight callers will receive WalShutDown. Continuing."
-                );
-                // The batch's oneshot senders were moved into process_batch and
-                // dropped by the panic unwind → callers get RecvError → WalShutDown.
-                // The loop continues for future requests.
+            match result {
+                Ok(future) => {
+                    future.await;
+                }
+                Err(_panic) => {
+                    tracing::error!(
+                        "WAL writer: caught panic in batch processing. \
+                         In-flight callers will receive WalShutDown. Continuing."
+                    );
+                    // The batch's oneshot senders were moved into process_batch and
+                    // dropped by the panic unwind → callers get RecvError → WalShutDown.
+                    // The loop continues for future requests.
+                }
             }
         }
     }
 
     /// Process a single batch of WAL write requests: serialize, append, sync,
     /// and respond.
-    fn process_batch(
-        storage: &Arc<dyn WalStorage>,
+    async fn process_batch(
+        storage: Arc<dyn WalStorage>,
         batch: Vec<WalWriteRequest>,
-        current_lsn: &Arc<AtomicU64>,
+        current_lsn: Arc<AtomicU64>,
     ) {
         // Serialize the entire batch into a single buffer.
         let mut buf = Vec::new();
@@ -230,12 +244,12 @@ impl WalWriter {
             }
         }
 
-        // Single append to storage.
-        let append_result = storage.append(&buf);
+        // Single async append to storage.
+        let append_result = storage.append(&buf).await;
 
-        // Single sync (fsync).
+        // Single async sync (fsync).
         let sync_result = if append_result.is_ok() {
-            storage.sync()
+            storage.sync().await
         } else {
             Ok(())
         };
@@ -347,22 +361,83 @@ impl WalReader {
         Self { storage }
     }
 
-    /// Create an iterator starting at the given LSN.
-    pub fn read_from(&self, lsn: Lsn) -> WalIterator {
-        WalIterator {
-            storage: self.storage.clone(),
-            current_lsn: lsn,
-        }
+    /// Create an async stream starting at the given LSN.
+    pub fn read_from(&self, start_lsn: Lsn) -> WalStream {
+        let storage = self.storage.clone();
+        Box::pin(async_stream::try_stream! {
+            let mut current_lsn = start_lsn;
+
+            loop {
+                // Step 1: Read the 9-byte header.
+                let mut header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
+                let n = storage.read_from(current_lsn, &mut header_buf).await?;
+
+                if n < WAL_FRAME_HEADER_SIZE {
+                    // Not enough data for a header -- end of log.
+                    break;
+                }
+
+                // Step 2: Parse header fields.
+                let payload_len = u32::from_le_bytes([
+                    header_buf[0], header_buf[1], header_buf[2], header_buf[3],
+                ]) as usize;
+                let stored_crc = u32::from_le_bytes([
+                    header_buf[4], header_buf[5], header_buf[6], header_buf[7],
+                ]);
+                let record_type = header_buf[8];
+
+                // Step 3: Check for end-of-log sentinel (payload_len == 0).
+                if payload_len == 0 {
+                    break;
+                }
+
+                // Step 4: Check for implausibly large payload (corrupt record).
+                if payload_len > MAX_WAL_RECORD_SIZE {
+                    break;
+                }
+
+                // Step 5: Read the payload.
+                let mut payload = vec![0u8; payload_len];
+                let n = storage
+                    .read_from(current_lsn + WAL_FRAME_HEADER_SIZE as u64, &mut payload)
+                    .await?;
+
+                if n < payload_len {
+                    // Incomplete payload -- partial write from crash. End of log.
+                    break;
+                }
+
+                // Step 6: Verify CRC-32C.
+                let computed_crc = compute_crc(record_type, &payload);
+                if computed_crc != stored_crc {
+                    // CRC mismatch -- corrupt record. Stop iteration.
+                    break;
+                }
+
+                // Step 7: Build the record and advance position.
+                let record_lsn = current_lsn;
+                current_lsn += (WAL_FRAME_HEADER_SIZE + payload_len) as u64;
+
+                yield WalRecord {
+                    lsn: record_lsn,
+                    record_type,
+                    payload,
+                };
+            }
+        })
     }
 
     /// Find the latest valid LSN by scanning from a starting point.
     /// Returns the LSN just past the last valid record (i.e., the position
     /// where the next record would be written).
-    pub fn find_end(&self, start_lsn: Lsn) -> io::Result<Lsn> {
-        let mut iter = self.read_from(start_lsn);
+    pub async fn find_end(&self, start_lsn: Lsn) -> io::Result<Lsn> {
+        let mut stream = self.read_from(start_lsn);
         let mut end_lsn = start_lsn;
         loop {
-            match iter.next() {
+            let item = std::future::poll_fn(|cx| {
+                Stream::poll_next(stream.as_mut(), cx)
+            }).await;
+            match item {
                 Some(Ok(record)) => {
                     end_lsn = record.lsn
                         + WAL_FRAME_HEADER_SIZE as u64
@@ -375,88 +450,6 @@ impl WalReader {
     }
 }
 
-// ─── WalIterator ───
-
-/// Iterator over WAL records. Owns an `Arc<dyn WalStorage>` so it is
-/// self-contained and can be returned from functions without lifetime issues.
-pub struct WalIterator {
-    storage: Arc<dyn WalStorage>,
-    current_lsn: Lsn,
-}
-
-impl WalIterator {
-    /// Return the current read position (LSN).
-    pub fn position(&self) -> Lsn {
-        self.current_lsn
-    }
-}
-
-impl Iterator for WalIterator {
-    type Item = io::Result<WalRecord>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Step 1: Read the 9-byte header.
-        let mut header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
-        let n = match self.storage.read_from(self.current_lsn, &mut header_buf) {
-            Ok(n) => n,
-            Err(e) => return Some(Err(e)),
-        };
-
-        if n < WAL_FRAME_HEADER_SIZE {
-            // Not enough data for a header -- end of log.
-            return None;
-        }
-
-        // Step 2: Parse header fields.
-        // header_buf is exactly WAL_FRAME_HEADER_SIZE (9) bytes and n >= 9, so these reads are safe.
-        let payload_len = u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]) as usize;
-        let stored_crc = u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
-        let record_type = header_buf[8];
-
-        // Step 3: Check for end-of-log sentinel (payload_len == 0).
-        if payload_len == 0 {
-            return None;
-        }
-
-        // Step 4: Check for implausibly large payload (corrupt record).
-        if payload_len > MAX_WAL_RECORD_SIZE {
-            return None;
-        }
-
-        // Step 5: Read the payload.
-        let mut payload = vec![0u8; payload_len];
-        let n = match self
-            .storage
-            .read_from(self.current_lsn + WAL_FRAME_HEADER_SIZE as u64, &mut payload)
-        {
-            Ok(n) => n,
-            Err(e) => return Some(Err(e)),
-        };
-
-        if n < payload_len {
-            // Incomplete payload -- partial write from crash. End of log.
-            return None;
-        }
-
-        // Step 6: Verify CRC-32C.
-        let computed_crc = compute_crc(record_type, &payload);
-        if computed_crc != stored_crc {
-            // CRC mismatch -- corrupt record. Stop iteration.
-            return None;
-        }
-
-        // Step 7: Build the record and advance position.
-        let record_lsn = self.current_lsn;
-        self.current_lsn += (WAL_FRAME_HEADER_SIZE + payload_len) as u64;
-
-        Some(Ok(WalRecord {
-            lsn: record_lsn,
-            record_type,
-            payload,
-        }))
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════
@@ -466,10 +459,20 @@ mod tests {
     use super::*;
     use crate::backend::{FileWalStorage, MemoryWalStorage};
     use tempfile::TempDir;
+    use tokio_stream::StreamExt;
 
     /// Helper: create a MemoryWalStorage wrapped in Arc.
     fn mem_storage() -> Arc<MemoryWalStorage> {
         Arc::new(MemoryWalStorage::new())
+    }
+
+    /// Helper: collect all records from a WalStream into a Vec.
+    async fn collect_records(mut stream: WalStream) -> io::Result<Vec<WalRecord>> {
+        let mut records = Vec::new();
+        while let Some(result) = stream.next().await {
+            records.push(result?);
+        }
+        Ok(records)
     }
 
     // ─── Test 1: Single record roundtrip ───
@@ -488,15 +491,15 @@ mod tests {
         assert_eq!(lsn, 0);
 
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
-        let mut iter = reader.read_from(0);
+        let mut stream = reader.read_from(0);
 
-        let record = iter.next().unwrap().unwrap();
+        let record = stream.next().await.unwrap().unwrap();
         assert_eq!(record.lsn, 0);
         assert_eq!(record.record_type, WAL_RECORD_TX_COMMIT);
         assert_eq!(record.payload, payload);
 
         // No more records.
-        assert!(iter.next().is_none());
+        assert!(stream.next().await.is_none());
     }
 
     // ─── Test 2: Multiple records ───
@@ -527,10 +530,7 @@ mod tests {
 
         // Read all back.
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
-        let records: Vec<_> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records = collect_records(reader.read_from(0)).await.unwrap();
         assert_eq!(records.len(), 100);
 
         for (i, record) in records.iter().enumerate() {
@@ -567,18 +567,16 @@ mod tests {
         let mut bad_frame = encode_frame(WAL_RECORD_TX_COMMIT, bad_payload);
         // Flip a bit in the CRC field (bytes 4..8).
         bad_frame[4] ^= 0xFF;
-        storage.append(&bad_frame).unwrap();
+        storage.append(&bad_frame).await.unwrap();
 
         // Write a third good record after the corrupt one.
         storage
             .append(&encode_frame(WAL_RECORD_TX_COMMIT, b"after bad"))
+            .await
             .unwrap();
 
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
-        let records: Vec<_> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records = collect_records(reader.read_from(0)).await.unwrap();
 
         // Should only get the first good record; iteration stops at the corrupt one.
         assert_eq!(records.len(), 1);
@@ -623,10 +621,7 @@ mod tests {
 
         // All records should be readable.
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
-        let records: Vec<_> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records = collect_records(reader.read_from(0)).await.unwrap();
         assert_eq!(records.len(), 10);
     }
 
@@ -636,9 +631,9 @@ mod tests {
     async fn empty_wal() {
         let storage = mem_storage();
         let reader = WalReader::new(storage as Arc<dyn WalStorage>);
-        let mut iter = reader.read_from(0);
+        let mut stream = reader.read_from(0);
 
-        assert!(iter.next().is_none(), "empty WAL should return None");
+        assert!(stream.next().await.is_none(), "empty WAL should return None");
     }
 
     // ─── Test 6: read_from mid-stream ───
@@ -664,10 +659,7 @@ mod tests {
 
         // Read starting from record 5.
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
-        let records: Vec<_> = reader
-            .read_from(lsns[5])
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records = collect_records(reader.read_from(lsns[5])).await.unwrap();
 
         assert_eq!(records.len(), 5, "should read records 5 through 9");
         for (j, record) in records.iter().enumerate() {
@@ -700,7 +692,7 @@ mod tests {
         let expected_end = writer.current_lsn();
 
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
-        let end = reader.find_end(0).unwrap();
+        let end = reader.find_end(0).await.unwrap();
         assert_eq!(end, expected_end);
     }
 
@@ -723,16 +715,16 @@ mod tests {
         let lsn = writer.append_raw_frame(&raw_frame).await.unwrap();
         assert_eq!(lsn, 0);
 
-        // Read it back via the iterator.
+        // Read it back via the stream.
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
-        let mut iter = reader.read_from(0);
+        let mut stream = reader.read_from(0);
 
-        let record = iter.next().unwrap().unwrap();
+        let record = stream.next().await.unwrap().unwrap();
         assert_eq!(record.lsn, 0);
         assert_eq!(record.record_type, record_type);
         assert_eq!(record.payload, payload);
 
-        assert!(iter.next().is_none());
+        assert!(stream.next().await.is_none());
     }
 
     // ─── Test 9: Large payload ───
@@ -755,13 +747,13 @@ mod tests {
         assert_eq!(lsn, 0);
 
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
-        let mut iter = reader.read_from(0);
+        let mut stream = reader.read_from(0);
 
-        let record = iter.next().unwrap().unwrap();
+        let record = stream.next().await.unwrap().unwrap();
         assert_eq!(record.payload.len(), 1_048_576);
         assert_eq!(record.payload, payload);
 
-        assert!(iter.next().is_none());
+        assert!(stream.next().await.is_none());
     }
 
     // ─── Test 10: current_lsn tracking ───
@@ -823,10 +815,7 @@ mod tests {
 
         // Verify the old data is still readable.
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
-        let records: Vec<_> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records = collect_records(reader.read_from(0)).await.unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].payload, b"before shutdown");
 
@@ -844,10 +833,7 @@ mod tests {
             .await
             .unwrap();
 
-        let records: Vec<_> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records = collect_records(reader.read_from(0)).await.unwrap();
         assert_eq!(records.len(), 2);
     }
 
@@ -882,10 +868,7 @@ mod tests {
         }
 
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
-        let records: Vec<_> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records = collect_records(reader.read_from(0)).await.unwrap();
         assert_eq!(records.len(), test_cases.len());
 
         for (i, (expected_type, expected_payload)) in test_cases.iter().enumerate()
@@ -919,10 +902,7 @@ mod tests {
 
         // Read all back.
         let reader = WalReader::new(storage.clone());
-        let records: Vec<_> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let records = collect_records(reader.read_from(0)).await.unwrap();
         assert_eq!(records.len(), 20);
 
         for (i, record) in records.iter().enumerate() {
@@ -932,14 +912,11 @@ mod tests {
         }
 
         // Verify find_end.
-        let end = reader.find_end(0).unwrap();
+        let end = reader.find_end(0).await.unwrap();
         assert_eq!(end, writer.current_lsn());
 
         // Verify mid-stream read.
-        let mid_records: Vec<_> = reader
-            .read_from(lsns[10])
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let mid_records = collect_records(reader.read_from(lsns[10])).await.unwrap();
         assert_eq!(mid_records.len(), 10);
     }
 
@@ -985,10 +962,7 @@ mod tests {
             let s = storage.clone() as Arc<dyn WalStorage>;
             reader_handles.push(tokio::spawn(async move {
                 let reader = WalReader::new(s);
-                let records: Vec<_> = reader
-                    .read_from(0)
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
+                let records = collect_records(reader.read_from(0)).await.unwrap();
                 // Should have at least the initial 10 records.
                 assert!(
                     records.len() >= 10,
@@ -1006,17 +980,11 @@ mod tests {
 
         // After all writes, verify the full log.
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
-        let all_records: Vec<_> = reader
-            .read_from(0)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let all_records = collect_records(reader.read_from(0)).await.unwrap();
         assert_eq!(all_records.len(), 30);
 
         // Verify we can still read from the initial end point.
-        let later_records: Vec<_> = reader
-            .read_from(initial_end)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let later_records = collect_records(reader.read_from(initial_end)).await.unwrap();
         assert_eq!(later_records.len(), 20);
     }
 }

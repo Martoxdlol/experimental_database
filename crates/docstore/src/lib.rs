@@ -22,10 +22,10 @@ pub use key_encoding::{
 };
 
 // Primary index (used by L4 scan/get, L5 commit)
-pub use primary_index::{CellFlags, PrimaryIndex, PrimaryScanner};
+pub use primary_index::{CellFlags, PrimaryIndex, PrimaryScanStream};
 
 // Secondary index (used by L4 index scan, L5 commit)
-pub use secondary_index::{SecondaryIndex, SecondaryScanner};
+pub use secondary_index::{SecondaryIndex, SecondaryScanStream};
 
 // Version resolution (used internally by D3/D4)
 pub use version_resolution::VersionResolver;

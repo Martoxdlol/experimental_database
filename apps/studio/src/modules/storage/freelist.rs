@@ -16,10 +16,7 @@ pub fn FreeListModule() -> Element {
         let _rev = *state.revision.read();
         let db = db.clone();
         async move {
-            tokio::task::spawn_blocking(move || db.walk_free_list())
-                .await
-                .ok()
-                .and_then(|r| r.ok())
+            db.walk_free_list().await.ok()
         }
     });
 
@@ -72,19 +69,21 @@ pub fn FreeListModule() -> Element {
                                     class: "btn btn-action",
                                     onclick: move |_| {
                                         let db = state.db.read().clone();
-                                        if let Some(db) = db {
-                                            match db.free_list_allocate() {
-                                                Ok(page_id) => {
-                                                    state.last_result.set(Some(OperationResult::Success(
-                                                        format!("Allocated page #{page_id}")
-                                                    )));
-                                                    state.notify_mutation();
-                                                }
-                                                Err(e) => {
-                                                    state.last_result.set(Some(OperationResult::Error(e.to_string())));
+                                        spawn(async move {
+                                            if let Some(db) = db {
+                                                match db.free_list_allocate().await {
+                                                    Ok(page_id) => {
+                                                        state.last_result.set(Some(OperationResult::Success(
+                                                            format!("Allocated page #{page_id}")
+                                                        )));
+                                                        state.notify_mutation();
+                                                    }
+                                                    Err(e) => {
+                                                        state.last_result.set(Some(OperationResult::Error(e.to_string())));
+                                                    }
                                                 }
                                             }
-                                        }
+                                        });
                                     },
                                     "Allocate Page"
                                 }
@@ -121,20 +120,22 @@ fn DeallocateForm() -> Element {
                     let val = page_input.read().clone();
                     if let Ok(page_id) = val.parse::<u32>() {
                         let db = state.db.read().clone();
-                        if let Some(db) = db {
-                            match db.free_list_deallocate(page_id) {
-                                Ok(()) => {
-                                    state.last_result.set(Some(OperationResult::Success(
-                                        format!("Deallocated page #{page_id}")
-                                    )));
-                                    state.notify_mutation();
-                                    page_input.set(String::new());
-                                }
-                                Err(e) => {
-                                    state.last_result.set(Some(OperationResult::Error(e.to_string())));
+                        spawn(async move {
+                            if let Some(db) = db {
+                                match db.free_list_deallocate(page_id).await {
+                                    Ok(()) => {
+                                        state.last_result.set(Some(OperationResult::Success(
+                                            format!("Deallocated page #{page_id}")
+                                        )));
+                                        state.notify_mutation();
+                                        page_input.set(String::new());
+                                    }
+                                    Err(e) => {
+                                        state.last_result.set(Some(OperationResult::Error(e.to_string())));
+                                    }
                                 }
                             }
-                        }
+                        });
                     }
                 },
                 "Deallocate"

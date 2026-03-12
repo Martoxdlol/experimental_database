@@ -8,6 +8,7 @@
 use crate::backend::{PageStorage, WalStorage};
 use crate::page::SlottedPageRef;
 use crate::wal::{Lsn, WalRecord, WAL_RECORD_CHECKPOINT};
+use async_trait::async_trait;
 use std::io;
 use std::path::Path;
 
@@ -60,10 +61,11 @@ const DWB_ENTRY_PREFIX_SIZE: usize = 4;
 ///
 /// The storage engine calls this for each record during recovery.
 /// Layer 3+ implements this to rebuild document/index state.
-pub trait WalRecordHandler {
+#[async_trait]
+pub trait WalRecordHandler: Send {
     /// Handle a single WAL record during replay.
     /// Called in LSN order, only for records after checkpoint_lsn.
-    fn handle_record(&mut self, record: &WalRecord) -> io::Result<()>;
+    async fn handle_record(&mut self, record: &WalRecord) -> io::Result<()>;
 }
 
 // ─── NoOpHandler ───
@@ -72,8 +74,9 @@ pub trait WalRecordHandler {
 /// (e.g., storage engine self-test).
 pub struct NoOpHandler;
 
+#[async_trait]
 impl WalRecordHandler for NoOpHandler {
-    fn handle_record(&mut self, _record: &WalRecord) -> io::Result<()> {
+    async fn handle_record(&mut self, _record: &WalRecord) -> io::Result<()> {
         Ok(())
     }
 }
@@ -95,7 +98,7 @@ impl Recovery {
     /// 4. Call handler for each replayed record (skip CHECKPOINT records)
     ///
     /// Returns the LSN after the last valid record and recovery statistics.
-    pub fn run(
+    pub async fn run(
         page_storage: &dyn PageStorage,
         wal_storage: &dyn WalStorage,
         dwb_path: Option<&Path>,
@@ -108,35 +111,47 @@ impl Recovery {
 
         // Step 2: DWB recovery (if applicable).
         if let Some(path) = dwb_path {
-            let (restored, skipped) = Self::dwb_recover(path, page_storage, page_size)?;
+            let (restored, skipped) =
+                Self::dwb_recover(path, page_storage, page_size).await?;
             stats.dwb_pages_restored = restored;
             stats.dwb_pages_skipped_corrupt = skipped;
         }
 
         // Step 3: WAL replay from checkpoint_lsn.
-        let end_lsn = Self::replay_wal(wal_storage, checkpoint_lsn, handler, mode, &mut stats)?;
+        let end_lsn =
+            Self::replay_wal(wal_storage, checkpoint_lsn, handler, mode, &mut stats).await?;
 
         Ok((end_lsn, stats))
     }
 
     /// Check if recovery is needed (DWB non-empty or WAL has records past checkpoint).
-    pub fn needs_recovery(
+    pub async fn needs_recovery(
         dwb_path: Option<&Path>,
         wal_storage: &dyn WalStorage,
         checkpoint_lsn: Lsn,
     ) -> io::Result<bool> {
         // Check DWB.
-        if let Some(path) = dwb_path
-            && path.exists() {
-                let metadata = std::fs::metadata(path)?;
-                if metadata.len() > 0 {
-                    return Ok(true);
+        if let Some(path) = dwb_path {
+            let path_buf = path.to_path_buf();
+            let exists_and_nonempty = tokio::task::spawn_blocking(move || -> io::Result<bool> {
+                if path_buf.exists() {
+                    let metadata = std::fs::metadata(&path_buf)?;
+                    Ok(metadata.len() > 0)
+                } else {
+                    Ok(false)
                 }
+            })
+            .await
+            .map_err(|e| io::Error::other(format!("spawn_blocking join error: {e}")))??;
+
+            if exists_and_nonempty {
+                return Ok(true);
             }
+        }
 
         // Check WAL: see if there are any valid records past checkpoint_lsn.
         let mut header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
-        let n = wal_storage.read_from(checkpoint_lsn, &mut header_buf)?;
+        let n = wal_storage.read_from(checkpoint_lsn, &mut header_buf).await?;
         if n >= WAL_FRAME_HEADER_SIZE {
             let payload_len = u32::from_le_bytes(
                 [header_buf[0], header_buf[1], header_buf[2], header_buf[3]],
@@ -151,7 +166,7 @@ impl Recovery {
 
     /// Replay WAL records starting from `start_lsn`, calling the handler for
     /// each non-checkpoint record. Returns the LSN after the last valid record.
-    fn replay_wal(
+    async fn replay_wal(
         wal_storage: &dyn WalStorage,
         start_lsn: Lsn,
         handler: &mut dyn WalRecordHandler,
@@ -164,7 +179,7 @@ impl Recovery {
         loop {
             // Read frame header.
             let mut header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
-            let n = wal_storage.read_from(current_lsn, &mut header_buf)?;
+            let n = wal_storage.read_from(current_lsn, &mut header_buf).await?;
             if n < WAL_FRAME_HEADER_SIZE {
                 break;
             }
@@ -188,7 +203,9 @@ impl Recovery {
                     stats.records_skipped_corrupt += 1;
                     current_lsn = match Self::scan_forward_for_valid_frame(
                         wal_storage, current_lsn + 1,
-                    )? {
+                    )
+                    .await?
+                    {
                         Some(next) => next,
                         None => break,
                     };
@@ -199,10 +216,9 @@ impl Recovery {
 
             // Read payload.
             let mut payload = vec![0u8; payload_len];
-            let n = wal_storage.read_from(
-                current_lsn + WAL_FRAME_HEADER_SIZE as u64,
-                &mut payload,
-            )?;
+            let n = wal_storage
+                .read_from(current_lsn + WAL_FRAME_HEADER_SIZE as u64, &mut payload)
+                .await?;
             if n < payload_len {
                 // Incomplete payload.
                 break;
@@ -220,7 +236,9 @@ impl Recovery {
                     stats.records_skipped_corrupt += 1;
                     current_lsn = match Self::scan_forward_for_valid_frame(
                         wal_storage, current_lsn + 1,
-                    )? {
+                    )
+                    .await?
+                    {
                         Some(next) => next,
                         None => break,
                     };
@@ -246,7 +264,7 @@ impl Recovery {
             }
 
             // Deliver to handler.
-            handler.handle_record(&record)?;
+            handler.handle_record(&record).await?;
             stats.records_replayed += 1;
         }
 
@@ -255,7 +273,7 @@ impl Recovery {
 
     /// Scan forward byte-by-byte from `start` looking for a valid WAL frame.
     /// Returns the LSN of the next valid frame, or None if not found within 1MB.
-    fn scan_forward_for_valid_frame(
+    async fn scan_forward_for_valid_frame(
         wal_storage: &dyn WalStorage,
         start: Lsn,
     ) -> io::Result<Option<Lsn>> {
@@ -266,7 +284,7 @@ impl Recovery {
 
         while probe < limit {
             let mut header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
-            let n = wal_storage.read_from(probe, &mut header_buf)?;
+            let n = wal_storage.read_from(probe, &mut header_buf).await?;
             if n < WAL_FRAME_HEADER_SIZE {
                 return Ok(None);
             }
@@ -284,10 +302,9 @@ impl Recovery {
 
             // Try to read the payload and verify CRC.
             let mut payload = vec![0u8; payload_len];
-            let n = wal_storage.read_from(
-                probe + WAL_FRAME_HEADER_SIZE as u64,
-                &mut payload,
-            )?;
+            let n = wal_storage
+                .read_from(probe + WAL_FRAME_HEADER_SIZE as u64, &mut payload)
+                .await?;
             if n < payload_len {
                 // Payload extends past WAL end at this probe — try next byte.
                 probe += 1;
@@ -316,33 +333,45 @@ impl Recovery {
 
     /// DWB recovery: restore torn pages from the DWB file.
     /// Returns (pages_restored, pages_skipped_corrupt).
-    fn dwb_recover(
+    async fn dwb_recover(
         dwb_path: &Path,
         page_storage: &dyn PageStorage,
         page_size: usize,
     ) -> io::Result<(u32, u32)> {
-        use std::io::Read;
+        // Read the entire DWB file into memory via spawn_blocking.
+        let path_buf = dwb_path.to_path_buf();
+        let file_data = tokio::task::spawn_blocking(move || -> io::Result<Option<Vec<u8>>> {
+            use std::io::Read;
 
-        if !dwb_path.exists() {
-            return Ok((0, 0));
-        }
+            if !path_buf.exists() {
+                return Ok(None);
+            }
 
-        let metadata = std::fs::metadata(dwb_path)?;
-        if metadata.len() == 0 {
-            return Ok((0, 0));
-        }
+            let metadata = std::fs::metadata(&path_buf)?;
+            if metadata.len() == 0 {
+                return Ok(None);
+            }
 
-        let mut file = std::fs::File::open(dwb_path)?;
+            let mut file = std::fs::File::open(&path_buf)?;
+            let mut data = Vec::with_capacity(metadata.len() as usize);
+            file.read_to_end(&mut data)?;
+            Ok(Some(data))
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("spawn_blocking join error: {e}")))??;
 
-        // Read header.
-        let mut header_buf = [0u8; DWB_HEADER_SIZE];
-        let bytes_read = file.read(&mut header_buf)?;
-        if bytes_read < DWB_HEADER_SIZE {
+        let file_data = match file_data {
+            Some(data) => data,
+            None => return Ok((0, 0)),
+        };
+
+        if file_data.len() < DWB_HEADER_SIZE {
             // Partial header -- treat as empty.
-            Self::truncate_dwb(dwb_path)?;
+            Self::truncate_dwb(dwb_path).await?;
             return Ok((0, 0));
         }
 
+        let header_buf = &file_data[..DWB_HEADER_SIZE];
         let magic = u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
         let _version = u16::from_le_bytes([header_buf[4], header_buf[5]]);
         let dwb_page_size = u16::from_le_bytes([header_buf[6], header_buf[7]]);
@@ -351,14 +380,14 @@ impl Recovery {
 
         // Verify magic.
         if magic != DWB_MAGIC {
-            Self::truncate_dwb(dwb_path)?;
+            Self::truncate_dwb(dwb_path).await?;
             return Ok((0, 0));
         }
 
         // Verify header checksum.
         let expected_checksum = crc32fast::hash(&header_buf[0..12]);
         if stored_checksum != expected_checksum {
-            Self::truncate_dwb(dwb_path)?;
+            Self::truncate_dwb(dwb_path).await?;
             return Ok((0, 0));
         }
 
@@ -374,16 +403,18 @@ impl Recovery {
         let mut restored = 0u32;
         let mut skipped_corrupt = 0u32;
         let entry_size = DWB_ENTRY_PREFIX_SIZE + page_size;
+        let mut offset = DWB_HEADER_SIZE;
 
         for _ in 0..page_count {
-            let mut entry_buf = vec![0u8; entry_size];
-            let bytes_read = file.read(&mut entry_buf)?;
-            if bytes_read < entry_size {
+            if offset + entry_size > file_data.len() {
                 // Incomplete entry -- crash during DWB write.
                 break;
             }
 
-            let page_id = crate::util::read_u32_le(&entry_buf, 0)?;
+            let entry_buf = &file_data[offset..offset + entry_size];
+            offset += entry_size;
+
+            let page_id = crate::util::read_u32_le(entry_buf, 0)?;
             let dwb_page_data = &entry_buf[DWB_ENTRY_PREFIX_SIZE..];
 
             // Verify DWB page checksum.
@@ -396,29 +427,29 @@ impl Recovery {
 
             // Read storage page and check its checksum.
             let mut storage_page = vec![0u8; page_size];
-            match page_storage.read_page(page_id, &mut storage_page) {
+            match page_storage.read_page(page_id, &mut storage_page).await {
                 Ok(()) => {
                     let storage_ref = SlottedPageRef::from_buf(&storage_page)?;
                     if !storage_ref.verify_checksum() {
                         // Torn write -- restore from DWB.
-                        page_storage.write_page(page_id, dwb_page_data)?;
+                        page_storage.write_page(page_id, dwb_page_data).await?;
                         restored += 1;
                     }
                 }
                 Err(_) => {
                     // Can't read page -- restore from DWB.
-                    page_storage.write_page(page_id, dwb_page_data)?;
+                    page_storage.write_page(page_id, dwb_page_data).await?;
                     restored += 1;
                 }
             }
         }
 
-        page_storage.sync()?;
-        Self::truncate_dwb(dwb_path)?;
+        page_storage.sync().await?;
+        Self::truncate_dwb(dwb_path).await?;
 
         if skipped_corrupt > 0 {
-            eprintln!(
-                "WARNING: DWB recovery skipped {} corrupt page(s). \
+            tracing::warn!(
+                "DWB recovery skipped {} corrupt page(s). \
                  Data may be lost if the corresponding storage pages are also corrupt.",
                 skipped_corrupt,
             );
@@ -428,14 +459,19 @@ impl Recovery {
     }
 
     /// Truncate the DWB file.
-    fn truncate_dwb(path: &Path) -> io::Result<()> {
-        if !path.exists() {
-            return Ok(());
-        }
-        let file = std::fs::OpenOptions::new().write(true).open(path)?;
-        file.set_len(0)?;
-        file.sync_data()?;
-        Ok(())
+    async fn truncate_dwb(path: &Path) -> io::Result<()> {
+        let path_buf = path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            if !path_buf.exists() {
+                return Ok(());
+            }
+            let file = std::fs::OpenOptions::new().write(true).open(&path_buf)?;
+            file.set_len(0)?;
+            file.sync_data()?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| io::Error::other(format!("spawn_blocking join error: {e}")))?
     }
 }
 
@@ -481,8 +517,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl WalRecordHandler for CountingHandler {
-        fn handle_record(&mut self, record: &WalRecord) -> io::Result<()> {
+        async fn handle_record(&mut self, record: &WalRecord) -> io::Result<()> {
             self.records.push(record.clone());
             Ok(())
         }
@@ -503,8 +540,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl WalRecordHandler for ErrorOnNthHandler {
-        fn handle_record(&mut self, _record: &WalRecord) -> io::Result<()> {
+        async fn handle_record(&mut self, _record: &WalRecord) -> io::Result<()> {
             self.count += 1;
             if self.count == self.error_on {
                 return Err(io::Error::other("handler error"));
@@ -526,8 +564,8 @@ mod tests {
     // ─── Test 1: Clean recovery ───
     // Checkpoint, then recover -> no records replayed, end_lsn == checkpoint_lsn.
 
-    #[test]
-    fn clean_recovery() {
+    #[tokio::test]
+    async fn clean_recovery() {
         let page_storage = MemoryPageStorage::new(PAGE_SIZE);
         let wal_storage = MemoryWalStorage::new();
 
@@ -543,6 +581,7 @@ mod tests {
             &mut handler,
             RecoveryMode::Strict,
         )
+        .await
         .unwrap();
 
         assert_eq!(end_lsn, checkpoint_lsn);
@@ -552,8 +591,8 @@ mod tests {
     // ─── Test 2: WAL replay ───
     // Write 5 WAL records after checkpoint. Recover with counting handler. Verify 5 delivered.
 
-    #[test]
-    fn wal_replay() {
+    #[tokio::test]
+    async fn wal_replay() {
         let page_storage = MemoryPageStorage::new(PAGE_SIZE);
         let wal_storage = MemoryWalStorage::new();
 
@@ -561,7 +600,7 @@ mod tests {
         for i in 0..5u32 {
             let payload = format!("record-{}", i);
             let frame = encode_frame(0x01, payload.as_bytes());
-            wal_storage.append(&frame).unwrap();
+            wal_storage.append(&frame).await.unwrap();
         }
 
         let checkpoint_lsn = 0;
@@ -576,6 +615,7 @@ mod tests {
             &mut handler,
             RecoveryMode::Strict,
         )
+        .await
         .unwrap();
 
         assert_eq!(handler.records.len(), 5);
@@ -592,18 +632,18 @@ mod tests {
     // ─── Test 3: DWB + WAL recovery ───
     // Write DWB with torn pages + WAL records. Recover. Verify pages restored AND WAL replayed.
 
-    #[test]
-    fn dwb_and_wal_recovery() {
+    #[tokio::test]
+    async fn dwb_and_wal_recovery() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dwb_path = tmp.path().join("test.dwb");
 
         let page_storage = MemoryPageStorage::new(PAGE_SIZE);
-        page_storage.extend(5).unwrap();
+        page_storage.extend(5).await.unwrap();
 
         // Initialize pages in storage.
         for i in 0..5u32 {
             let page = make_valid_page(i);
-            page_storage.write_page(i, &page).unwrap();
+            page_storage.write_page(i, &page).await.unwrap();
         }
 
         // Write DWB file with valid page data.
@@ -637,14 +677,14 @@ mod tests {
 
         // Corrupt page 2 in storage.
         let corrupt = vec![0xFFu8; PAGE_SIZE];
-        page_storage.write_page(2, &corrupt).unwrap();
+        page_storage.write_page(2, &corrupt).await.unwrap();
 
         // Write WAL records.
         let wal_storage = MemoryWalStorage::new();
         for i in 0..3u32 {
             let payload = format!("wal-{}", i);
             let frame = encode_frame(0x01, payload.as_bytes());
-            wal_storage.append(&frame).unwrap();
+            wal_storage.append(&frame).await.unwrap();
         }
 
         let mut handler = CountingHandler::new();
@@ -657,6 +697,7 @@ mod tests {
             &mut handler,
             RecoveryMode::Strict,
         )
+        .await
         .unwrap();
 
         // Verify WAL records replayed.
@@ -664,15 +705,15 @@ mod tests {
 
         // Verify page 2 was restored.
         let mut buf = vec![0u8; PAGE_SIZE];
-        page_storage.read_page(2, &mut buf).unwrap();
+        page_storage.read_page(2, &mut buf).await.unwrap();
         assert_eq!(&buf, &dwb_pages[2]);
     }
 
     // ─── Test 4: Corrupt WAL record ───
     // Write 3 valid + 1 corrupt WAL record. Recover. Verify only 3 records replayed.
 
-    #[test]
-    fn corrupt_wal_record() {
+    #[tokio::test]
+    async fn corrupt_wal_record() {
         let page_storage = MemoryPageStorage::new(PAGE_SIZE);
         let wal_storage = MemoryWalStorage::new();
 
@@ -680,17 +721,17 @@ mod tests {
         for i in 0..3u32 {
             let payload = format!("valid-{}", i);
             let frame = encode_frame(0x01, payload.as_bytes());
-            wal_storage.append(&frame).unwrap();
+            wal_storage.append(&frame).await.unwrap();
         }
 
         // Write a corrupt record (bad CRC).
         let mut bad_frame = encode_frame(0x01, b"corrupt");
         bad_frame[4] ^= 0xFF; // Flip CRC.
-        wal_storage.append(&bad_frame).unwrap();
+        wal_storage.append(&bad_frame).await.unwrap();
 
         // Write another valid record after the corrupt one.
         let good_after = encode_frame(0x01, b"after-corrupt");
-        wal_storage.append(&good_after).unwrap();
+        wal_storage.append(&good_after).await.unwrap();
 
         let mut handler = CountingHandler::new();
         let (_end_lsn, _stats) = Recovery::run(
@@ -702,6 +743,7 @@ mod tests {
             &mut handler,
             RecoveryMode::Strict,
         )
+        .await
         .unwrap();
 
         // Only 3 records should be replayed (stops at corrupt).
@@ -711,8 +753,8 @@ mod tests {
     // ─── Test 5: Empty WAL ───
     // Recover with no WAL records after checkpoint -> returns checkpoint_lsn.
 
-    #[test]
-    fn empty_wal() {
+    #[tokio::test]
+    async fn empty_wal() {
         let page_storage = MemoryPageStorage::new(PAGE_SIZE);
         let wal_storage = MemoryWalStorage::new();
 
@@ -728,6 +770,7 @@ mod tests {
             &mut handler,
             RecoveryMode::Strict,
         )
+        .await
         .unwrap();
 
         assert_eq!(end_lsn, checkpoint_lsn);
@@ -737,19 +780,19 @@ mod tests {
     // ─── Test 6: needs_recovery false ───
     // Clean state -> returns false.
 
-    #[test]
-    fn needs_recovery_false() {
+    #[tokio::test]
+    async fn needs_recovery_false() {
         let wal_storage = MemoryWalStorage::new();
 
-        let result = Recovery::needs_recovery(None, &wal_storage, 0).unwrap();
+        let result = Recovery::needs_recovery(None, &wal_storage, 0).await.unwrap();
         assert!(!result);
     }
 
     // ─── Test 7: needs_recovery true (DWB) ───
     // Non-empty DWB -> returns true.
 
-    #[test]
-    fn needs_recovery_true_dwb() {
+    #[tokio::test]
+    async fn needs_recovery_true_dwb() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dwb_path = tmp.path().join("test.dwb");
 
@@ -762,37 +805,37 @@ mod tests {
 
         let wal_storage = MemoryWalStorage::new();
         let result =
-            Recovery::needs_recovery(Some(dwb_path.as_path()), &wal_storage, 0).unwrap();
+            Recovery::needs_recovery(Some(dwb_path.as_path()), &wal_storage, 0).await.unwrap();
         assert!(result);
     }
 
     // ─── Test 8: needs_recovery true (WAL) ───
     // WAL has records past checkpoint -> returns true.
 
-    #[test]
-    fn needs_recovery_true_wal() {
+    #[tokio::test]
+    async fn needs_recovery_true_wal() {
         let wal_storage = MemoryWalStorage::new();
 
         // Write a record.
         let frame = encode_frame(0x01, b"data");
-        wal_storage.append(&frame).unwrap();
+        wal_storage.append(&frame).await.unwrap();
 
-        let result = Recovery::needs_recovery(None, &wal_storage, 0).unwrap();
+        let result = Recovery::needs_recovery(None, &wal_storage, 0).await.unwrap();
         assert!(result);
     }
 
     // ─── Test 9: Idempotent replay ───
     // Replay same records twice. Handler should produce same result.
 
-    #[test]
-    fn idempotent_replay() {
+    #[tokio::test]
+    async fn idempotent_replay() {
         let page_storage = MemoryPageStorage::new(PAGE_SIZE);
         let wal_storage = MemoryWalStorage::new();
 
         for i in 0..5u32 {
             let payload = format!("record-{}", i);
             let frame = encode_frame(0x01, payload.as_bytes());
-            wal_storage.append(&frame).unwrap();
+            wal_storage.append(&frame).await.unwrap();
         }
 
         // First replay.
@@ -806,6 +849,7 @@ mod tests {
             &mut handler1,
             RecoveryMode::Strict,
         )
+        .await
         .unwrap();
 
         // Second replay.
@@ -819,6 +863,7 @@ mod tests {
             &mut handler2,
             RecoveryMode::Strict,
         )
+        .await
         .unwrap();
 
         assert_eq!(end1, end2);
@@ -834,8 +879,8 @@ mod tests {
     // ─── Test 10: In-memory recovery ───
     // MemoryPageStorage, no DWB. Verify recovery is a no-op.
 
-    #[test]
-    fn in_memory_recovery() {
+    #[tokio::test]
+    async fn in_memory_recovery() {
         let page_storage = MemoryPageStorage::new(PAGE_SIZE);
         let wal_storage = MemoryWalStorage::new();
 
@@ -850,20 +895,21 @@ mod tests {
             &mut handler,
             RecoveryMode::Strict,
         )
+        .await
         .unwrap();
 
         assert_eq!(end_lsn, 0);
 
         // needs_recovery should be false.
-        let needs = Recovery::needs_recovery(None, &wal_storage, 0).unwrap();
+        let needs = Recovery::needs_recovery(None, &wal_storage, 0).await.unwrap();
         assert!(!needs);
     }
 
     // ─── Test 11: Handler error propagation ───
     // Handler returns error on record 3. Recovery stops and propagates error.
 
-    #[test]
-    fn handler_error_propagation() {
+    #[tokio::test]
+    async fn handler_error_propagation() {
         let page_storage = MemoryPageStorage::new(PAGE_SIZE);
         let wal_storage = MemoryWalStorage::new();
 
@@ -871,7 +917,7 @@ mod tests {
         for i in 0..5u32 {
             let payload = format!("record-{}", i);
             let frame = encode_frame(0x01, payload.as_bytes());
-            wal_storage.append(&frame).unwrap();
+            wal_storage.append(&frame).await.unwrap();
         }
 
         // Handler errors on the 3rd record.
@@ -884,7 +930,8 @@ mod tests {
             PAGE_SIZE,
             &mut handler,
             RecoveryMode::Strict,
-        );
+        )
+        .await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -895,26 +942,26 @@ mod tests {
 
     // ─── Test: Checkpoint records are skipped during replay ───
 
-    #[test]
-    fn checkpoint_records_skipped() {
+    #[tokio::test]
+    async fn checkpoint_records_skipped() {
         let page_storage = MemoryPageStorage::new(PAGE_SIZE);
         let wal_storage = MemoryWalStorage::new();
 
         // Write: record, checkpoint, record, checkpoint, record.
         let frame1 = encode_frame(0x01, b"tx-1");
-        wal_storage.append(&frame1).unwrap();
+        wal_storage.append(&frame1).await.unwrap();
 
         let ckpt = encode_frame(WAL_RECORD_CHECKPOINT, &42u64.to_le_bytes());
-        wal_storage.append(&ckpt).unwrap();
+        wal_storage.append(&ckpt).await.unwrap();
 
         let frame2 = encode_frame(0x01, b"tx-2");
-        wal_storage.append(&frame2).unwrap();
+        wal_storage.append(&frame2).await.unwrap();
 
         let ckpt2 = encode_frame(WAL_RECORD_CHECKPOINT, &100u64.to_le_bytes());
-        wal_storage.append(&ckpt2).unwrap();
+        wal_storage.append(&ckpt2).await.unwrap();
 
         let frame3 = encode_frame(0x01, b"tx-3");
-        wal_storage.append(&frame3).unwrap();
+        wal_storage.append(&frame3).await.unwrap();
 
         let mut handler = CountingHandler::new();
         let (_end_lsn, _stats) = Recovery::run(
@@ -926,6 +973,7 @@ mod tests {
             &mut handler,
             RecoveryMode::Strict,
         )
+        .await
         .unwrap();
 
         // Only the 3 non-checkpoint records should be delivered.
@@ -937,21 +985,21 @@ mod tests {
 
     // ─── Test 11: BestEffort mode recovers records around corruption ───
 
-    #[test]
-    fn best_effort_skips_corrupt() {
+    #[tokio::test]
+    async fn best_effort_skips_corrupt() {
         let page_storage = MemoryPageStorage::new(PAGE_SIZE);
         let wal_storage = MemoryWalStorage::new();
 
         // Write: valid record, corrupt bytes, valid record.
         let frame1 = encode_frame(0x01, b"before");
-        wal_storage.append(&frame1).unwrap();
+        wal_storage.append(&frame1).await.unwrap();
 
         // Write corrupt bytes (invalid CRC).
         let corrupt = vec![0x05, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x42, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
-        wal_storage.append(&corrupt).unwrap();
+        wal_storage.append(&corrupt).await.unwrap();
 
         let frame2 = encode_frame(0x01, b"after");
-        wal_storage.append(&frame2).unwrap();
+        wal_storage.append(&frame2).await.unwrap();
 
         // Strict mode: only gets first record.
         let mut strict_handler = CountingHandler::new();
@@ -964,6 +1012,7 @@ mod tests {
             &mut strict_handler,
             RecoveryMode::Strict,
         )
+        .await
         .unwrap();
         assert_eq!(strict_handler.records.len(), 1);
         assert_eq!(strict_stats.records_skipped_corrupt, 0);
@@ -979,6 +1028,7 @@ mod tests {
             &mut best_handler,
             RecoveryMode::BestEffort,
         )
+        .await
         .unwrap();
         assert_eq!(best_handler.records.len(), 2);
         assert_eq!(best_stats.records_skipped_corrupt, 1);

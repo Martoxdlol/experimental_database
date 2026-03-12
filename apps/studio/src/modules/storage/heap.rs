@@ -20,21 +20,16 @@ pub fn HeapModule() -> Element {
         let _rev = *state.revision.read();
         let db = db_for_scan.clone();
         async move {
-            tokio::task::spawn_blocking(move || {
-                let pages = db.scan_page_types()?;
-                let heap_pages: Vec<_> = pages
-                    .into_iter()
-                    .filter(|(_, pt, _)| *pt == Some(PageType::Heap))
-                    .map(|(id, _, _)| {
-                        let info = db.read_page(id)?;
-                        Ok((id, info.num_slots, info.free_space))
-                    })
-                    .collect::<std::io::Result<Vec<_>>>()?;
-                Ok::<_, std::io::Error>(heap_pages)
-            })
-            .await
-            .ok()
-            .and_then(|r| r.ok())
+            let pages = db.scan_page_types().await.ok()?;
+            let mut heap_pages = Vec::new();
+            for (id, pt, _) in pages {
+                if pt == Some(PageType::Heap) {
+                    if let Ok(info) = db.read_page(id).await {
+                        heap_pages.push((id, info.num_slots, info.free_space));
+                    }
+                }
+            }
+            Some(heap_pages)
         }
     });
 
@@ -180,19 +175,21 @@ fn StoreBlobForm() -> Element {
                                 return;
                             }
                             let db = state.db.read().clone();
-                            if let Some(db) = db {
-                                match db.heap_store(&data) {
-                                    Ok((page_id, slot_id)) => {
-                                        state.last_result.set(Some(OperationResult::Success(
-                                            format!("Stored {} bytes at page={page_id}, slot={slot_id}", data.len())
-                                        )));
-                                        state.notify_mutation();
-                                        text_input.set(String::new());
-                                        hex_input.set(String::new());
+                            spawn(async move {
+                                if let Some(db) = db {
+                                    match db.heap_store(&data).await {
+                                        Ok((page_id, slot_id)) => {
+                                            state.last_result.set(Some(OperationResult::Success(
+                                                format!("Stored {} bytes at page={page_id}, slot={slot_id}", data.len())
+                                            )));
+                                            state.notify_mutation();
+                                            text_input.set(String::new());
+                                            hex_input.set(String::new());
+                                        }
+                                        Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                     }
-                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                 }
-                            }
+                            });
                         } else {
                             state.last_result.set(Some(OperationResult::Error("Invalid hex input".into())));
                         }
@@ -237,15 +234,17 @@ fn LoadBlobForm() -> Element {
                     let page = page_input.read().parse::<u32>().unwrap_or(0);
                     let slot = slot_input.read().parse::<u16>().unwrap_or(0);
                     let db = state.db.read().clone();
-                    if let Some(db) = db {
-                        match db.heap_load(page, slot) {
-                            Ok(data) => blob_data.set(Some(data)),
-                            Err(e) => {
-                                state.last_result.set(Some(OperationResult::Error(e.to_string())));
-                                blob_data.set(None);
+                    spawn(async move {
+                        if let Some(db) = db {
+                            match db.heap_load(page, slot).await {
+                                Ok(data) => blob_data.set(Some(data)),
+                                Err(e) => {
+                                    state.last_result.set(Some(OperationResult::Error(e.to_string())));
+                                    blob_data.set(None);
+                                }
                             }
                         }
-                    }
+                    });
                 },
                 "Load"
             }
@@ -303,19 +302,21 @@ fn FreeBlobForm() -> Element {
                             let slot_val = slot_input.read().clone();
                             if let (Ok(page), Ok(slot)) = (page_val.parse::<u32>(), slot_val.parse::<u16>()) {
                                 let db = state.db.read().clone();
-                                if let Some(db) = db {
-                                    match db.heap_free(page, slot) {
-                                        Ok(()) => {
-                                            state.last_result.set(Some(OperationResult::Success(
-                                                format!("Freed blob at page={page}, slot={slot}")
-                                            )));
-                                            state.notify_mutation();
-                                            page_input.set(String::new());
-                                            slot_input.set(String::new());
+                                spawn(async move {
+                                    if let Some(db) = db {
+                                        match db.heap_free(page, slot).await {
+                                            Ok(()) => {
+                                                state.last_result.set(Some(OperationResult::Success(
+                                                    format!("Freed blob at page={page}, slot={slot}")
+                                                )));
+                                                state.notify_mutation();
+                                                page_input.set(String::new());
+                                                slot_input.set(String::new());
+                                            }
+                                            Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                         }
-                                        Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                     }
-                                }
+                                });
                             } else {
                                 state.last_result.set(Some(OperationResult::Error("Invalid page/slot ID".into())));
                             }

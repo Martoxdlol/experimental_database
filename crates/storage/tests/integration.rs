@@ -14,6 +14,9 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use tokio_stream::StreamExt;
+
 use exdb_storage::backend::{MemoryPageStorage, MemoryWalStorage, PageStorage, WalStorage};
 use exdb_storage::btree::ScanDirection;
 use exdb_storage::catalog_btree::{
@@ -50,8 +53,9 @@ impl CollectingHandler {
     }
 }
 
+#[async_trait]
 impl WalRecordHandler for CollectingHandler {
-    fn handle_record(&mut self, record: &WalRecord) -> std::io::Result<()> {
+    async fn handle_record(&mut self, record: &WalRecord) -> std::io::Result<()> {
         self.records
             .push((record.record_type, record.payload.clone()));
         Ok(())
@@ -69,15 +73,15 @@ async fn test_full_lifecycle_1000_entries() {
 
     let root_page;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
 
-        let handle = engine.create_btree().unwrap();
+        let handle = engine.create_btree().await.unwrap();
 
         // Insert 1000 entries.
         for i in 0u32..1000 {
             let key = format!("key-{:06}", i);
             let value = format!("value-{:06}", i);
-            handle.insert(key.as_bytes(), value.as_bytes()).unwrap();
+            handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
         }
 
         // Save root page AFTER inserts (root may change due to splits).
@@ -90,13 +94,13 @@ async fn test_full_lifecycle_1000_entries() {
 
     // Reopen and verify all 1000 entries.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
 
         let handle = engine.open_btree(root_page);
         for i in 0u32..1000 {
             let key = format!("key-{:06}", i);
             let expected = format!("value-{:06}", i);
-            let value = handle.get(key.as_bytes()).unwrap();
+            let value = handle.get(key.as_bytes()).await.unwrap();
             assert_eq!(value, Some(expected.into_bytes()), "missing key {}", key);
         }
 
@@ -104,6 +108,7 @@ async fn test_full_lifecycle_1000_entries() {
         let entries: Vec<_> = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
             .collect::<Result<Vec<_>, _>>()
+            .await
             .unwrap();
         assert_eq!(entries.len(), 1000);
 
@@ -122,36 +127,36 @@ async fn test_full_lifecycle_1000_entries() {
 
 #[tokio::test]
 async fn test_in_memory_lifecycle() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
     assert!(!engine.is_durable());
 
     // Create multiple B-trees and insert data.
-    let bt1 = engine.create_btree().unwrap();
-    let bt2 = engine.create_btree().unwrap();
+    let bt1 = engine.create_btree().await.unwrap();
+    let bt2 = engine.create_btree().await.unwrap();
 
     for i in 0u32..100 {
         let key = format!("k{:04}", i);
-        bt1.insert(key.as_bytes(), b"from-tree1").unwrap();
-        bt2.insert(key.as_bytes(), b"from-tree2").unwrap();
+        bt1.insert(key.as_bytes(), b"from-tree1").await.unwrap();
+        bt2.insert(key.as_bytes(), b"from-tree2").await.unwrap();
     }
 
     // Verify isolation.
     for i in 0u32..100 {
         let key = format!("k{:04}", i);
         assert_eq!(
-            bt1.get(key.as_bytes()).unwrap(),
+            bt1.get(key.as_bytes()).await.unwrap(),
             Some(b"from-tree1".to_vec())
         );
         assert_eq!(
-            bt2.get(key.as_bytes()).unwrap(),
+            bt2.get(key.as_bytes()).await.unwrap(),
             Some(b"from-tree2".to_vec())
         );
     }
 
     // Heap operations.
     let large_data = vec![0xABu8; 8000]; // larger than a page
-    let href = engine.heap_store(&large_data).unwrap();
-    let loaded = engine.heap_load(href).unwrap();
+    let href = engine.heap_store(&large_data).await.unwrap();
+    let loaded = engine.heap_load(href).await.unwrap();
     assert_eq!(loaded, large_data);
 
     // WAL operations.
@@ -178,13 +183,14 @@ async fn test_custom_backend() {
         small_config(),
         None, // no handler for fresh database
     )
+    .await
     .unwrap();
 
     assert!(!engine.is_durable()); // memory backends are not durable
 
-    let handle = engine.create_btree().unwrap();
-    handle.insert(b"custom", b"backend").unwrap();
-    assert_eq!(handle.get(b"custom").unwrap(), Some(b"backend".to_vec()));
+    let handle = engine.create_btree().await.unwrap();
+    handle.insert(b"custom", b"backend").await.unwrap();
+    assert_eq!(handle.get(b"custom").await.unwrap(), Some(b"backend".to_vec()));
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -199,7 +205,7 @@ async fn test_crash_recovery_end_to_end() {
     // Phase 1: Open, checkpoint once (so file structure is valid), then append
     // more WAL records AFTER the checkpoint, and simulate crash.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
 
         // First checkpoint to establish a valid on-disk state.
         engine.checkpoint().await.unwrap();
@@ -213,15 +219,15 @@ async fn test_crash_recovery_end_to_end() {
         // but do NOT close/checkpoint — the file header retains the OLD checkpoint_lsn.
         engine.wal_writer().shutdown().await;
         // Write file header so page 0 is valid on reopen (with old checkpoint_lsn).
-        engine.buffer_pool().flush_page(0).unwrap();
-        engine.buffer_pool().page_storage().sync().unwrap();
+        engine.buffer_pool().flush_page(0).await.unwrap();
+        engine.buffer_pool().page_storage().sync().await.unwrap();
         // Engine is dropped here without final checkpoint.
     }
 
     // Phase 2: Reopen with a collecting handler to verify WAL replay.
     {
         let mut handler = CollectingHandler::new();
-        let engine = StorageEngine::open(&path, small_config(), &mut handler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut handler).await.unwrap();
 
         // The handler should have seen the post-checkpoint WAL records replayed.
         assert!(
@@ -251,21 +257,21 @@ async fn test_multiple_engines_isolation() {
     let path1 = tmp.path().join("db1");
     let path2 = tmp.path().join("db2");
 
-    let engine1 = StorageEngine::open(&path1, small_config(), &mut NoOpHandler).unwrap();
-    let engine2 = StorageEngine::open(&path2, small_config(), &mut NoOpHandler).unwrap();
+    let engine1 = StorageEngine::open(&path1, small_config(), &mut NoOpHandler).await.unwrap();
+    let engine2 = StorageEngine::open(&path2, small_config(), &mut NoOpHandler).await.unwrap();
 
-    let bt1 = engine1.create_btree().unwrap();
-    let bt2 = engine2.create_btree().unwrap();
+    let bt1 = engine1.create_btree().await.unwrap();
+    let bt2 = engine2.create_btree().await.unwrap();
 
-    bt1.insert(b"only-in-1", b"val1").unwrap();
-    bt2.insert(b"only-in-2", b"val2").unwrap();
+    bt1.insert(b"only-in-1", b"val1").await.unwrap();
+    bt2.insert(b"only-in-2", b"val2").await.unwrap();
 
     // Verify data does not leak across engines.
-    assert_eq!(bt1.get(b"only-in-1").unwrap(), Some(b"val1".to_vec()));
-    assert_eq!(bt1.get(b"only-in-2").unwrap(), None);
+    assert_eq!(bt1.get(b"only-in-1").await.unwrap(), Some(b"val1".to_vec()));
+    assert_eq!(bt1.get(b"only-in-2").await.unwrap(), None);
 
-    assert_eq!(bt2.get(b"only-in-2").unwrap(), Some(b"val2".to_vec()));
-    assert_eq!(bt2.get(b"only-in-1").unwrap(), None);
+    assert_eq!(bt2.get(b"only-in-2").await.unwrap(), Some(b"val2".to_vec()));
+    assert_eq!(bt2.get(b"only-in-1").await.unwrap(), None);
 
     engine1.close().await.unwrap();
     engine2.close().await.unwrap();
@@ -281,8 +287,8 @@ async fn test_catalog_btree_persistence() {
     let path = tmp.path().join("catalog_db");
 
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let fh = engine.file_header();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let fh = engine.file_header().await;
         let catalog_root = fh.catalog_root_page.get();
         let name_root = fh.catalog_name_root_page.get();
 
@@ -309,12 +315,12 @@ async fn test_catalog_btree_persistence() {
                 col.collection_id,
             );
             let val = catalog_btree::serialize_collection(col);
-            catalog.insert(&key, &val).unwrap();
+            catalog.insert(&key, &val).await.unwrap();
 
             let name_key =
                 catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, &col.name);
             let name_val = catalog_btree::serialize_name_value(col.collection_id);
-            name_idx.insert(&name_key, &name_val).unwrap();
+            name_idx.insert(&name_key, &name_val).await.unwrap();
         }
 
         // Insert index entry.
@@ -331,12 +337,12 @@ async fn test_catalog_btree_persistence() {
         };
         let idx_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx1.index_id);
         let idx_val = catalog_btree::serialize_index(&idx1);
-        catalog.insert(&idx_key, &idx_val).unwrap();
+        catalog.insert(&idx_key, &idx_val).await.unwrap();
 
         let idx_name_key =
             catalog_btree::make_catalog_name_key(CatalogEntityType::Index, &idx1.name);
         let idx_name_val = catalog_btree::serialize_name_value(idx1.index_id);
-        name_idx.insert(&idx_name_key, &idx_name_val).unwrap();
+        name_idx.insert(&idx_name_key, &idx_name_val).await.unwrap();
 
         engine.checkpoint().await.unwrap();
         engine.close().await.unwrap();
@@ -344,8 +350,8 @@ async fn test_catalog_btree_persistence() {
 
     // Reopen and verify catalog entries.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let fh = engine.file_header();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let fh = engine.file_header().await;
         let catalog = engine.open_btree(fh.catalog_root_page.get());
         let name_idx = engine.open_btree(fh.catalog_name_root_page.get());
 
@@ -363,6 +369,7 @@ async fn test_catalog_btree_persistence() {
                     .unwrap_or(true)
             })
             .collect::<Result<Vec<_>, _>>()
+            .await
             .unwrap();
 
         assert_eq!(entries.len(), 2, "should have 2 collection entries");
@@ -377,13 +384,13 @@ async fn test_catalog_btree_persistence() {
 
         // Verify name index lookup.
         let name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, "users");
-        let name_val = name_idx.get(&name_key).unwrap().unwrap();
+        let name_val = name_idx.get(&name_key).await.unwrap().unwrap();
         let resolved_id = catalog_btree::deserialize_name_value(&name_val).unwrap();
         assert_eq!(resolved_id, 1);
 
         // Verify index entry.
         let idx_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, 10);
-        let idx_val = catalog.get(&idx_key).unwrap().unwrap();
+        let idx_val = catalog.get(&idx_key).await.unwrap().unwrap();
         let idx = catalog_btree::deserialize_index(&idx_val).unwrap();
         assert_eq!(idx.name, "users_email");
         assert_eq!(idx.state, CatalogIndexState::Ready);
@@ -399,7 +406,7 @@ async fn test_catalog_btree_persistence() {
 
 #[tokio::test]
 async fn test_heap_large_blobs_and_free() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
 
     // Store several blobs of varying sizes.
     let sizes = [100, 1000, 4000, 8000, 16000, 50000];
@@ -407,25 +414,25 @@ async fn test_heap_large_blobs_and_free() {
 
     for &size in &sizes {
         let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
-        let href = engine.heap_store(&data).unwrap();
+        let href = engine.heap_store(&data).await.unwrap();
         refs.push((href, data));
     }
 
     // Verify all blobs can be loaded correctly.
     for (href, expected) in &refs {
-        let loaded = engine.heap_load(*href).unwrap();
+        let loaded = engine.heap_load(*href).await.unwrap();
         assert_eq!(loaded.len(), expected.len(), "blob size mismatch");
         assert_eq!(&loaded, expected, "blob content mismatch");
     }
 
     // Free the first few blobs.
     for (href, _) in &refs[..3] {
-        engine.heap_free(*href).unwrap();
+        engine.heap_free(*href).await.unwrap();
     }
 
     // Remaining blobs should still be accessible.
     for (href, expected) in &refs[3..] {
-        let loaded = engine.heap_load(*href).unwrap();
+        let loaded = engine.heap_load(*href).await.unwrap();
         assert_eq!(&loaded, expected);
     }
 }
@@ -436,16 +443,16 @@ async fn test_heap_large_blobs_and_free() {
 
 #[tokio::test]
 async fn test_vacuum_through_engine() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
 
-    let handle = engine.create_btree().unwrap();
+    let handle = engine.create_btree().await.unwrap();
     let root = handle.root_page();
 
     // Insert entries.
     for i in 0u32..50 {
         let key = format!("vac-{:04}", i);
         let value = format!("val-{:04}", i);
-        handle.insert(key.as_bytes(), value.as_bytes()).unwrap();
+        handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
     }
 
     // Vacuum some entries.
@@ -456,13 +463,13 @@ async fn test_vacuum_through_engine() {
         })
         .collect();
 
-    let removed = engine.vacuum(&entries).unwrap();
+    let removed = engine.vacuum(&entries).await.unwrap();
     assert_eq!(removed, 10);
 
     // Verify vacuumed entries are gone.
     for i in 0u32..10 {
         let key = format!("vac-{:04}", i);
-        assert_eq!(handle.get(key.as_bytes()).unwrap(), None);
+        assert_eq!(handle.get(key.as_bytes()).await.unwrap(), None);
     }
 
     // Verify remaining entries still exist.
@@ -470,7 +477,7 @@ async fn test_vacuum_through_engine() {
         let key = format!("vac-{:04}", i);
         let expected = format!("val-{:04}", i);
         assert_eq!(
-            handle.get(key.as_bytes()).unwrap(),
+            handle.get(key.as_bytes()).await.unwrap(),
             Some(expected.into_bytes())
         );
     }
@@ -482,14 +489,15 @@ async fn test_vacuum_through_engine() {
 
 #[tokio::test]
 async fn test_btree_scan_directions_and_bounds() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
-    let handle = engine.create_btree().unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
+    let handle = engine.create_btree().await.unwrap();
 
     // Insert ordered keys.
     for i in 0u32..100 {
         let key = format!("scan-{:04}", i);
         handle
             .insert(key.as_bytes(), format!("{}", i).as_bytes())
+            .await
             .unwrap();
     }
 
@@ -501,6 +509,7 @@ async fn test_btree_scan_directions_and_bounds() {
             ScanDirection::Forward,
         )
         .collect::<Result<Vec<_>, _>>()
+        .await
         .unwrap();
     assert_eq!(entries.len(), 10);
     assert_eq!(entries[0].0, b"scan-0020");
@@ -510,6 +519,7 @@ async fn test_btree_scan_directions_and_bounds() {
     let entries: Vec<_> = handle
         .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Backward)
         .collect::<Result<Vec<_>, _>>()
+        .await
         .unwrap();
     assert_eq!(entries.len(), 100);
     assert_eq!(entries[0].0, b"scan-0099"); // largest key first
@@ -523,6 +533,7 @@ async fn test_btree_scan_directions_and_bounds() {
             ScanDirection::Backward,
         )
         .collect::<Result<Vec<_>, _>>()
+        .await
         .unwrap();
     assert_eq!(entries.len(), 6);
     assert_eq!(entries[0].0, b"scan-0055");
@@ -535,26 +546,26 @@ async fn test_btree_scan_directions_and_bounds() {
 
 #[tokio::test]
 async fn test_btree_delete_and_reinsert() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
-    let handle = engine.create_btree().unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
+    let handle = engine.create_btree().await.unwrap();
 
     // Insert 200 entries.
     for i in 0u32..200 {
         let key = format!("del-{:04}", i);
-        handle.insert(key.as_bytes(), b"original").unwrap();
+        handle.insert(key.as_bytes(), b"original").await.unwrap();
     }
 
     // Delete even-numbered entries.
     for i in (0u32..200).step_by(2) {
         let key = format!("del-{:04}", i);
-        let deleted = handle.delete(key.as_bytes()).unwrap();
+        let deleted = handle.delete(key.as_bytes()).await.unwrap();
         assert!(deleted, "key {} should have been deleted", key);
     }
 
     // Verify: even = gone, odd = present.
     for i in 0u32..200 {
         let key = format!("del-{:04}", i);
-        let value = handle.get(key.as_bytes()).unwrap();
+        let value = handle.get(key.as_bytes()).await.unwrap();
         if i % 2 == 0 {
             assert_eq!(value, None, "key {} should be deleted", key);
         } else {
@@ -570,14 +581,14 @@ async fn test_btree_delete_and_reinsert() {
     // Re-insert some deleted keys with new values.
     for i in (0u32..50).step_by(2) {
         let key = format!("del-{:04}", i);
-        handle.insert(key.as_bytes(), b"reinserted").unwrap();
+        handle.insert(key.as_bytes(), b"reinserted").await.unwrap();
     }
 
     // Verify re-inserted values.
     for i in (0u32..50).step_by(2) {
         let key = format!("del-{:04}", i);
         assert_eq!(
-            handle.get(key.as_bytes()).unwrap(),
+            handle.get(key.as_bytes()).await.unwrap(),
             Some(b"reinserted".to_vec())
         );
     }
@@ -585,7 +596,7 @@ async fn test_btree_delete_and_reinsert() {
     // Total scan should show 100 odd + 25 re-inserted = 125 entries.
     let count = handle
         .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-        .count();
+        .fold(0usize, |acc, _| acc + 1).await;
     assert_eq!(count, 125);
 }
 
@@ -595,7 +606,7 @@ async fn test_btree_delete_and_reinsert() {
 
 #[tokio::test]
 async fn test_wal_multiple_records_and_read() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
 
     let mut lsns = Vec::new();
     for i in 0u32..20 {
@@ -619,6 +630,7 @@ async fn test_wal_multiple_records_and_read() {
     let records: Vec<_> = engine
         .read_wal_from(0)
         .collect::<Result<Vec<_>, _>>()
+        .await
         .unwrap();
     assert_eq!(records.len(), 20);
 
@@ -634,6 +646,7 @@ async fn test_wal_multiple_records_and_read() {
     let mid_records: Vec<_> = engine
         .read_wal_from(lsns[10])
         .collect::<Result<Vec<_>, _>>()
+        .await
         .unwrap();
     assert_eq!(mid_records.len(), 10);
     assert_eq!(mid_records[0].lsn, lsns[10]);
@@ -651,22 +664,24 @@ async fn test_checkpoint_recovery_roundtrip() {
     let root1;
     let root2;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
 
         // Create two btrees with data.
-        let bt1 = engine.create_btree().unwrap();
-        let bt2 = engine.create_btree().unwrap();
+        let bt1 = engine.create_btree().await.unwrap();
+        let bt2 = engine.create_btree().await.unwrap();
 
         for i in 0u32..100 {
             bt1.insert(
                 format!("bt1-{:04}", i).as_bytes(),
                 format!("v1-{}", i).as_bytes(),
             )
+            .await
             .unwrap();
             bt2.insert(
                 format!("bt2-{:04}", i).as_bytes(),
                 format!("v2-{}", i).as_bytes(),
             )
+            .await
             .unwrap();
         }
 
@@ -679,6 +694,7 @@ async fn test_checkpoint_recovery_roundtrip() {
                 format!("bt1-{:04}", i).as_bytes(),
                 format!("v1-{}", i).as_bytes(),
             )
+            .await
             .unwrap();
         }
 
@@ -696,7 +712,7 @@ async fn test_checkpoint_recovery_roundtrip() {
 
     // Reopen and verify all data (pre- and post-first-checkpoint).
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
 
         let bt1 = engine.open_btree(root1);
         let bt2 = engine.open_btree(root2);
@@ -705,7 +721,7 @@ async fn test_checkpoint_recovery_roundtrip() {
         for i in 0u32..150 {
             let key = format!("bt1-{:04}", i);
             assert!(
-                bt1.get(key.as_bytes()).unwrap().is_some(),
+                bt1.get(key.as_bytes()).await.unwrap().is_some(),
                 "bt1 missing key {}",
                 key
             );
@@ -715,7 +731,7 @@ async fn test_checkpoint_recovery_roundtrip() {
         for i in 0u32..100 {
             let key = format!("bt2-{:04}", i);
             assert!(
-                bt2.get(key.as_bytes()).unwrap().is_some(),
+                bt2.get(key.as_bytes()).await.unwrap().is_some(),
                 "bt2 missing key {}",
                 key
             );
@@ -731,26 +747,26 @@ async fn test_checkpoint_recovery_roundtrip() {
 
 #[tokio::test]
 async fn test_btree_update_existing_keys() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
-    let handle = engine.create_btree().unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
+    let handle = engine.create_btree().await.unwrap();
 
     // Insert.
     for i in 0u32..50 {
         let key = format!("upd-{:04}", i);
-        handle.insert(key.as_bytes(), b"version-1").unwrap();
+        handle.insert(key.as_bytes(), b"version-1").await.unwrap();
     }
 
     // Overwrite with new values.
     for i in 0u32..50 {
         let key = format!("upd-{:04}", i);
-        handle.insert(key.as_bytes(), b"version-2").unwrap();
+        handle.insert(key.as_bytes(), b"version-2").await.unwrap();
     }
 
     // Verify all have the updated value.
     for i in 0u32..50 {
         let key = format!("upd-{:04}", i);
         assert_eq!(
-            handle.get(key.as_bytes()).unwrap(),
+            handle.get(key.as_bytes()).await.unwrap(),
             Some(b"version-2".to_vec())
         );
     }
@@ -758,7 +774,7 @@ async fn test_btree_update_existing_keys() {
     // Total count should still be 50 (not 100).
     let count = handle
         .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-        .count();
+        .fold(0usize, |acc, _| acc + 1).await;
     assert_eq!(count, 50);
 }
 
@@ -774,7 +790,7 @@ async fn test_file_header_persistence() {
     let path = tmp.path().join("header_db");
 
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
 
         engine
             .update_file_header(|fh| {
@@ -783,6 +799,7 @@ async fn test_file_header_persistence() {
                 fh.next_index_id = U64::new(7);
                 fh.generation = U64::new(3);
             })
+            .await
             .unwrap();
 
         engine.checkpoint().await.unwrap();
@@ -790,8 +807,8 @@ async fn test_file_header_persistence() {
     }
 
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let fh = engine.file_header();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let fh = engine.file_header().await;
 
         assert_eq!(fh.visible_ts.get(), 99999);
         assert_eq!(fh.next_collection_id.get(), 42);
@@ -808,8 +825,8 @@ async fn test_file_header_persistence() {
 
 #[tokio::test]
 async fn test_btree_large_keys_and_values() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
-    let handle = engine.create_btree().unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
+    let handle = engine.create_btree().await.unwrap();
 
     // Insert entries with varying key/value sizes.
     let test_cases = vec![
@@ -820,11 +837,11 @@ async fn test_btree_large_keys_and_values() {
     ];
 
     for (key, value) in &test_cases {
-        handle.insert(key, value).unwrap();
+        handle.insert(key, value).await.unwrap();
     }
 
     for (key, expected) in &test_cases {
-        let result = handle.get(key).unwrap();
+        let result = handle.get(key).await.unwrap();
         assert_eq!(result.as_deref(), Some(expected.as_slice()));
     }
 }
@@ -835,8 +852,8 @@ async fn test_btree_large_keys_and_values() {
 
 #[tokio::test]
 async fn test_heap_btree_reference_pattern() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
-    let handle = engine.create_btree().unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
+    let handle = engine.create_btree().await.unwrap();
 
     // Common pattern: store large values in heap, reference from B-tree.
     let mut expected: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -846,17 +863,17 @@ async fn test_heap_btree_reference_pattern() {
         let large_value: Vec<u8> = (0..5000).map(|j| ((i + j) % 256) as u8).collect();
 
         // Store in heap, put heap ref in btree.
-        let href = engine.heap_store(&large_value).unwrap();
-        handle.insert(key.as_bytes(), &href.to_bytes()).unwrap();
+        let href = engine.heap_store(&large_value).await.unwrap();
+        handle.insert(key.as_bytes(), &href.to_bytes()).await.unwrap();
 
         expected.insert(key.into_bytes(), large_value);
     }
 
     // Verify: read heap ref from btree, load from heap.
     for (key, expected_value) in &expected {
-        let href_bytes = handle.get(key).unwrap().unwrap();
+        let href_bytes = handle.get(key).await.unwrap().unwrap();
         let href = exdb_storage::heap::HeapRef::from_bytes(href_bytes[..6].try_into().unwrap());
-        let loaded = engine.heap_load(href).unwrap();
+        let loaded = engine.heap_load(href).await.unwrap();
         assert_eq!(&loaded, expected_value);
     }
 }
@@ -872,26 +889,26 @@ async fn test_reopen_preserves_complex_btree() {
 
     let root;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let handle = engine.create_btree().unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let handle = engine.create_btree().await.unwrap();
 
         // Insert 500 entries.
         for i in 0u32..500 {
             let key = format!("cplx-{:06}", i);
             let value = format!("data-{}", i);
-            handle.insert(key.as_bytes(), value.as_bytes()).unwrap();
+            handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
         }
 
         // Delete every 3rd entry.
         for i in (0u32..500).step_by(3) {
             let key = format!("cplx-{:06}", i);
-            handle.delete(key.as_bytes()).unwrap();
+            handle.delete(key.as_bytes()).await.unwrap();
         }
 
         // Update entries where i % 5 == 0 and not deleted (i % 3 != 0).
         for i in (0u32..500).filter(|i| i % 3 != 0 && i % 5 == 0) {
             let key = format!("cplx-{:06}", i);
-            handle.insert(key.as_bytes(), b"updated").unwrap();
+            handle.insert(key.as_bytes(), b"updated").await.unwrap();
         }
 
         // Save root page AFTER all modifications (root may change due to splits).
@@ -903,12 +920,12 @@ async fn test_reopen_preserves_complex_btree() {
 
     // Reopen and verify.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
         let handle = engine.open_btree(root);
 
         for i in 0u32..500 {
             let key = format!("cplx-{:06}", i);
-            let value = handle.get(key.as_bytes()).unwrap();
+            let value = handle.get(key.as_bytes()).await.unwrap();
 
             if i % 3 == 0 {
                 // Deleted.
@@ -943,18 +960,20 @@ async fn test_reopen_preserves_complex_btree() {
 
 #[tokio::test]
 async fn test_empty_btree_scan() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
-    let handle = engine.create_btree().unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
+    let handle = engine.create_btree().await.unwrap();
 
     let entries: Vec<_> = handle
         .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
         .collect::<Result<Vec<_>, _>>()
+        .await
         .unwrap();
     assert!(entries.is_empty());
 
     let entries: Vec<_> = handle
         .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Backward)
         .collect::<Result<Vec<_>, _>>()
+        .await
         .unwrap();
     assert!(entries.is_empty());
 }
@@ -965,13 +984,13 @@ async fn test_empty_btree_scan() {
 
 #[tokio::test]
 async fn test_delete_nonexistent() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
-    let handle = engine.create_btree().unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
+    let handle = engine.create_btree().await.unwrap();
 
-    handle.insert(b"exists", b"yes").unwrap();
-    assert!(!handle.delete(b"does-not-exist").unwrap());
-    assert!(handle.delete(b"exists").unwrap());
-    assert!(!handle.delete(b"exists").unwrap()); // already deleted
+    handle.insert(b"exists", b"yes").await.unwrap();
+    assert!(!handle.delete(b"does-not-exist").await.unwrap());
+    assert!(handle.delete(b"exists").await.unwrap());
+    assert!(!handle.delete(b"exists").await.unwrap()); // already deleted
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -980,13 +999,14 @@ async fn test_delete_nonexistent() {
 
 #[tokio::test]
 async fn test_vacuum_idempotent() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
-    let handle = engine.create_btree().unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
+    let handle = engine.create_btree().await.unwrap();
     let root = handle.root_page();
 
     for i in 0u32..20 {
         handle
             .insert(format!("idem-{}", i).as_bytes(), b"val")
+            .await
             .unwrap();
     }
 
@@ -997,11 +1017,11 @@ async fn test_vacuum_idempotent() {
         })
         .collect();
 
-    let removed1 = engine.vacuum(&entries).unwrap();
+    let removed1 = engine.vacuum(&entries).await.unwrap();
     assert_eq!(removed1, 10);
 
     // Second vacuum of same entries should remove 0.
-    let removed2 = engine.vacuum(&entries).unwrap();
+    let removed2 = engine.vacuum(&entries).await.unwrap();
     assert_eq!(removed2, 0);
 }
 
@@ -1011,11 +1031,11 @@ async fn test_vacuum_idempotent() {
 
 #[tokio::test]
 async fn test_many_btrees() {
-    let engine = StorageEngine::open_in_memory(small_config()).unwrap();
+    let engine = StorageEngine::open_in_memory(small_config()).await.unwrap();
 
     let mut handles = Vec::new();
     for _ in 0..20 {
-        handles.push(engine.create_btree().unwrap());
+        handles.push(engine.create_btree().await.unwrap());
     }
 
     // Insert different data into each tree.
@@ -1023,7 +1043,7 @@ async fn test_many_btrees() {
         for i in 0u32..50 {
             let key = format!("t{}-k{}", t, i);
             let value = format!("t{}-v{}", t, i);
-            handle.insert(key.as_bytes(), value.as_bytes()).unwrap();
+            handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
         }
     }
 
@@ -1031,13 +1051,13 @@ async fn test_many_btrees() {
     for (t, handle) in handles.iter().enumerate() {
         let count = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .count();
+            .fold(0usize, |acc, _| acc + 1).await;
         assert_eq!(count, 50, "tree {} should have 50 entries", t);
 
         let key = format!("t{}-k{}", t, 25);
         let expected = format!("t{}-v{}", t, 25);
         assert_eq!(
-            handle.get(key.as_bytes()).unwrap(),
+            handle.get(key.as_bytes()).await.unwrap(),
             Some(expected.into_bytes())
         );
     }
@@ -1055,8 +1075,8 @@ async fn test_no_checkpoint_data_lost() {
     let root_page;
     // Phase 1: create btree, checkpoint so root page exists on disk.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let handle = engine.create_btree().unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let handle = engine.create_btree().await.unwrap();
         root_page = handle.root_page();
         engine.checkpoint().await.unwrap();
         engine.close().await.unwrap();
@@ -1064,12 +1084,12 @@ async fn test_no_checkpoint_data_lost() {
 
     // Phase 2: reopen, insert data, do NOT checkpoint — simulate crash.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
         let handle = engine.open_btree(root_page);
 
         for i in 0u32..50 {
             let key = format!("ephemeral-{:04}", i);
-            handle.insert(key.as_bytes(), b"gone").unwrap();
+            handle.insert(key.as_bytes(), b"gone").await.unwrap();
         }
 
         // Deliberately do NOT checkpoint. Just drop — simulates crash.
@@ -1081,12 +1101,13 @@ async fn test_no_checkpoint_data_lost() {
     // be in the btree pages (they were never flushed to disk).
     {
         let mut handler = CollectingHandler::new();
-        let engine = StorageEngine::open(&path, small_config(), &mut handler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut handler).await.unwrap();
 
         let handle = engine.open_btree(root_page);
         let entries: Vec<_> = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
             .collect::<Result<Vec<_>, _>>()
+            .await
             .unwrap();
 
         assert_eq!(
@@ -1111,12 +1132,12 @@ async fn test_multiple_reopen_cycles() {
     let mut root;
     // Cycle 1: create btree, insert 0..100
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let handle = engine.create_btree().unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let handle = engine.create_btree().await.unwrap();
 
         for i in 0u32..100 {
             let key = format!("cycle-{:06}", i);
-            handle.insert(key.as_bytes(), b"v1").unwrap();
+            handle.insert(key.as_bytes(), b"v1").await.unwrap();
         }
         root = handle.root_page();
         engine.checkpoint().await.unwrap();
@@ -1125,17 +1146,17 @@ async fn test_multiple_reopen_cycles() {
 
     // Cycle 2: reopen, insert 100..200, update some from cycle 1
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
         let handle = engine.open_btree(root);
 
         for i in 100u32..200 {
             let key = format!("cycle-{:06}", i);
-            handle.insert(key.as_bytes(), b"v2").unwrap();
+            handle.insert(key.as_bytes(), b"v2").await.unwrap();
         }
         // Update first 10 keys from cycle 1.
         for i in 0u32..10 {
             let key = format!("cycle-{:06}", i);
-            handle.insert(key.as_bytes(), b"updated").unwrap();
+            handle.insert(key.as_bytes(), b"updated").await.unwrap();
         }
         // Root may have changed due to splits.
         root = handle.root_page();
@@ -1146,17 +1167,17 @@ async fn test_multiple_reopen_cycles() {
 
     // Cycle 3: reopen, delete some, insert 200..250
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
         let handle = engine.open_btree(root);
 
         // Delete 50..60.
         for i in 50u32..60 {
             let key = format!("cycle-{:06}", i);
-            handle.delete(key.as_bytes()).unwrap();
+            handle.delete(key.as_bytes()).await.unwrap();
         }
         for i in 200u32..250 {
             let key = format!("cycle-{:06}", i);
-            handle.insert(key.as_bytes(), b"v3").unwrap();
+            handle.insert(key.as_bytes(), b"v3").await.unwrap();
         }
         // Root may have changed due to splits.
         root = handle.root_page();
@@ -1167,14 +1188,14 @@ async fn test_multiple_reopen_cycles() {
 
     // Final verify: reopen and check all data.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
         let handle = engine.open_btree(root);
 
         // 0..10 should be "updated".
         for i in 0u32..10 {
             let key = format!("cycle-{:06}", i);
             assert_eq!(
-                handle.get(key.as_bytes()).unwrap(),
+                handle.get(key.as_bytes()).await.unwrap(),
                 Some(b"updated".to_vec()),
                 "key {} should be updated",
                 key
@@ -1184,7 +1205,7 @@ async fn test_multiple_reopen_cycles() {
         for i in 10u32..50 {
             let key = format!("cycle-{:06}", i);
             assert_eq!(
-                handle.get(key.as_bytes()).unwrap(),
+                handle.get(key.as_bytes()).await.unwrap(),
                 Some(b"v1".to_vec()),
                 "key {} should be v1",
                 key
@@ -1194,7 +1215,7 @@ async fn test_multiple_reopen_cycles() {
         for i in 50u32..60 {
             let key = format!("cycle-{:06}", i);
             assert_eq!(
-                handle.get(key.as_bytes()).unwrap(),
+                handle.get(key.as_bytes()).await.unwrap(),
                 None,
                 "key {} should be deleted",
                 key
@@ -1204,7 +1225,7 @@ async fn test_multiple_reopen_cycles() {
         for i in 60u32..100 {
             let key = format!("cycle-{:06}", i);
             assert_eq!(
-                handle.get(key.as_bytes()).unwrap(),
+                handle.get(key.as_bytes()).await.unwrap(),
                 Some(b"v1".to_vec()),
                 "key {} should be v1",
                 key
@@ -1214,7 +1235,7 @@ async fn test_multiple_reopen_cycles() {
         for i in 100u32..200 {
             let key = format!("cycle-{:06}", i);
             assert_eq!(
-                handle.get(key.as_bytes()).unwrap(),
+                handle.get(key.as_bytes()).await.unwrap(),
                 Some(b"v2".to_vec()),
                 "key {} should be v2",
                 key
@@ -1224,7 +1245,7 @@ async fn test_multiple_reopen_cycles() {
         for i in 200u32..250 {
             let key = format!("cycle-{:06}", i);
             assert_eq!(
-                handle.get(key.as_bytes()).unwrap(),
+                handle.get(key.as_bytes()).await.unwrap(),
                 Some(b"v3".to_vec()),
                 "key {} should be v3",
                 key
@@ -1234,7 +1255,7 @@ async fn test_multiple_reopen_cycles() {
         // Total: 10 + 40 + 0 + 40 + 100 + 50 = 240.
         let count = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .count();
+            .fold(0usize, |acc, _| acc + 1).await;
         assert_eq!(count, 240);
 
         engine.close().await.unwrap();
@@ -1254,19 +1275,19 @@ async fn test_heap_persistence_file_backed() {
     let btree_root;
 
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let handle = engine.create_btree().unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let handle = engine.create_btree().await.unwrap();
 
         // Store blobs of varying sizes: small, medium, and large (overflow).
         let sizes = [50, 500, 2000, 8000];
         for (idx, &size) in sizes.iter().enumerate() {
             let data: Vec<u8> = (0..size).map(|j| ((idx + j) % 256) as u8).collect();
-            let href = engine.heap_store(&data).unwrap();
+            let href = engine.heap_store(&data).await.unwrap();
             let href_bytes = href.to_bytes();
 
             // Store the heap ref in the btree so we can find it after reopen.
             let key = format!("blob-{}", idx);
-            handle.insert(key.as_bytes(), &href_bytes).unwrap();
+            handle.insert(key.as_bytes(), &href_bytes).await.unwrap();
 
             refs_and_data.push((href_bytes, data));
         }
@@ -1278,12 +1299,12 @@ async fn test_heap_persistence_file_backed() {
 
     // Reopen and verify all blobs.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
         let handle = engine.open_btree(btree_root);
 
         for (idx, (expected_href_bytes, expected_data)) in refs_and_data.iter().enumerate() {
             let key = format!("blob-{}", idx);
-            let stored_href_bytes = handle.get(key.as_bytes()).unwrap().unwrap();
+            let stored_href_bytes = handle.get(key.as_bytes()).await.unwrap().unwrap();
             assert_eq!(
                 &stored_href_bytes[..6],
                 expected_href_bytes,
@@ -1292,7 +1313,7 @@ async fn test_heap_persistence_file_backed() {
             );
 
             let href = HeapRef::from_bytes(stored_href_bytes[..6].try_into().unwrap());
-            let loaded = engine.heap_load(href).unwrap();
+            let loaded = engine.heap_load(href).await.unwrap();
             assert_eq!(
                 loaded.len(),
                 expected_data.len(),
@@ -1322,7 +1343,7 @@ async fn test_page_size_mismatch_on_reopen() {
             memory_budget: 4096 * 64,
             ..Default::default()
         };
-        let engine = StorageEngine::open(&path, config, &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, config, &mut NoOpHandler).await.unwrap();
         engine.checkpoint().await.unwrap();
         engine.close().await.unwrap();
     }
@@ -1334,7 +1355,7 @@ async fn test_page_size_mismatch_on_reopen() {
             memory_budget: 8192 * 64,
             ..Default::default()
         };
-        let result = StorageEngine::open(&path, config, &mut NoOpHandler);
+        let result = StorageEngine::open(&path, config, &mut NoOpHandler).await;
         assert!(result.is_err(), "opening with wrong page_size should fail");
     }
 }
@@ -1351,32 +1372,32 @@ async fn test_free_list_persistence() {
     let freed_pages;
     let page_count_before_close;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
 
         // Allocate several pages via btree inserts to grow the file.
-        let handle = engine.create_btree().unwrap();
+        let handle = engine.create_btree().await.unwrap();
         for i in 0u32..100 {
             let key = format!("fl-{:06}", i);
-            handle.insert(key.as_bytes(), b"data").unwrap();
+            handle.insert(key.as_bytes(), b"data").await.unwrap();
         }
 
         // Manually deallocate some pages through the free list.
         // First, allocate extra pages that we'll then free.
         let mut pages_to_free = Vec::new();
         {
-            let mut fl = engine.free_list().lock();
+            let mut fl = engine.free_list().lock().await;
             for _ in 0..5 {
-                let page_id = fl.allocate().unwrap();
+                let page_id = fl.allocate().await.unwrap();
                 pages_to_free.push(page_id);
             }
             // Now free them back.
             for &page_id in &pages_to_free {
-                fl.deallocate(page_id).unwrap();
+                fl.deallocate(page_id).await.unwrap();
             }
         }
 
         // The free list should now have 5 pages.
-        let free_count = engine.free_list().lock().count().unwrap();
+        let free_count = engine.free_list().lock().await.count().await.unwrap();
         assert_eq!(free_count, 5, "free list should have 5 freed pages");
         freed_pages = free_count;
 
@@ -1388,13 +1409,13 @@ async fn test_free_list_persistence() {
 
     // Reopen and verify free list was restored.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
 
         // Free list head should be non-zero (restored from file header).
-        let free_head = engine.free_list().lock().head();
+        let free_head = engine.free_list().lock().await.head();
         assert!(free_head > 0, "free list head should be restored on reopen");
 
-        let free_count = engine.free_list().lock().count().unwrap();
+        let free_count = engine.free_list().lock().await.count().await.unwrap();
         assert_eq!(
             free_count, freed_pages,
             "free list page count should survive reopen"
@@ -1402,8 +1423,8 @@ async fn test_free_list_persistence() {
 
         // Allocate from free list — should reuse freed pages, not extend file.
         {
-            let mut fl = engine.free_list().lock();
-            let reused = fl.allocate().unwrap();
+            let mut fl = engine.free_list().lock().await;
+            let reused = fl.allocate().await.unwrap();
             assert!(
                 (reused as u64) < page_count_before_close,
                 "allocated page {} should come from free list (total pages={})",
@@ -1446,7 +1467,7 @@ async fn test_truncated_wal_frame_recovery() {
     for i in 0..3u32 {
         let payload = format!("valid-{}", i);
         let frame = encode_wal_frame(0x01, payload.as_bytes());
-        wal_storage.append(&frame).unwrap();
+        wal_storage.append(&frame).await.unwrap();
     }
 
     // Write a truncated frame: valid header claiming 100 bytes of payload,
@@ -1463,12 +1484,12 @@ async fn test_truncated_wal_frame_recovery() {
         partial_frame.extend_from_slice(&crc.to_le_bytes());
         partial_frame.push(0x01);
         partial_frame.extend_from_slice(&[0xAB; 10]); // Only 10 of 100 bytes
-        wal_storage.append(&partial_frame).unwrap();
+        wal_storage.append(&partial_frame).await.unwrap();
     }
 
     // Write another valid record after the truncated one.
     let good_after = encode_wal_frame(0x01, b"after-truncated");
-    wal_storage.append(&good_after).unwrap();
+    wal_storage.append(&good_after).await.unwrap();
 
     let mut handler = CollectingHandler::new();
     let (_end_lsn, _stats) = Recovery::run(
@@ -1480,6 +1501,7 @@ async fn test_truncated_wal_frame_recovery() {
         &mut handler,
         RecoveryMode::Strict,
     )
+    .await
     .unwrap();
 
     // Only the 3 valid records before the truncation should be replayed.
@@ -1509,12 +1531,12 @@ async fn test_multiple_crash_recovery_cycles() {
 
     // Session 1: create, insert, checkpoint, then insert more WITHOUT checkpoint → crash.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let handle = engine.create_btree().unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let handle = engine.create_btree().await.unwrap();
 
         for i in 0u32..50 {
             let key = format!("s1-{:04}", i);
-            handle.insert(key.as_bytes(), b"batch1").unwrap();
+            handle.insert(key.as_bytes(), b"batch1").await.unwrap();
         }
         root = handle.root_page();
         engine.checkpoint().await.unwrap();
@@ -1524,14 +1546,14 @@ async fn test_multiple_crash_recovery_cycles() {
 
         // Simulate crash.
         engine.wal_writer().shutdown().await;
-        engine.buffer_pool().flush_page(0).unwrap();
-        engine.buffer_pool().page_storage().sync().unwrap();
+        engine.buffer_pool().flush_page(0).await.unwrap();
+        engine.buffer_pool().page_storage().sync().await.unwrap();
     }
 
     // Recovery 1.
     {
         let mut handler = CollectingHandler::new();
-        let engine = StorageEngine::open(&path, small_config(), &mut handler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut handler).await.unwrap();
 
         assert!(
             !handler.records.is_empty(),
@@ -1543,7 +1565,7 @@ async fn test_multiple_crash_recovery_cycles() {
         for i in 0u32..50 {
             let key = format!("s1-{:04}", i);
             assert!(
-                handle.get(key.as_bytes()).unwrap().is_some(),
+                handle.get(key.as_bytes()).await.unwrap().is_some(),
                 "checkpointed key {} should survive crash",
                 key
             );
@@ -1552,7 +1574,7 @@ async fn test_multiple_crash_recovery_cycles() {
         // Session 2: write more, checkpoint, crash again.
         for i in 0u32..30 {
             let key = format!("s2-{:04}", i);
-            handle.insert(key.as_bytes(), b"batch2").unwrap();
+            handle.insert(key.as_bytes(), b"batch2").await.unwrap();
         }
         engine.checkpoint().await.unwrap();
 
@@ -1560,14 +1582,14 @@ async fn test_multiple_crash_recovery_cycles() {
 
         // Simulate crash 2.
         engine.wal_writer().shutdown().await;
-        engine.buffer_pool().flush_page(0).unwrap();
-        engine.buffer_pool().page_storage().sync().unwrap();
+        engine.buffer_pool().flush_page(0).await.unwrap();
+        engine.buffer_pool().page_storage().sync().await.unwrap();
     }
 
     // Recovery 2.
     {
         let mut handler = CollectingHandler::new();
-        let engine = StorageEngine::open(&path, small_config(), &mut handler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut handler).await.unwrap();
 
         assert!(
             !handler.records.is_empty(),
@@ -1580,7 +1602,7 @@ async fn test_multiple_crash_recovery_cycles() {
         for i in 0u32..50 {
             let key = format!("s1-{:04}", i);
             assert!(
-                handle.get(key.as_bytes()).unwrap().is_some(),
+                handle.get(key.as_bytes()).await.unwrap().is_some(),
                 "batch 1 key {} should survive two crashes",
                 key
             );
@@ -1589,7 +1611,7 @@ async fn test_multiple_crash_recovery_cycles() {
         for i in 0u32..30 {
             let key = format!("s2-{:04}", i);
             assert!(
-                handle.get(key.as_bytes()).unwrap().is_some(),
+                handle.get(key.as_bytes()).await.unwrap().is_some(),
                 "batch 2 key {} should survive crash 2",
                 key
             );
@@ -1610,7 +1632,7 @@ async fn test_corrupt_file_header_reopen() {
 
     // Create a valid database.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
         engine.checkpoint().await.unwrap();
         engine.close().await.unwrap();
     }
@@ -1631,7 +1653,7 @@ async fn test_corrupt_file_header_reopen() {
     }
 
     // Reopen should fail with a clear error.
-    let result = StorageEngine::open(&path, small_config(), &mut NoOpHandler);
+    let result = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await;
     assert!(
         result.is_err(),
         "corrupt file header should cause open to fail"
@@ -1656,8 +1678,8 @@ async fn test_empty_database_reopen() {
     let catalog_root;
     let catalog_name_root;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let fh = engine.file_header();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let fh = engine.file_header().await;
         catalog_root = fh.catalog_root_page.get();
         catalog_name_root = fh.catalog_name_root_page.get();
 
@@ -1668,8 +1690,8 @@ async fn test_empty_database_reopen() {
 
     // Reopen and verify empty state.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let fh = engine.file_header();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let fh = engine.file_header().await;
 
         assert_eq!(fh.catalog_root_page.get(), catalog_root);
         assert_eq!(fh.catalog_name_root_page.get(), catalog_name_root);
@@ -1679,6 +1701,7 @@ async fn test_empty_database_reopen() {
         let entries: Vec<_> = catalog
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
             .collect::<Result<Vec<_>, _>>()
+            .await
             .unwrap();
         assert_eq!(
             entries.len(),
@@ -1687,10 +1710,10 @@ async fn test_empty_database_reopen() {
         );
 
         // Should be able to create and use btrees normally.
-        let handle = engine.create_btree().unwrap();
-        handle.insert(b"first-key", b"first-value").unwrap();
+        let handle = engine.create_btree().await.unwrap();
+        handle.insert(b"first-key", b"first-value").await.unwrap();
         assert_eq!(
-            handle.get(b"first-key").unwrap(),
+            handle.get(b"first-key").await.unwrap(),
             Some(b"first-value".to_vec())
         );
 
@@ -1709,13 +1732,13 @@ async fn test_vacuum_persistence_file_backed() {
 
     let root;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let handle = engine.create_btree().unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let handle = engine.create_btree().await.unwrap();
 
         for i in 0u32..100 {
             let key = format!("vp-{:04}", i);
             let value = format!("val-{}", i);
-            handle.insert(key.as_bytes(), value.as_bytes()).unwrap();
+            handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
         }
         root = handle.root_page();
 
@@ -1726,7 +1749,7 @@ async fn test_vacuum_persistence_file_backed() {
                 key: format!("vp-{:04}", i).into_bytes(),
             })
             .collect();
-        let removed = engine.vacuum(&entries).unwrap();
+        let removed = engine.vacuum(&entries).await.unwrap();
         assert_eq!(removed, 40);
 
         engine.checkpoint().await.unwrap();
@@ -1735,13 +1758,13 @@ async fn test_vacuum_persistence_file_backed() {
 
     // Reopen and verify vacuum results persisted.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
         let handle = engine.open_btree(root);
 
         for i in 0u32..40 {
             let key = format!("vp-{:04}", i);
             assert_eq!(
-                handle.get(key.as_bytes()).unwrap(),
+                handle.get(key.as_bytes()).await.unwrap(),
                 None,
                 "vacuumed key {} should be gone after reopen",
                 key
@@ -1751,7 +1774,7 @@ async fn test_vacuum_persistence_file_backed() {
             let key = format!("vp-{:04}", i);
             let expected = format!("val-{}", i);
             assert_eq!(
-                handle.get(key.as_bytes()).unwrap(),
+                handle.get(key.as_bytes()).await.unwrap(),
                 Some(expected.into_bytes()),
                 "surviving key {} should persist",
                 key
@@ -1760,7 +1783,7 @@ async fn test_vacuum_persistence_file_backed() {
 
         let count = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .count();
+            .fold(0usize, |acc, _| acc + 1).await;
         assert_eq!(count, 60);
 
         engine.close().await.unwrap();
@@ -1780,7 +1803,7 @@ async fn test_crash_mid_checkpoint_dwb_recovery() {
     let page_size = 4096;
 
     let page_storage = Arc::new(MemoryPageStorage::new(page_size));
-    page_storage.extend(10).unwrap();
+    page_storage.extend(10).await.unwrap();
 
     let mut original_pages: Vec<Vec<u8>> = Vec::new();
     for i in 0..10u32 {
@@ -1789,7 +1812,7 @@ async fn test_crash_mid_checkpoint_dwb_recovery() {
         let data = format!("original-page-{}", i);
         page.insert_slot(data.as_bytes()).unwrap();
         page.stamp_checksum();
-        page_storage.write_page(i, &buf).unwrap();
+        page_storage.write_page(i, &buf).await.unwrap();
         original_pages.push(buf);
     }
 
@@ -1836,12 +1859,13 @@ async fn test_crash_mid_checkpoint_dwb_recovery() {
     for i in 0..5u32 {
         page_storage
             .write_page(i, &updated_pages[i as usize])
+            .await
             .unwrap();
     }
     // Corrupt pages 5..8 (torn writes).
     for i in 5..8u32 {
         let corrupt = vec![0xFFu8; page_size];
-        page_storage.write_page(i, &corrupt).unwrap();
+        page_storage.write_page(i, &corrupt).await.unwrap();
     }
     // Pages 8..10 still have valid original data.
 
@@ -1851,7 +1875,7 @@ async fn test_crash_mid_checkpoint_dwb_recovery() {
         page_storage.clone() as Arc<dyn PageStorage>,
         page_size,
     );
-    let restored = dwb.recover().unwrap();
+    let restored = dwb.recover().await.unwrap();
 
     assert!(
         restored >= 3,
@@ -1862,7 +1886,7 @@ async fn test_crash_mid_checkpoint_dwb_recovery() {
     // All 10 pages should have valid checksums after recovery.
     for i in 0..10u32 {
         let mut buf = vec![0u8; page_size];
-        page_storage.read_page(i, &mut buf).unwrap();
+        page_storage.read_page(i, &mut buf).await.unwrap();
         let page_ref = SlottedPageRef::from_buf(&buf).unwrap();
         assert!(
             page_ref.verify_checksum(),
@@ -1888,19 +1912,19 @@ async fn test_buffer_pool_extreme_pressure() {
         ..Default::default()
     };
 
-    let engine = StorageEngine::open(&path, config, &mut NoOpHandler).unwrap();
+    let engine = StorageEngine::open(&path, config, &mut NoOpHandler).await.unwrap();
 
     // Create 3 btrees — forces heavy eviction with only 8 frames.
     let mut handles = Vec::new();
     for _ in 0..3 {
-        handles.push(engine.create_btree().unwrap());
+        handles.push(engine.create_btree().await.unwrap());
     }
 
     for (t, handle) in handles.iter().enumerate() {
         for i in 0u32..100 {
             let key = format!("t{}-k{:04}", t, i);
             let value = format!("t{}-v{:04}", t, i);
-            handle.insert(key.as_bytes(), value.as_bytes()).unwrap();
+            handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
         }
     }
 
@@ -1910,7 +1934,7 @@ async fn test_buffer_pool_extreme_pressure() {
             let key = format!("t{}-k{:04}", t, i);
             let expected = format!("t{}-v{:04}", t, i);
             assert_eq!(
-                handle.get(key.as_bytes()).unwrap(),
+                handle.get(key.as_bytes()).await.unwrap(),
                 Some(expected.into_bytes()),
                 "tree {} key {} mismatch under pressure",
                 t,
@@ -1919,7 +1943,7 @@ async fn test_buffer_pool_extreme_pressure() {
         }
         let count = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .count();
+            .fold(0usize, |acc, _| acc + 1).await;
         assert_eq!(count, 100, "tree {} should have 100 entries", t);
     }
 
@@ -1929,12 +1953,12 @@ async fn test_buffer_pool_extreme_pressure() {
     engine.close().await.unwrap();
     drop(handles);
 
-    let engine2 = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+    let engine2 = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
     for (t, &root) in roots.iter().enumerate() {
         let handle = engine2.open_btree(root);
         let count = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .count();
+            .fold(0usize, |acc, _| acc + 1).await;
         assert_eq!(
             count, 100,
             "tree {} should have 100 entries after reopen",
@@ -1953,10 +1977,10 @@ async fn test_double_close() {
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("double_close_db");
 
-    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-    let handle = engine.create_btree().unwrap();
+    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+    let handle = engine.create_btree().await.unwrap();
     let root = handle.root_page();
-    handle.insert(b"key", b"value").unwrap();
+    handle.insert(b"key", b"value").await.unwrap();
 
     // First close.
     engine.close().await.unwrap();
@@ -1968,10 +1992,10 @@ async fn test_double_close() {
     drop(result);
 
     // Reopen and verify data is intact.
-    let engine2 = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+    let engine2 = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
     let handle2 = engine2.open_btree(root);
     assert_eq!(
-        handle2.get(b"key").unwrap(),
+        handle2.get(b"key").await.unwrap(),
         Some(b"value".to_vec()),
         "data should survive double close"
     );
@@ -1990,15 +2014,15 @@ async fn test_reopen_fresh_db_without_checkpoint() {
     let path = tmp.path().join("fresh_no_ckpt");
 
     {
-        let _engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let _engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
         // Drop without checkpoint or close.
     }
 
-    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
     // Verify the catalog roots are valid by creating a btree (touches the free list + catalog).
-    let handle = engine.create_btree().unwrap();
-    handle.insert(b"k", b"v").unwrap();
-    assert_eq!(handle.get(b"k").unwrap(), Some(b"v".to_vec()));
+    let handle = engine.create_btree().await.unwrap();
+    handle.insert(b"k", b"v").await.unwrap();
+    assert_eq!(handle.get(b"k").await.unwrap(), Some(b"v".to_vec()));
     engine.close().await.unwrap();
 }
 
@@ -2015,14 +2039,14 @@ async fn test_heap_store_after_reopen() {
 
     let btree_root;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
-        let handle = engine.create_btree().unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let handle = engine.create_btree().await.unwrap();
         btree_root = handle.root_page();
 
         // Store a blob, persist its ref in a btree.
         let data = vec![0xAAu8; 500];
-        let href = engine.heap_store(&data).unwrap();
-        handle.insert(b"blob1", &href.to_bytes()).unwrap();
+        let href = engine.heap_store(&data).await.unwrap();
+        handle.insert(b"blob1", &href.to_bytes()).await.unwrap();
 
         engine.checkpoint().await.unwrap();
         engine.close().await.unwrap();
@@ -2030,18 +2054,18 @@ async fn test_heap_store_after_reopen() {
 
     // Reopen — free space map is empty.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
         let handle = engine.open_btree(btree_root);
 
         // Old blob is still loadable.
-        let href_bytes = handle.get(b"blob1").unwrap().unwrap();
+        let href_bytes = handle.get(b"blob1").await.unwrap().unwrap();
         let href = HeapRef::from_bytes(href_bytes[..6].try_into().unwrap());
-        assert_eq!(engine.heap_load(href).unwrap(), vec![0xAAu8; 500]);
+        assert_eq!(engine.heap_load(href).await.unwrap(), vec![0xAAu8; 500]);
 
         // New store works despite empty free space map.
         let data2 = vec![0xBBu8; 300];
-        let href2 = engine.heap_store(&data2).unwrap();
-        assert_eq!(engine.heap_load(href2).unwrap(), data2);
+        let href2 = engine.heap_store(&data2).await.unwrap();
+        assert_eq!(engine.heap_load(href2).await.unwrap(), data2);
 
         engine.close().await.unwrap();
     }

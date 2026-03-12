@@ -21,9 +21,7 @@ pub fn WalModule() -> Element {
         let db = db.clone();
         let lsn = *from_lsn.read();
         async move {
-            tokio::task::spawn_blocking(move || db.read_wal_frames(lsn, 500))
-                .await
-                .ok()
+            Some(db.read_wal_frames(lsn, 500).await)
         }
     });
 

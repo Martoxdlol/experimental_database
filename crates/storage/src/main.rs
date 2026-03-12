@@ -8,43 +8,46 @@ use exdb_storage::catalog_btree::{
 use exdb_storage::engine::{StorageConfig, StorageEngine};
 use exdb_storage::posting::{PostingEntry, PostingList};
 use exdb_storage::recovery::NoOpHandler;
+use tokio_stream::StreamExt;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
     let db_path = Path::new("tmp_data");
 
     // ── Open the storage engine ──
-    let engine = StorageEngine::open(db_path, StorageConfig::default(), &mut NoOpHandler)?;
+    let engine = StorageEngine::open(db_path, StorageConfig::default(), &mut NoOpHandler).await?;
     println!("Storage engine opened at {:?}", db_path);
 
     // ── Create a B-tree and insert some data ──
-    let tree = engine.create_btree()?;
+    let tree = engine.create_btree().await?;
     println!("Created B-tree with root page {}", tree.root_page());
 
     // Insert key-value pairs (raw bytes — Layer 2 is domain-agnostic).
     for i in 0u32..100 {
         let key = i.to_be_bytes(); // big-endian for sorted ordering
         let value = format!("value_{}", i);
-        tree.insert(&key, value.as_bytes())?;
+        tree.insert(&key, value.as_bytes()).await?;
     }
     println!("Inserted 100 entries");
 
     // ── Point lookup ──
     let key_42 = 42u32.to_be_bytes();
-    if let Some(val) = tree.get(&key_42)? {
+    if let Some(val) = tree.get(&key_42).await? {
         println!("GET key=42 -> {:?}", String::from_utf8_lossy(&val));
     }
 
     // ── Range scan [10, 20) ──
     let lower = 10u32.to_be_bytes();
     let upper = 20u32.to_be_bytes();
-    let results: Vec<_> = tree
-        .scan(
-            Bound::Included(&lower[..]),
-            Bound::Excluded(&upper[..]),
-            ScanDirection::Forward,
-        )
-        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut scan = tree.scan(
+        Bound::Included(&lower[..]),
+        Bound::Excluded(&upper[..]),
+        ScanDirection::Forward,
+    );
+    let mut results = Vec::new();
+    while let Some(item) = scan.next().await {
+        results.push(item?);
+    }
     println!("SCAN [10..20): {} entries", results.len());
     for (k, v) in &results {
         let num = u32::from_be_bytes(k[..4].try_into().unwrap());
@@ -52,15 +55,15 @@ async fn main() -> std::io::Result<()> {
     }
 
     // ── Delete a key ──
-    let deleted = tree.delete(&key_42)?;
+    let deleted = tree.delete(&key_42).await?;
     println!("DELETE key=42: existed={}", deleted);
-    assert!(tree.get(&key_42)?.is_none());
+    assert!(tree.get(&key_42).await?.is_none());
 
     // ── Heap (large blob storage) ──
     let blob = vec![0xABu8; 50_000]; // 50 KB blob
-    let href = engine.heap_store(&blob)?;
+    let href = engine.heap_store(&blob).await?;
     println!("Stored 50KB blob in heap: {:?}", href);
-    let loaded = engine.heap_load(href)?;
+    let loaded = engine.heap_load(href).await?;
     assert_eq!(loaded, blob);
     println!("Loaded blob back, size={}", loaded.len());
 
@@ -69,7 +72,7 @@ async fn main() -> std::io::Result<()> {
     println!("Appended WAL record, LSN={}", lsn);
 
     // ── Catalog (use the engine's built-in catalog B-trees) ──
-    let fh = engine.file_header();
+    let fh = engine.file_header().await;
     let catalog = engine.open_btree(fh.catalog_root_page.get());
     let name_idx = engine.open_btree(fh.catalog_name_root_page.get());
 
@@ -82,19 +85,19 @@ async fn main() -> std::io::Result<()> {
     };
     let id_key =
         catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, col.collection_id);
-    catalog.insert(&id_key, &catalog_btree::serialize_collection(&col))?;
+    catalog.insert(&id_key, &catalog_btree::serialize_collection(&col)).await?;
 
     let name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, &col.name);
     name_idx.insert(
         &name_key,
         &catalog_btree::serialize_name_value(col.collection_id),
-    )?;
+    ).await?;
     println!("Registered collection '{}'", col.name);
 
     // Register a GIN index (by ID + by name).
-    let posting_tree = engine.create_btree()?;
-    let pending_tree = engine.create_btree()?;
-    let docterm_tree = engine.create_btree()?;
+    let posting_tree = engine.create_btree().await?;
+    let pending_tree = engine.create_btree().await?;
+    let docterm_tree = engine.create_btree().await?;
 
     let gin_idx = IndexEntry {
         index_id: 1,
@@ -108,14 +111,14 @@ async fn main() -> std::io::Result<()> {
         config: vec![],
     };
     let idx_id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, gin_idx.index_id);
-    catalog.insert(&idx_id_key, &catalog_btree::serialize_index(&gin_idx))?;
+    catalog.insert(&idx_id_key, &catalog_btree::serialize_index(&gin_idx)).await?;
 
     let idx_name_key =
         catalog_btree::make_catalog_name_key(CatalogEntityType::Index, &gin_idx.name);
     name_idx.insert(
         &idx_name_key,
         &catalog_btree::serialize_name_value(gin_idx.index_id),
-    )?;
+    ).await?;
     println!(
         "Registered GIN index '{}' (posting={}, pending={}, docterm={})",
         gin_idx.name,
@@ -161,8 +164,8 @@ async fn main() -> std::io::Result<()> {
 
     // Store a posting list in the B-tree (term -> encoded posting list).
     let encoded = union.encode();
-    posting_tree.insert(b"rust", &encoded)?;
-    let loaded = posting_tree.get(b"rust")?.unwrap();
+    posting_tree.insert(b"rust", &encoded).await?;
+    let loaded = posting_tree.get(b"rust").await?.unwrap();
     let decoded = PostingList::decode(&loaded)?;
     println!(
         "Stored+loaded posting list for term 'rust': {} entries",
@@ -177,15 +180,15 @@ async fn main() -> std::io::Result<()> {
     println!("Engine closed");
 
     // ── Reopen and look up collection by name ──
-    let engine2 = StorageEngine::open(db_path, StorageConfig::default(), &mut NoOpHandler)?;
-    let fh2 = engine2.file_header();
+    let engine2 = StorageEngine::open(db_path, StorageConfig::default(), &mut NoOpHandler).await?;
+    let fh2 = engine2.file_header().await;
     let catalog2 = engine2.open_btree(fh2.catalog_root_page.get());
     let name_idx2 = engine2.open_btree(fh2.catalog_name_root_page.get());
 
     // Look up "users" collection by name
     let lookup_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, "users");
     let id_bytes = name_idx2
-        .get(&lookup_key)?
+        .get(&lookup_key).await?
         .expect("collection 'users' not found in name index");
     let collection_id = catalog_btree::deserialize_name_value(&id_bytes)?;
     println!(
@@ -195,7 +198,7 @@ async fn main() -> std::io::Result<()> {
 
     // Fetch the full CollectionEntry by ID
     let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, collection_id);
-    let col_bytes = catalog2.get(&id_key)?.expect("collection entry not found");
+    let col_bytes = catalog2.get(&id_key).await?.expect("collection entry not found");
     let col2 = catalog_btree::deserialize_collection(&col_bytes)?;
     println!(
         "Collection '{}': root_page={}, doc_count={}",
@@ -204,7 +207,7 @@ async fn main() -> std::io::Result<()> {
 
     // Open the data B-tree and verify
     let tree2 = engine2.open_btree(col2.primary_root_page);
-    let val = tree2.get(&10u32.to_be_bytes())?.unwrap();
+    let val = tree2.get(&10u32.to_be_bytes()).await?.unwrap();
     println!(
         "After reopen: GET key=10 -> {:?}",
         String::from_utf8_lossy(&val)
@@ -214,11 +217,11 @@ async fn main() -> std::io::Result<()> {
     let idx_lookup =
         catalog_btree::make_catalog_name_key(CatalogEntityType::Index, "users_tags_gin");
     let idx_id_bytes = name_idx2
-        .get(&idx_lookup)?
+        .get(&idx_lookup).await?
         .expect("index not found by name");
     let idx_id = catalog_btree::deserialize_name_value(&idx_id_bytes)?;
     let idx_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx_id);
-    let idx_bytes = catalog2.get(&idx_key)?.expect("index entry not found");
+    let idx_bytes = catalog2.get(&idx_key).await?.expect("index entry not found");
     let idx2 = catalog_btree::deserialize_index(&idx_bytes)?;
     println!(
         "Looked up index '{}' by name: root={}, aux={:?}",

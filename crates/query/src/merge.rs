@@ -14,6 +14,7 @@ use exdb_docstore::key_encoding::encode_key_prefix;
 use exdb_storage::btree::ScanDirection;
 use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
+use tokio_stream::StreamExt;
 
 /// A view of buffered mutations for one collection.
 /// Constructed by L6 from the WriteSet — L4 does not depend on L5.
@@ -24,8 +25,12 @@ pub struct MergeView<'a> {
 }
 
 /// Merge snapshot scan results with buffered mutations.
-pub fn merge_with_writes<I>(
-    snapshot: I,
+///
+/// Accepts a Stream of scan results (from execute_scan) and merges with
+/// buffered writes. Collects everything into a Vec since merge-sort requires
+/// both sides to be fully materialized.
+pub async fn merge_with_writes<S>(
+    mut snapshot: S,
     merge_view: &MergeView<'_>,
     sort_fields: &[FieldPath],
     range_lower: Bound<&[u8]>,
@@ -35,7 +40,7 @@ pub fn merge_with_writes<I>(
     limit: Option<usize>,
 ) -> std::io::Result<Vec<ScanRow>>
 where
-    I: Iterator<Item = std::io::Result<ScanRow>>,
+    S: futures_core::Stream<Item = std::io::Result<ScanRow>> + Unpin,
 {
     let delete_set: HashSet<DocId> = merge_view.deletes.iter().copied().collect();
     let replace_map: HashMap<DocId, &serde_json::Value> =
@@ -43,7 +48,7 @@ where
 
     // Step 1: Consume snapshot with delete/replace overlay
     let mut snapshot_rows = Vec::new();
-    for item in snapshot {
+    while let Some(item) = snapshot.next().await {
         let row = item?;
         if delete_set.contains(&row.doc_id) {
             continue;
@@ -227,15 +232,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_write_set() {
-        let rows: Vec<std::io::Result<ScanRow>> = vec![
+    /// Helper to create a stream from a vec of results.
+    fn stream_from_vec(
+        rows: Vec<std::io::Result<ScanRow>>,
+    ) -> std::pin::Pin<Box<dyn futures_core::Stream<Item = std::io::Result<ScanRow>> + Send + Unpin>>
+    {
+        Box::pin(tokio_stream::iter(rows))
+    }
+
+    #[tokio::test]
+    async fn no_write_set() {
+        let rows = vec![
             Ok(make_row(1, json!({"x": 1}))),
             Ok(make_row(2, json!({"x": 2}))),
             Ok(make_row(3, json!({"x": 3}))),
         ];
         let result = merge_with_writes(
-            rows.into_iter(),
+            stream_from_vec(rows),
             &empty_merge_view(),
             &[fp("x")],
             Bound::Unbounded,
@@ -244,13 +257,14 @@ mod tests {
             ScanDirection::Forward,
             None,
         )
+        .await
         .unwrap();
         assert_eq!(result.len(), 3);
     }
 
-    #[test]
-    fn delete_overlay() {
-        let rows: Vec<std::io::Result<ScanRow>> = vec![
+    #[tokio::test]
+    async fn delete_overlay() {
+        let rows = vec![
             Ok(make_row(1, json!({"x": 1}))),
             Ok(make_row(2, json!({"x": 2}))),
             Ok(make_row(3, json!({"x": 3}))),
@@ -262,7 +276,7 @@ mod tests {
             replaces: &[],
         };
         let result = merge_with_writes(
-            rows.into_iter(),
+            stream_from_vec(rows),
             &mv,
             &[fp("x")],
             Bound::Unbounded,
@@ -271,15 +285,16 @@ mod tests {
             ScanDirection::Forward,
             None,
         )
+        .await
         .unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].doc_id, make_doc_id(1));
         assert_eq!(result[1].doc_id, make_doc_id(3));
     }
 
-    #[test]
-    fn replace_overlay() {
-        let rows: Vec<std::io::Result<ScanRow>> = vec![Ok(make_row(1, json!({"x": 1})))];
+    #[tokio::test]
+    async fn replace_overlay() {
+        let rows = vec![Ok(make_row(1, json!({"x": 1})))];
         let replaces = [(make_doc_id(1), json!({"x": 99}))];
         let mv = MergeView {
             inserts: &[],
@@ -287,7 +302,7 @@ mod tests {
             replaces: &replaces,
         };
         let result = merge_with_writes(
-            rows.into_iter(),
+            stream_from_vec(rows),
             &mv,
             &[fp("x")],
             Bound::Unbounded,
@@ -296,14 +311,15 @@ mod tests {
             ScanDirection::Forward,
             None,
         )
+        .await
         .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].doc["x"], 99);
     }
 
-    #[test]
-    fn replace_with_filter_rejection() {
-        let rows: Vec<std::io::Result<ScanRow>> = vec![Ok(make_row(1, json!({"x": 5})))];
+    #[tokio::test]
+    async fn replace_with_filter_rejection() {
+        let rows = vec![Ok(make_row(1, json!({"x": 5})))];
         let replaces = [(make_doc_id(1), json!({"x": 1}))];
         let mv = MergeView {
             inserts: &[],
@@ -312,7 +328,7 @@ mod tests {
         };
         let filter = Filter::Gte(fp("x"), Scalar::Int64(3));
         let result = merge_with_writes(
-            rows.into_iter(),
+            stream_from_vec(rows),
             &mv,
             &[fp("x")],
             Bound::Unbounded,
@@ -321,12 +337,13 @@ mod tests {
             ScanDirection::Forward,
             None,
         )
+        .await
         .unwrap();
         assert_eq!(result.len(), 0);
     }
 
-    #[test]
-    fn insert_within_range() {
+    #[tokio::test]
+    async fn insert_within_range() {
         let rows: Vec<std::io::Result<ScanRow>> = vec![];
         let inserts = [(make_doc_id(10), json!({"x": 5}))];
         let mv = MergeView {
@@ -335,7 +352,7 @@ mod tests {
             replaces: &[],
         };
         let result = merge_with_writes(
-            rows.into_iter(),
+            stream_from_vec(rows),
             &mv,
             &[fp("x")],
             Bound::Unbounded,
@@ -344,13 +361,14 @@ mod tests {
             ScanDirection::Forward,
             None,
         )
+        .await
         .unwrap();
         assert_eq!(result.len(), 1);
     }
 
-    #[test]
-    fn insert_sort_order_forward() {
-        let rows: Vec<std::io::Result<ScanRow>> = vec![
+    #[tokio::test]
+    async fn insert_sort_order_forward() {
+        let rows = vec![
             Ok(make_row(1, json!({"x": 1}))),
             Ok(make_row(3, json!({"x": 3}))),
             Ok(make_row(5, json!({"x": 5}))),
@@ -362,7 +380,7 @@ mod tests {
             replaces: &[],
         };
         let result = merge_with_writes(
-            rows.into_iter(),
+            stream_from_vec(rows),
             &mv,
             &[fp("x")],
             Bound::Unbounded,
@@ -371,6 +389,7 @@ mod tests {
             ScanDirection::Forward,
             None,
         )
+        .await
         .unwrap();
         assert_eq!(result.len(), 4);
         let xs: Vec<i64> = result
@@ -380,9 +399,9 @@ mod tests {
         assert_eq!(xs, vec![1, 2, 3, 5]);
     }
 
-    #[test]
-    fn insert_sort_order_backward() {
-        let rows: Vec<std::io::Result<ScanRow>> = vec![
+    #[tokio::test]
+    async fn insert_sort_order_backward() {
+        let rows = vec![
             Ok(make_row(5, json!({"x": 5}))),
             Ok(make_row(3, json!({"x": 3}))),
             Ok(make_row(1, json!({"x": 1}))),
@@ -394,7 +413,7 @@ mod tests {
             replaces: &[],
         };
         let result = merge_with_writes(
-            rows.into_iter(),
+            stream_from_vec(rows),
             &mv,
             &[fp("x")],
             Bound::Unbounded,
@@ -403,6 +422,7 @@ mod tests {
             ScanDirection::Backward,
             None,
         )
+        .await
         .unwrap();
         let xs: Vec<i64> = result
             .iter()
@@ -411,13 +431,13 @@ mod tests {
         assert_eq!(xs, vec![5, 3, 2, 1]);
     }
 
-    #[test]
-    fn limit_applied() {
+    #[tokio::test]
+    async fn limit_applied() {
         let rows: Vec<std::io::Result<ScanRow>> = (1..=5)
             .map(|i| Ok(make_row(i, json!({"x": i}))))
             .collect();
         let result = merge_with_writes(
-            rows.into_iter(),
+            stream_from_vec(rows),
             &empty_merge_view(),
             &[fp("x")],
             Bound::Unbounded,
@@ -426,13 +446,14 @@ mod tests {
             ScanDirection::Forward,
             Some(3),
         )
+        .await
         .unwrap();
         assert_eq!(result.len(), 3);
     }
 
-    #[test]
-    fn all_deleted() {
-        let rows: Vec<std::io::Result<ScanRow>> = vec![
+    #[tokio::test]
+    async fn all_deleted() {
+        let rows = vec![
             Ok(make_row(1, json!({"x": 1}))),
             Ok(make_row(2, json!({"x": 2}))),
         ];
@@ -443,7 +464,7 @@ mod tests {
             replaces: &[],
         };
         let result = merge_with_writes(
-            rows.into_iter(),
+            stream_from_vec(rows),
             &mv,
             &[fp("x")],
             Bound::Unbounded,
@@ -452,6 +473,7 @@ mod tests {
             ScanDirection::Forward,
             None,
         )
+        .await
         .unwrap();
         assert_eq!(result.len(), 0);
     }

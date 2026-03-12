@@ -13,7 +13,9 @@ use crate::backend::PageId;
 use crate::buffer_pool::BufferPool;
 use crate::free_list::FreeList;
 use crate::page::{PageFullError, PageType, SlottedPage, SlottedPageRef};
+use futures_core::Stream;
 use std::ops::Bound;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::io;
@@ -34,6 +36,11 @@ pub enum ScanDirection {
     Forward,
     Backward,
 }
+
+// ─── ScanStream ───
+
+/// Async stream of `(key, value)` pairs from a B+ tree range scan.
+pub type ScanStream<'a> = Pin<Box<dyn Stream<Item = io::Result<(Vec<u8>, Vec<u8>)>> + Send + 'a>>;
 
 // ─── Cell encoding/decoding helpers ───
 
@@ -221,8 +228,8 @@ struct SplitResult {
 impl BTree {
     /// Create a new B-tree with an empty leaf root page.
     /// Allocates one page from the free list.
-    pub fn create(buffer_pool: Arc<BufferPool>, free_list: &mut FreeList) -> io::Result<Self> {
-        let page_id = free_list.allocate()?;
+    pub async fn create(buffer_pool: Arc<BufferPool>, free_list: &mut FreeList) -> io::Result<Self> {
+        let page_id = free_list.allocate().await?;
         let mut guard = buffer_pool.new_page(page_id)?;
         {
             let buf = guard.data_mut();
@@ -252,11 +259,11 @@ impl BTree {
     /// Point lookup. Returns value bytes if found, None if not.
     ///
     /// Uses latch coupling: acquire child shared, release parent shared.
-    pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    pub async fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let mut current_page_id = self.root_page();
 
         loop {
-            let guard = self.buffer_pool.fetch_page_shared(current_page_id)?;
+            let guard = self.buffer_pool.fetch_page_shared(current_page_id).await?;
             let page = SlottedPageRef::from_buf(guard.data())?;
             let page_type = page.page_type_checked()?;
 
@@ -294,7 +301,7 @@ impl BTree {
     ///
     /// If key exists, the value is replaced. Handles leaf and internal splits,
     /// including root splits.
-    pub fn insert(
+    pub async fn insert(
         &self,
         key: &[u8],
         value: &[u8],
@@ -305,7 +312,7 @@ impl BTree {
         let mut current_page_id = self.root_page();
 
         loop {
-            let guard = self.buffer_pool.fetch_page_shared(current_page_id)?;
+            let guard = self.buffer_pool.fetch_page_shared(current_page_id).await?;
             let page = SlottedPageRef::from_buf(guard.data())?;
             let page_type = page.page_type_checked()?;
 
@@ -335,7 +342,7 @@ impl BTree {
         }
 
         // Now `current_page_id` is the leaf. Acquire exclusive lock.
-        let mut guard = self.buffer_pool.fetch_page_exclusive(current_page_id)?;
+        let mut guard = self.buffer_pool.fetch_page_exclusive(current_page_id).await?;
         let leaf_page_id = guard.page_id();
 
         // Check if key already exists for update.
@@ -381,11 +388,11 @@ impl BTree {
         }
 
         // -- Leaf split --
-        let split = self.split_leaf(&mut guard, key, value, free_list)?;
+        let split = self.split_leaf(&mut guard, key, value, free_list).await?;
         drop(guard);
 
         // Propagate the split up through parents.
-        self.propagate_split(split, &mut path, leaf_page_id, free_list)?;
+        self.propagate_split(split, &mut path, leaf_page_id, free_list).await?;
 
         Ok(())
     }
@@ -393,12 +400,12 @@ impl BTree {
     /// Delete a key. Returns true if the key was found and deleted.
     ///
     /// Simple delete: just removes from the leaf (no merge/redistribute for v1).
-    pub fn delete(&self, key: &[u8], _free_list: &mut FreeList) -> io::Result<bool> {
+    pub async fn delete(&self, key: &[u8], _free_list: &mut FreeList) -> io::Result<bool> {
         // Traverse to the leaf.
         let mut current_page_id = self.root_page();
 
         loop {
-            let guard = self.buffer_pool.fetch_page_shared(current_page_id)?;
+            let guard = self.buffer_pool.fetch_page_shared(current_page_id).await?;
             let page = SlottedPageRef::from_buf(guard.data())?;
             let page_type = page.page_type_checked()?;
 
@@ -424,7 +431,7 @@ impl BTree {
         }
 
         // Acquire exclusive lock on the leaf.
-        let mut guard = self.buffer_pool.fetch_page_exclusive(current_page_id)?;
+        let mut guard = self.buffer_pool.fetch_page_exclusive(current_page_id).await?;
         let page = SlottedPageRef::from_buf(guard.data())?;
         let (found, idx) = binary_search_slots(&page, key, true);
         drop(page);
@@ -439,215 +446,110 @@ impl BTree {
         Ok(true)
     }
 
-    /// Range scan with bounds and direction.
+    /// Range scan with bounds and direction. Returns an async `Stream`.
     pub fn scan(
         &self,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
         direction: ScanDirection,
-    ) -> ScanIterator {
+    ) -> ScanStream<'_> {
         let root_page = self.root_page();
 
-        let lower_bound = match lower {
+        let lower_bound: Option<(Vec<u8>, bool)> = match lower {
             Bound::Unbounded => None,
             Bound::Included(k) => Some((k.to_vec(), true)),
             Bound::Excluded(k) => Some((k.to_vec(), false)),
         };
 
-        let upper_bound = match upper {
+        let upper_bound: Option<(Vec<u8>, bool)> = match upper {
             Bound::Unbounded => None,
             Bound::Included(k) => Some((k.to_vec(), true)),
             Bound::Excluded(k) => Some((k.to_vec(), false)),
         };
+
+        let buffer_pool = self.buffer_pool.clone();
 
         match direction {
             ScanDirection::Forward => {
-                let (start_page, start_slot) =
-                    self.find_scan_start(&lower_bound, root_page);
-                ScanIterator {
-                    buffer_pool: self.buffer_pool.clone(),
-                    current_page: start_page,
-                    current_slot: start_slot,
-                    lower: lower_bound,
-                    upper: upper_bound,
-                    direction,
-                    root_page,
-                    done: start_page.is_none(),
-                }
+                Box::pin(async_stream::try_stream! {
+                    let (mut current_page, mut current_slot) =
+                        find_scan_start_async(&buffer_pool, &lower_bound, root_page).await;
+
+                    loop {
+                        let page_id = match current_page {
+                            Some(p) => p,
+                            None => break,
+                        };
+
+                        match forward_step(&buffer_pool, page_id, current_slot, &upper_bound).await? {
+                            ForwardStep::Yield(k, v) => {
+                                current_slot += 1;
+                                yield (k, v);
+                            }
+                            ForwardStep::NextSibling(sibling) => {
+                                current_page = Some(sibling);
+                                current_slot = 0;
+                            }
+                            ForwardStep::SkipSlot => {
+                                current_slot += 1;
+                            }
+                            ForwardStep::Done => break,
+                        }
+                    }
+                })
             }
             ScanDirection::Backward => {
-                let (start_page, start_slot) =
-                    self.find_scan_start_backward(&upper_bound, root_page);
-                ScanIterator {
-                    buffer_pool: self.buffer_pool.clone(),
-                    current_page: start_page,
-                    current_slot: start_slot,
-                    lower: lower_bound,
-                    upper: upper_bound,
-                    direction,
-                    root_page,
-                    done: start_page.is_none(),
-                }
+                Box::pin(async_stream::try_stream! {
+                    let (mut current_page, mut current_slot) =
+                        find_scan_start_backward_async(&buffer_pool, &upper_bound, root_page).await;
+
+                    loop {
+                        let page_id = match current_page {
+                            Some(p) => p,
+                            None => break,
+                        };
+
+                        match backward_step(&buffer_pool, page_id, current_slot, &lower_bound).await? {
+                            BackwardStep::Yield(k, v) => {
+                                if current_slot == 0 {
+                                    match find_prev_leaf_page_async(&buffer_pool, page_id, root_page).await {
+                                        Some((prev_id, last_slot)) => {
+                                            current_page = Some(prev_id);
+                                            current_slot = last_slot;
+                                        }
+                                        None => {
+                                            current_page = None;
+                                        }
+                                    }
+                                } else {
+                                    current_slot -= 1;
+                                }
+                                yield (k, v);
+                            }
+                            BackwardStep::PrevLeaf => {
+                                match find_prev_leaf_page_async(&buffer_pool, page_id, root_page).await {
+                                    Some((prev_id, last_slot)) => {
+                                        current_page = Some(prev_id);
+                                        current_slot = last_slot;
+                                    }
+                                    None => break,
+                                }
+                            }
+                            BackwardStep::SkipSlot => {
+                                current_slot -= 1;
+                            }
+                            BackwardStep::Done => break,
+                        }
+                    }
+                })
             }
         }
     }
 
     // ─── Internal helpers ───
 
-    /// Find the starting leaf page and slot for a forward scan.
-    fn find_scan_start(
-        &self,
-        lower: &Option<(Vec<u8>, bool)>,
-        root_page: PageId,
-    ) -> (Option<PageId>, u16) {
-        let mut current_page_id = root_page;
-
-        loop {
-            let guard = match self.buffer_pool.fetch_page_shared(current_page_id) {
-                Ok(g) => g,
-                Err(_) => return (None, 0),
-            };
-            // Buffer from pool is always page_size.
-            let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
-
-            match page.try_page_type() {
-                Some(PageType::BTreeLeaf) => {
-                    let num_slots = page.num_slots();
-                    if num_slots == 0 {
-                        return (None, 0);
-                    }
-
-                    let start_slot = match lower {
-                        None => 0,
-                        Some((key, inclusive)) => {
-                            let (found, idx) = binary_search_slots(&page, key, true);
-                            if found {
-                                if *inclusive { idx } else { idx + 1 }
-                            } else {
-                                idx
-                            }
-                        }
-                    };
-
-                    if start_slot >= num_slots {
-                        // All keys on this page are less than lower bound.
-                        // Move to right sibling.
-                        let right_sibling = page.prev_or_ptr();
-                        drop(page);
-                        drop(guard);
-                        if right_sibling == 0 {
-                            return (None, 0);
-                        }
-                        return (Some(right_sibling), 0);
-                    }
-
-                    return (Some(current_page_id), start_slot);
-                }
-                Some(PageType::BTreeInternal) => {
-                    let child = match lower {
-                        None => page.prev_or_ptr(),
-                        Some((key, _)) => find_child_in_internal(&page, key),
-                    };
-                    drop(page);
-                    drop(guard);
-                    current_page_id = child;
-                }
-                _ => return (None, 0),
-            }
-        }
-    }
-
-    /// Find the starting leaf page and slot for a backward scan.
-    fn find_scan_start_backward(
-        &self,
-        upper: &Option<(Vec<u8>, bool)>,
-        root_page: PageId,
-    ) -> (Option<PageId>, u16) {
-        let mut current_page_id = root_page;
-
-        loop {
-            let guard = match self.buffer_pool.fetch_page_shared(current_page_id) {
-                Ok(g) => g,
-                Err(_) => return (None, 0),
-            };
-            // Buffer from pool is always page_size.
-            let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
-
-            match page.try_page_type() {
-                Some(PageType::BTreeLeaf) => {
-                    let num_slots = page.num_slots();
-                    if num_slots == 0 {
-                        return (None, 0);
-                    }
-
-                    let start_slot = match upper {
-                        None => num_slots - 1,
-                        Some((key, inclusive)) => {
-                            let (found, idx) = binary_search_slots(&page, key, true);
-                            if found {
-                                if *inclusive {
-                                    idx
-                                } else if idx > 0 {
-                                    idx - 1
-                                } else {
-                                    // Need to go to previous leaf.
-                                    drop(page);
-                                    drop(guard);
-                                    return match find_prev_leaf_page(
-                                        &self.buffer_pool,
-                                        current_page_id,
-                                        root_page,
-                                    ) {
-                                        Some((pid, slot)) => (Some(pid), slot),
-                                        None => (None, 0),
-                                    };
-                                }
-                            } else if idx > 0 {
-                                idx - 1
-                            } else {
-                                // All keys on this leaf >= upper bound.
-                                drop(page);
-                                drop(guard);
-                                return match find_prev_leaf_page(
-                                    &self.buffer_pool,
-                                    current_page_id,
-                                    root_page,
-                                ) {
-                                    Some((pid, slot)) => (Some(pid), slot),
-                                    None => (None, 0),
-                                };
-                            }
-                        }
-                    };
-
-                    return (Some(current_page_id), start_slot);
-                }
-                Some(PageType::BTreeInternal) => {
-                    let child = match upper {
-                        None => {
-                            // Go to rightmost child.
-                            let num_slots = page.num_slots();
-                            if num_slots == 0 {
-                                page.prev_or_ptr()
-                            } else {
-                                let cell = page.slot_data(num_slots - 1);
-                                let (_, child) = decode_internal_cell(cell);
-                                child
-                            }
-                        }
-                        Some((key, _)) => find_child_in_internal(&page, key),
-                    };
-                    drop(page);
-                    drop(guard);
-                    current_page_id = child;
-                }
-                _ => return (None, 0),
-            }
-        }
-    }
-
     /// Split a leaf page. Returns the split result (median key + new page id).
-    fn split_leaf(
+    async fn split_leaf(
         &self,
         guard: &mut crate::buffer_pool::ExclusivePageGuard<'_>,
         new_key: &[u8],
@@ -679,7 +581,7 @@ impl BTree {
         let median_key = entries[split_point].0.clone();
 
         // Allocate a new leaf page for the upper half.
-        let new_page_id = free_list.allocate()?;
+        let new_page_id = free_list.allocate().await?;
         let mut new_guard = self.buffer_pool.new_page(new_page_id)?;
         {
             let buf = new_guard.data_mut();
@@ -728,7 +630,7 @@ impl BTree {
     }
 
     /// Propagate a split result up through parent pages.
-    fn propagate_split(
+    async fn propagate_split(
         &self,
         mut split: SplitResult,
         path: &mut Vec<PageId>,
@@ -736,7 +638,7 @@ impl BTree {
         free_list: &mut FreeList,
     ) -> io::Result<()> {
         while let Some(parent_page_id) = path.pop() {
-            let mut parent_guard = self.buffer_pool.fetch_page_exclusive(parent_page_id)?;
+            let mut parent_guard = self.buffer_pool.fetch_page_exclusive(parent_page_id).await?;
 
             // Try to insert the promoted key + child into the parent.
             let cell = encode_internal_cell(&split.median_key, split.new_page_id);
@@ -764,13 +666,13 @@ impl BTree {
                 &split.median_key,
                 split.new_page_id,
                 free_list,
-            )?;
+            ).await?;
             let this_page_id = parent_guard.page_id();
             drop(parent_guard);
 
             // If this was the root, create a new root.
             if path.is_empty() && this_page_id == self.root_page() {
-                self.create_new_root(this_page_id, &new_split, free_list)?;
+                self.create_new_root(this_page_id, &new_split, free_list).await?;
                 return Ok(());
             }
 
@@ -779,12 +681,12 @@ impl BTree {
 
         // If we get here, we split the root without a parent.
         let old_root = self.root_page();
-        self.create_new_root(old_root, &split, free_list)?;
+        self.create_new_root(old_root, &split, free_list).await?;
         Ok(())
     }
 
     /// Split an internal node. Returns the split result.
-    fn split_internal(
+    async fn split_internal(
         &self,
         guard: &mut crate::buffer_pool::ExclusivePageGuard<'_>,
         new_key: &[u8],
@@ -817,7 +719,7 @@ impl BTree {
         let median_child = entries[median_idx].1;
 
         // Allocate new internal page for the upper half.
-        let new_page_id = free_list.allocate()?;
+        let new_page_id = free_list.allocate().await?;
         let mut new_guard = self.buffer_pool.new_page(new_page_id)?;
         {
             let buf = new_guard.data_mut();
@@ -866,13 +768,13 @@ impl BTree {
     }
 
     /// Create a new root page after the old root splits.
-    fn create_new_root(
+    async fn create_new_root(
         &self,
         old_root: PageId,
         split: &SplitResult,
         free_list: &mut FreeList,
     ) -> io::Result<()> {
-        let new_root_id = free_list.allocate()?;
+        let new_root_id = free_list.allocate().await?;
         let mut guard = self.buffer_pool.new_page(new_root_id)?;
         {
             let buf = guard.data_mut();
@@ -922,219 +824,317 @@ fn find_child_in_internal(page: &SlottedPageRef, key: &[u8]) -> PageId {
     }
 }
 
-// ─── ScanIterator ───
+// ─── Scan step helpers (separate async fns so guards don't cross yield points) ───
 
-/// Iterator over `(key, value)` pairs from a B+ tree range scan.
-pub struct ScanIterator {
-    buffer_pool: Arc<BufferPool>,
-    current_page: Option<PageId>,
+/// Result of reading one step in a forward scan.
+enum ForwardStep {
+    /// Yield this key-value pair, then advance slot.
+    Yield(Vec<u8>, Vec<u8>),
+    /// Move to the right sibling page.
+    NextSibling(PageId),
+    /// Current slot was empty, skip it.
+    SkipSlot,
+    /// Scan is done.
+    Done,
+}
+
+/// Read one forward-scan step from the given page/slot. The page guard is
+/// acquired, read, and dropped entirely inside this function so it never
+/// crosses a yield point.
+async fn forward_step(
+    buffer_pool: &BufferPool,
+    page_id: PageId,
     current_slot: u16,
-    lower: Option<(Vec<u8>, bool)>, // None = unbounded, Some((key, inclusive))
-    upper: Option<(Vec<u8>, bool)>, // None = unbounded, Some((key, inclusive))
-    direction: ScanDirection,
-    root_page: PageId, // needed for backward scan re-traversal
-    done: bool,
+    upper_bound: &Option<(Vec<u8>, bool)>,
+) -> io::Result<ForwardStep> {
+    let guard = buffer_pool.fetch_page_shared(page_id).await?;
+    let page = SlottedPageRef::from_buf(guard.data())?;
+    let num_slots = page.num_slots();
+
+    if current_slot >= num_slots {
+        let right_sibling = page.prev_or_ptr();
+        if right_sibling == 0 {
+            return Ok(ForwardStep::Done);
+        } else {
+            return Ok(ForwardStep::NextSibling(right_sibling));
+        }
+    }
+
+    let cell = page.slot_data(current_slot);
+    if cell.is_empty() {
+        return Ok(ForwardStep::SkipSlot);
+    }
+
+    let (key, value) = decode_leaf_cell(cell);
+
+    if let Some((ref upper_key, inclusive)) = *upper_bound {
+        match key.cmp(upper_key.as_slice()) {
+            std::cmp::Ordering::Greater => return Ok(ForwardStep::Done),
+            std::cmp::Ordering::Equal if !inclusive => return Ok(ForwardStep::Done),
+            _ => {}
+        }
+    }
+
+    Ok(ForwardStep::Yield(key.to_vec(), value.to_vec()))
 }
 
-impl Iterator for ScanIterator {
-    type Item = io::Result<(Vec<u8>, Vec<u8>)>;
+/// Result of reading one step in a backward scan.
+enum BackwardStep {
+    /// Yield this key-value pair.
+    Yield(Vec<u8>, Vec<u8>),
+    /// Need to navigate to the previous leaf.
+    PrevLeaf,
+    /// Current slot was empty, skip backward.
+    SkipSlot,
+    /// Scan is done.
+    Done,
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
+/// Read one backward-scan step from the given page/slot.
+async fn backward_step(
+    buffer_pool: &BufferPool,
+    page_id: PageId,
+    current_slot: u16,
+    lower_bound: &Option<(Vec<u8>, bool)>,
+) -> io::Result<BackwardStep> {
+    let guard = buffer_pool.fetch_page_shared(page_id).await?;
+    let page = SlottedPageRef::from_buf(guard.data())?;
+    let num_slots = page.num_slots();
+
+    if num_slots == 0 || current_slot >= num_slots {
+        return Ok(BackwardStep::PrevLeaf);
+    }
+
+    let cell = page.slot_data(current_slot);
+    if cell.is_empty() {
+        if current_slot == 0 {
+            return Ok(BackwardStep::PrevLeaf);
+        } else {
+            return Ok(BackwardStep::SkipSlot);
         }
+    }
 
-        match self.direction {
-            ScanDirection::Forward => self.next_forward(),
-            ScanDirection::Backward => self.next_backward(),
+    let (key, value) = decode_leaf_cell(cell);
+
+    if let Some((ref lower_key, inclusive)) = *lower_bound {
+        match key.cmp(lower_key.as_slice()) {
+            std::cmp::Ordering::Less => return Ok(BackwardStep::Done),
+            std::cmp::Ordering::Equal if !inclusive => return Ok(BackwardStep::Done),
+            _ => {}
+        }
+    }
+
+    Ok(BackwardStep::Yield(key.to_vec(), value.to_vec()))
+}
+
+// ─── Async scan helpers (free functions) ───
+
+/// Result of reading a page during forward scan start traversal.
+enum ScanStartResult {
+    /// Found a leaf: return (page_id, start_slot).
+    Found(PageId, u16),
+    /// Follow right sibling.
+    RightSibling(PageId),
+    /// Follow child (internal node).
+    Child(PageId),
+    /// No result (empty or error).
+    None,
+}
+
+/// Find the starting leaf page and slot for a forward scan (async version).
+async fn find_scan_start_async(
+    buffer_pool: &BufferPool,
+    lower: &Option<(Vec<u8>, bool)>,
+    root_page: PageId,
+) -> (Option<PageId>, u16) {
+    let mut current_page_id = root_page;
+
+    loop {
+        let result = read_scan_start_page(buffer_pool, current_page_id, lower).await;
+        match result {
+            ScanStartResult::Found(pid, slot) => return (Some(pid), slot),
+            ScanStartResult::RightSibling(sibling) => return (Some(sibling), 0),
+            ScanStartResult::Child(child) => current_page_id = child,
+            ScanStartResult::None => return (None, 0),
         }
     }
 }
 
-impl ScanIterator {
-    fn next_forward(&mut self) -> Option<io::Result<(Vec<u8>, Vec<u8>)>> {
-        loop {
-            let page_id = match self.current_page {
-                Some(p) => p,
-                None => {
-                    self.done = true;
-                    return None;
-                }
-            };
+/// Read a single page for forward scan start. Guard is fully scoped here.
+async fn read_scan_start_page(
+    buffer_pool: &BufferPool,
+    current_page_id: PageId,
+    lower: &Option<(Vec<u8>, bool)>,
+) -> ScanStartResult {
+    let guard = match buffer_pool.fetch_page_shared(current_page_id).await {
+        Ok(g) => g,
+        Err(_) => return ScanStartResult::None,
+    };
+    let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
 
-            let guard = match self.buffer_pool.fetch_page_shared(page_id) {
-                Ok(g) => g,
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(e));
-                }
-            };
-
-            let page = match SlottedPageRef::from_buf(guard.data()) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(e));
-                }
-            };
+    match page.try_page_type() {
+        Some(PageType::BTreeLeaf) => {
             let num_slots = page.num_slots();
+            if num_slots == 0 {
+                return ScanStartResult::None;
+            }
 
-            if self.current_slot >= num_slots {
-                // Move to next leaf (right sibling).
+            let start_slot = match lower {
+                None => 0,
+                Some((key, inclusive)) => {
+                    let (found, idx) = binary_search_slots(&page, key, true);
+                    if found {
+                        if *inclusive { idx } else { idx + 1 }
+                    } else {
+                        idx
+                    }
+                }
+            };
+
+            if start_slot >= num_slots {
                 let right_sibling = page.prev_or_ptr();
-                drop(page);
-                drop(guard);
-
                 if right_sibling == 0 {
-                    self.done = true;
-                    return None;
-                }
-                self.current_page = Some(right_sibling);
-                self.current_slot = 0;
-                continue;
-            }
-
-            let cell = page.slot_data(self.current_slot);
-            if cell.is_empty() {
-                self.current_slot += 1;
-                continue;
-            }
-
-            let (key, value) = decode_leaf_cell(cell);
-
-            // Check upper bound.
-            if let Some((ref upper_key, inclusive)) = self.upper {
-                match key.cmp(upper_key.as_slice()) {
-                    std::cmp::Ordering::Greater => {
-                        self.done = true;
-                        return None;
-                    }
-                    std::cmp::Ordering::Equal if !inclusive => {
-                        self.done = true;
-                        return None;
-                    }
-                    _ => {}
-                }
-            }
-
-            let result = (key.to_vec(), value.to_vec());
-            self.current_slot += 1;
-            drop(page);
-            drop(guard);
-
-            return Some(Ok(result));
-        }
-    }
-
-    fn next_backward(&mut self) -> Option<io::Result<(Vec<u8>, Vec<u8>)>> {
-        loop {
-            let page_id = match self.current_page {
-                Some(p) => p,
-                None => {
-                    self.done = true;
-                    return None;
-                }
-            };
-
-            let guard = match self.buffer_pool.fetch_page_shared(page_id) {
-                Ok(g) => g,
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(e));
-                }
-            };
-
-            let page = match SlottedPageRef::from_buf(guard.data()) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.done = true;
-                    return Some(Err(e));
-                }
-            };
-            let num_slots = page.num_slots();
-
-            if num_slots == 0 || self.current_slot >= num_slots {
-                // Empty page or invalid position. Try previous leaf.
-                drop(page);
-                drop(guard);
-                match find_prev_leaf_page(&self.buffer_pool, page_id, self.root_page) {
-                    Some((prev_id, last_slot)) => {
-                        self.current_page = Some(prev_id);
-                        self.current_slot = last_slot;
-                        continue;
-                    }
-                    None => {
-                        self.done = true;
-                        return None;
-                    }
-                }
-            }
-
-            let cell = page.slot_data(self.current_slot);
-            if cell.is_empty() {
-                if self.current_slot == 0 {
-                    drop(page);
-                    drop(guard);
-                    match find_prev_leaf_page(&self.buffer_pool, page_id, self.root_page) {
-                        Some((prev_id, last_slot)) => {
-                            self.current_page = Some(prev_id);
-                            self.current_slot = last_slot;
-                            continue;
-                        }
-                        None => {
-                            self.done = true;
-                            return None;
-                        }
-                    }
-                }
-                self.current_slot -= 1;
-                continue;
-            }
-
-            let (key, value) = decode_leaf_cell(cell);
-
-            // Check lower bound.
-            if let Some((ref lower_key, inclusive)) = self.lower {
-                match key.cmp(lower_key.as_slice()) {
-                    std::cmp::Ordering::Less => {
-                        self.done = true;
-                        return None;
-                    }
-                    std::cmp::Ordering::Equal if !inclusive => {
-                        self.done = true;
-                        return None;
-                    }
-                    _ => {}
-                }
-            }
-
-            let result = (key.to_vec(), value.to_vec());
-            drop(page);
-            drop(guard);
-
-            // Advance backward.
-            if self.current_slot == 0 {
-                match find_prev_leaf_page(&self.buffer_pool, page_id, self.root_page) {
-                    Some((prev_id, last_slot)) => {
-                        self.current_page = Some(prev_id);
-                        self.current_slot = last_slot;
-                    }
-                    None => {
-                        self.done = true;
-                    }
+                    ScanStartResult::None
+                } else {
+                    ScanStartResult::RightSibling(right_sibling)
                 }
             } else {
-                self.current_slot -= 1;
+                ScanStartResult::Found(current_page_id, start_slot)
             }
+        }
+        Some(PageType::BTreeInternal) => {
+            let child = match lower {
+                None => page.prev_or_ptr(),
+                Some((key, _)) => find_child_in_internal(&page, key),
+            };
+            ScanStartResult::Child(child)
+        }
+        _ => ScanStartResult::None,
+    }
+}
 
-            return Some(Ok(result));
+/// Result of reading a page during backward scan start traversal.
+enum BackwardStartResult {
+    /// Found a leaf: return (page_id, start_slot).
+    Found(PageId, u16),
+    /// Need to find previous leaf from this page.
+    NeedPrevLeaf(PageId),
+    /// Follow child (internal node).
+    Child(PageId),
+    /// No result.
+    None,
+}
+
+/// Find the starting leaf page and slot for a backward scan (async version).
+async fn find_scan_start_backward_async(
+    buffer_pool: &BufferPool,
+    upper: &Option<(Vec<u8>, bool)>,
+    root_page: PageId,
+) -> (Option<PageId>, u16) {
+    let mut current_page_id = root_page;
+
+    loop {
+        let result = read_backward_start_page(buffer_pool, current_page_id, upper).await;
+        match result {
+            BackwardStartResult::Found(pid, slot) => return (Some(pid), slot),
+            BackwardStartResult::NeedPrevLeaf(leaf_pid) => {
+                return match find_prev_leaf_page_async(buffer_pool, leaf_pid, root_page).await {
+                    Some((pid, slot)) => (Some(pid), slot),
+                    None => (None, 0),
+                };
+            }
+            BackwardStartResult::Child(child) => current_page_id = child,
+            BackwardStartResult::None => return (None, 0),
         }
     }
 }
 
-/// Find the previous leaf page by traversing from root.
+/// Read a single page for backward scan start. Guard is fully scoped here.
+async fn read_backward_start_page(
+    buffer_pool: &BufferPool,
+    current_page_id: PageId,
+    upper: &Option<(Vec<u8>, bool)>,
+) -> BackwardStartResult {
+    let guard = match buffer_pool.fetch_page_shared(current_page_id).await {
+        Ok(g) => g,
+        Err(_) => return BackwardStartResult::None,
+    };
+    let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
+
+    match page.try_page_type() {
+        Some(PageType::BTreeLeaf) => {
+            let num_slots = page.num_slots();
+            if num_slots == 0 {
+                return BackwardStartResult::None;
+            }
+
+            match upper {
+                None => BackwardStartResult::Found(current_page_id, num_slots - 1),
+                Some((key, inclusive)) => {
+                    let (found, idx) = binary_search_slots(&page, key, true);
+                    if found {
+                        if *inclusive {
+                            BackwardStartResult::Found(current_page_id, idx)
+                        } else if idx > 0 {
+                            BackwardStartResult::Found(current_page_id, idx - 1)
+                        } else {
+                            BackwardStartResult::NeedPrevLeaf(current_page_id)
+                        }
+                    } else if idx > 0 {
+                        BackwardStartResult::Found(current_page_id, idx - 1)
+                    } else {
+                        BackwardStartResult::NeedPrevLeaf(current_page_id)
+                    }
+                }
+            }
+        }
+        Some(PageType::BTreeInternal) => {
+            let child = match upper {
+                None => {
+                    let num_slots = page.num_slots();
+                    if num_slots == 0 {
+                        page.prev_or_ptr()
+                    } else {
+                        let cell = page.slot_data(num_slots - 1);
+                        let (_, child) = decode_internal_cell(cell);
+                        child
+                    }
+                }
+                Some((key, _)) => find_child_in_internal(&page, key),
+            };
+            BackwardStartResult::Child(child)
+        }
+        _ => BackwardStartResult::None,
+    }
+}
+
+/// Read page type and leftmost child from a page. Guard scoped here.
+async fn read_page_type_and_leftmost(
+    buffer_pool: &BufferPool,
+    page_id: PageId,
+) -> Option<(PageType, PageId)> {
+    let guard = buffer_pool.fetch_page_shared(page_id).await.ok()?;
+    let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
+    let pt = page.try_page_type()?;
+    let ptr = page.prev_or_ptr();
+    Some((pt, ptr))
+}
+
+/// Read right sibling and num_slots from a leaf page. Guard scoped here.
+async fn read_leaf_chain_info(
+    buffer_pool: &BufferPool,
+    page_id: PageId,
+) -> Option<(PageId, u16)> {
+    let guard = buffer_pool.fetch_page_shared(page_id).await.ok()?;
+    let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
+    let right = page.prev_or_ptr();
+    let ns = page.num_slots();
+    Some((right, ns))
+}
+
+/// Find the previous leaf page by traversing from root (async version).
 /// Returns `(page_id, last_slot_index)` of the previous leaf, or `None`.
-fn find_prev_leaf_page(
+async fn find_prev_leaf_page_async(
     buffer_pool: &BufferPool,
     target_page_id: PageId,
     root_page: PageId,
@@ -1143,36 +1143,23 @@ fn find_prev_leaf_page(
     let leftmost_leaf = {
         let mut current = root_page;
         loop {
-            let guard = buffer_pool.fetch_page_shared(current).ok()?;
-            // Buffer from pool is always page_size.
-            let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
-            match page.try_page_type() {
-                Some(PageType::BTreeLeaf) => break current,
-                Some(PageType::BTreeInternal) => {
-                    let child = page.prev_or_ptr();
-                    drop(page);
-                    drop(guard);
-                    current = child;
-                }
+            let (pt, ptr) = read_page_type_and_leftmost(buffer_pool, current).await?;
+            match pt {
+                PageType::BTreeLeaf => break current,
+                PageType::BTreeInternal => current = ptr,
                 _ => return None,
             }
         }
     };
 
     if leftmost_leaf == target_page_id {
-        return None; // target is the leftmost leaf; no predecessor.
+        return None;
     }
 
     // Walk the leaf chain from the leftmost leaf to find the predecessor of target.
     let mut prev_page_id = leftmost_leaf;
     loop {
-        let guard = buffer_pool.fetch_page_shared(prev_page_id).ok()?;
-        // Buffer from pool is always page_size.
-        let page = SlottedPageRef::from_buf(guard.data()).expect("buffer from pool is always page_size");
-        let right = page.prev_or_ptr();
-        let ns = page.num_slots();
-        drop(page);
-        drop(guard);
+        let (right, ns) = read_leaf_chain_info(buffer_pool, prev_page_id).await?;
 
         if right == target_page_id {
             if ns == 0 {
@@ -1181,7 +1168,7 @@ fn find_prev_leaf_page(
             return Some((prev_page_id, ns - 1));
         }
         if right == 0 {
-            return None; // Reached end without finding target.
+            return None;
         }
         prev_page_id = right;
     }
@@ -1197,14 +1184,15 @@ mod tests {
     use super::*;
     use crate::backend::{MemoryPageStorage, PageStorage};
     use crate::buffer_pool::BufferPoolConfig;
+    use tokio_stream::StreamExt;
 
     const PAGE_SIZE: usize = 4096;
 
     /// Helper: set up MemoryPageStorage + BufferPool + FreeList for tests.
-    fn setup() -> (Arc<BufferPool>, FreeList) {
+    async fn setup() -> (Arc<BufferPool>, FreeList) {
         let storage = Arc::new(MemoryPageStorage::new(PAGE_SIZE));
         // Pre-allocate page 0 (reserved).
-        storage.extend(1).unwrap();
+        storage.extend(1).await.unwrap();
         let pool = Arc::new(BufferPool::new(
             BufferPoolConfig {
                 page_size: PAGE_SIZE,
@@ -1217,9 +1205,9 @@ mod tests {
     }
 
     /// Helper: set up with a larger buffer pool for big tests.
-    fn setup_large() -> (Arc<BufferPool>, FreeList) {
+    async fn setup_large() -> (Arc<BufferPool>, FreeList) {
         let storage = Arc::new(MemoryPageStorage::new(PAGE_SIZE));
-        storage.extend(1).unwrap();
+        storage.extend(1).await.unwrap();
         let pool = Arc::new(BufferPool::new(
             BufferPoolConfig {
                 page_size: PAGE_SIZE,
@@ -1231,46 +1219,56 @@ mod tests {
         (pool, free_list)
     }
 
+    /// Helper: collect all items from a ScanStream into a Vec.
+    async fn collect_scan(stream: ScanStream<'_>) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        tokio::pin!(stream);
+        let mut results = Vec::new();
+        while let Some(item) = stream.next().await {
+            results.push(item?);
+        }
+        Ok(results)
+    }
+
     // ─── Test 1: Create empty tree ───
-    #[test]
-    fn test_create_empty_tree() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_create_empty_tree() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         let root = tree.root_page();
-        let guard = pool.fetch_page_shared(root).unwrap();
+        let guard = pool.fetch_page_shared(root).await.unwrap();
         let page = SlottedPageRef::from_buf(guard.data()).unwrap();
         assert_eq!(page.page_type(), PageType::BTreeLeaf);
         assert_eq!(page.num_slots(), 0);
     }
 
     // ─── Test 2: Insert + get single ───
-    #[test]
-    fn test_insert_get_single() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_insert_get_single() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
-        tree.insert(b"hello", b"world", &mut fl).unwrap();
-        let val = tree.get(b"hello").unwrap();
+        tree.insert(b"hello", b"world", &mut fl).await.unwrap();
+        let val = tree.get(b"hello").await.unwrap();
         assert_eq!(val, Some(b"world".to_vec()));
     }
 
     // ─── Test 3: Insert + get missing ───
-    #[test]
-    fn test_insert_get_missing() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_insert_get_missing() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
-        tree.insert(b"hello", b"world", &mut fl).unwrap();
-        let val = tree.get(b"other_key").unwrap();
+        tree.insert(b"hello", b"world", &mut fl).await.unwrap();
+        let val = tree.get(b"other_key").await.unwrap();
         assert_eq!(val, None);
     }
 
     // ─── Test 4: Insert 10K random keys ───
-    #[test]
-    fn test_insert_10k_random_keys() {
-        let (pool, mut fl) = setup_large();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_insert_10k_random_keys() {
+        let (pool, mut fl) = setup_large().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         // Generate deterministic "random" key-value pairs using a simple LCG.
         let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
@@ -1283,11 +1281,11 @@ mod tests {
         }
 
         for (k, v) in &entries {
-            tree.insert(k, v, &mut fl).unwrap();
+            tree.insert(k, v, &mut fl).await.unwrap();
         }
 
         for (k, v) in &entries {
-            let got = tree.get(k).unwrap();
+            let got = tree.get(k).await.unwrap();
             assert_eq!(
                 got.as_deref(),
                 Some(v.as_slice()),
@@ -1298,10 +1296,10 @@ mod tests {
     }
 
     // ─── Test 5: Insert sorted keys ───
-    #[test]
-    fn test_insert_sorted_keys() {
-        let (pool, mut fl) = setup_large();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_insert_sorted_keys() {
+        let (pool, mut fl) = setup_large().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for i in 0..1000u32 {
@@ -1311,20 +1309,20 @@ mod tests {
         }
 
         for (k, v) in &entries {
-            tree.insert(k, v, &mut fl).unwrap();
+            tree.insert(k, v, &mut fl).await.unwrap();
         }
 
         for (k, v) in &entries {
-            let got = tree.get(k).unwrap();
+            let got = tree.get(k).await.unwrap();
             assert_eq!(got.as_deref(), Some(v.as_slice()));
         }
     }
 
     // ─── Test 6: Insert reverse sorted ───
-    #[test]
-    fn test_insert_reverse_sorted() {
-        let (pool, mut fl) = setup_large();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_insert_reverse_sorted() {
+        let (pool, mut fl) = setup_large().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for i in (0..1000u32).rev() {
@@ -1334,27 +1332,27 @@ mod tests {
         }
 
         for (k, v) in &entries {
-            tree.insert(k, v, &mut fl).unwrap();
+            tree.insert(k, v, &mut fl).await.unwrap();
         }
 
         for (k, v) in &entries {
-            let got = tree.get(k).unwrap();
+            let got = tree.get(k).await.unwrap();
             assert_eq!(got.as_deref(), Some(v.as_slice()));
         }
     }
 
     // ─── Test 7: Leaf split ───
-    #[test]
-    fn test_leaf_split() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_leaf_split() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
         let initial_root = tree.root_page();
 
         // Insert enough entries to force a leaf split.
         for i in 0..200u32 {
             let key = format!("key_{:08}", i).into_bytes();
             let value = format!("val_{:08}", i).into_bytes();
-            tree.insert(&key, &value, &mut fl).unwrap();
+            tree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
         // Root should have changed (original root was a leaf that split).
@@ -1364,30 +1362,30 @@ mod tests {
         for i in 0..200u32 {
             let key = format!("key_{:08}", i).into_bytes();
             let value = format!("val_{:08}", i).into_bytes();
-            let got = tree.get(&key).unwrap();
+            let got = tree.get(&key).await.unwrap();
             assert_eq!(got.as_deref(), Some(value.as_slice()), "missing key {}", i);
         }
     }
 
     // ─── Test 8: Internal split ───
-    #[test]
-    fn test_internal_split() {
-        let (pool, mut fl) = setup_large();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_internal_split() {
+        let (pool, mut fl) = setup_large().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         // Insert enough to cause many leaf splits and at least one internal split.
         let count = 5000;
         for i in 0..count {
             let key = format!("k{:06}", i).into_bytes();
             let value = format!("v{:06}", i).into_bytes();
-            tree.insert(&key, &value, &mut fl).unwrap();
+            tree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
         // Verify all entries.
         for i in 0..count {
             let key = format!("k{:06}", i).into_bytes();
             let value = format!("v{:06}", i).into_bytes();
-            let got = tree.get(&key).unwrap();
+            let got = tree.get(&key).await.unwrap();
             assert_eq!(
                 got.as_deref(),
                 Some(value.as_slice()),
@@ -1398,21 +1396,21 @@ mod tests {
     }
 
     // ─── Test 9: Root split ───
-    #[test]
-    fn test_root_split() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_root_split() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         // Force a root split by inserting enough entries.
         for i in 0..200u32 {
             let key = format!("key_{:08}", i).into_bytes();
             let value = format!("v{}", i).into_bytes();
-            tree.insert(&key, &value, &mut fl).unwrap();
+            tree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
         // Verify new root is internal.
         let root = tree.root_page();
-        let guard = pool.fetch_page_shared(root).unwrap();
+        let guard = pool.fetch_page_shared(root).await.unwrap();
         let page = SlottedPageRef::from_buf(guard.data()).unwrap();
         assert_eq!(page.page_type(), PageType::BTreeInternal);
         // Should have at least 1 slot (separator key) pointing to 2 children.
@@ -1420,156 +1418,151 @@ mod tests {
     }
 
     // ─── Test 10: Delete single ───
-    #[test]
-    fn test_delete_single() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_delete_single() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
-        tree.insert(b"aaa", b"val_a", &mut fl).unwrap();
-        tree.insert(b"bbb", b"val_b", &mut fl).unwrap();
-        tree.insert(b"ccc", b"val_c", &mut fl).unwrap();
+        tree.insert(b"aaa", b"val_a", &mut fl).await.unwrap();
+        tree.insert(b"bbb", b"val_b", &mut fl).await.unwrap();
+        tree.insert(b"ccc", b"val_c", &mut fl).await.unwrap();
 
-        let deleted = tree.delete(b"bbb", &mut fl).unwrap();
+        let deleted = tree.delete(b"bbb", &mut fl).await.unwrap();
         assert!(deleted);
 
-        assert_eq!(tree.get(b"bbb").unwrap(), None);
-        assert_eq!(tree.get(b"aaa").unwrap(), Some(b"val_a".to_vec()));
-        assert_eq!(tree.get(b"ccc").unwrap(), Some(b"val_c".to_vec()));
+        assert_eq!(tree.get(b"bbb").await.unwrap(), None);
+        assert_eq!(tree.get(b"aaa").await.unwrap(), Some(b"val_a".to_vec()));
+        assert_eq!(tree.get(b"ccc").await.unwrap(), Some(b"val_c".to_vec()));
     }
 
     // ─── Test 11: Delete all ───
-    #[test]
-    fn test_delete_all() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_delete_all() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         for i in 0..100u32 {
             let key = format!("key_{:04}", i).into_bytes();
             let value = format!("val_{:04}", i).into_bytes();
-            tree.insert(&key, &value, &mut fl).unwrap();
+            tree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
         for i in 0..100u32 {
             let key = format!("key_{:04}", i).into_bytes();
-            let deleted = tree.delete(&key, &mut fl).unwrap();
+            let deleted = tree.delete(&key, &mut fl).await.unwrap();
             assert!(deleted, "key_{:04} should be deletable", i);
         }
 
         for i in 0..100u32 {
             let key = format!("key_{:04}", i).into_bytes();
-            assert_eq!(tree.get(&key).unwrap(), None, "key_{:04} should be gone", i);
+            assert_eq!(tree.get(&key).await.unwrap(), None, "key_{:04} should be gone", i);
         }
     }
 
     // ─── Test 12: Scan forward all ───
-    #[test]
-    fn test_scan_forward_all() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_scan_forward_all() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         let keys: Vec<&[u8]> = vec![b"A", b"B", b"C", b"D", b"E"];
         for &k in &keys {
-            tree.insert(k, k, &mut fl).unwrap();
+            tree.insert(k, k, &mut fl).await.unwrap();
         }
 
-        let results: Vec<(Vec<u8>, Vec<u8>)> = tree
-            .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .collect::<io::Result<Vec<_>>>()
-            .unwrap();
+        let results = collect_scan(
+            tree.scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward),
+        ).await.unwrap();
 
         let result_keys: Vec<&[u8]> = results.iter().map(|(k, _)| k.as_slice()).collect();
         assert_eq!(result_keys, keys);
     }
 
     // ─── Test 13: Scan with bounds ───
-    #[test]
-    fn test_scan_with_bounds() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_scan_with_bounds() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         let keys: Vec<&[u8]> = vec![b"A", b"B", b"C", b"D", b"E"];
         for &k in &keys {
-            tree.insert(k, k, &mut fl).unwrap();
+            tree.insert(k, k, &mut fl).await.unwrap();
         }
 
         // Scan [B, E) = [B, C, D]
-        let results: Vec<(Vec<u8>, Vec<u8>)> = tree
-            .scan(
+        let results = collect_scan(
+            tree.scan(
                 Bound::Included(b"B"),
                 Bound::Excluded(b"E"),
                 ScanDirection::Forward,
-            )
-            .collect::<io::Result<Vec<_>>>()
-            .unwrap();
+            ),
+        ).await.unwrap();
 
         let result_keys: Vec<&[u8]> = results.iter().map(|(k, _)| k.as_slice()).collect();
         assert_eq!(result_keys, vec![b"B" as &[u8], b"C", b"D"]);
     }
 
     // ─── Test 14: Scan backward ───
-    #[test]
-    fn test_scan_backward() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_scan_backward() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         let keys: Vec<&[u8]> = vec![b"A", b"B", b"C", b"D", b"E"];
         for &k in &keys {
-            tree.insert(k, k, &mut fl).unwrap();
+            tree.insert(k, k, &mut fl).await.unwrap();
         }
 
-        let results: Vec<(Vec<u8>, Vec<u8>)> = tree
-            .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Backward)
-            .collect::<io::Result<Vec<_>>>()
-            .unwrap();
+        let results = collect_scan(
+            tree.scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Backward),
+        ).await.unwrap();
 
         let result_keys: Vec<&[u8]> = results.iter().map(|(k, _)| k.as_slice()).collect();
         assert_eq!(result_keys, vec![b"E" as &[u8], b"D", b"C", b"B", b"A"]);
     }
 
     // ─── Test 15: Scan empty range ───
-    #[test]
-    fn test_scan_empty_range() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_scan_empty_range() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         let keys: Vec<&[u8]> = vec![b"A", b"B", b"C", b"D", b"E"];
         for &k in &keys {
-            tree.insert(k, k, &mut fl).unwrap();
+            tree.insert(k, k, &mut fl).await.unwrap();
         }
 
         // lower > upper: should be empty.
-        let results: Vec<(Vec<u8>, Vec<u8>)> = tree
-            .scan(
+        let results = collect_scan(
+            tree.scan(
                 Bound::Included(b"Z"),
                 Bound::Included(b"A"),
                 ScanDirection::Forward,
-            )
-            .collect::<io::Result<Vec<_>>>()
-            .unwrap();
+            ),
+        ).await.unwrap();
 
         assert!(results.is_empty());
     }
 
     // ─── Test 16: Scan across leaf boundaries ───
-    #[test]
-    fn test_scan_across_leaf_boundaries() {
-        let (pool, mut fl) = setup_large();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_scan_across_leaf_boundaries() {
+        let (pool, mut fl) = setup_large().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         let count = 500;
         let mut expected_keys: Vec<Vec<u8>> = Vec::new();
         for i in 0..count {
             let key = format!("key_{:06}", i).into_bytes();
             let value = format!("val_{:06}", i).into_bytes();
-            tree.insert(&key, &value, &mut fl).unwrap();
+            tree.insert(&key, &value, &mut fl).await.unwrap();
             expected_keys.push(key);
         }
         expected_keys.sort();
 
-        let results: Vec<(Vec<u8>, Vec<u8>)> = tree
-            .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .collect::<io::Result<Vec<_>>>()
-            .unwrap();
+        let results = collect_scan(
+            tree.scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward),
+        ).await.unwrap();
 
         let result_keys: Vec<Vec<u8>> = results.iter().map(|(k, _)| k.clone()).collect();
         assert_eq!(result_keys.len(), count);
@@ -1586,34 +1579,34 @@ mod tests {
     }
 
     // ─── Test 17: Insert duplicate key (overwrite) ───
-    #[test]
-    fn test_insert_duplicate_key() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_insert_duplicate_key() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
-        tree.insert(b"key", b"first_value", &mut fl).unwrap();
-        tree.insert(b"key", b"second_value", &mut fl).unwrap();
+        tree.insert(b"key", b"first_value", &mut fl).await.unwrap();
+        tree.insert(b"key", b"second_value", &mut fl).await.unwrap();
 
-        let val = tree.get(b"key").unwrap();
+        let val = tree.get(b"key").await.unwrap();
         assert_eq!(val, Some(b"second_value".to_vec()));
     }
 
     // ─── Test 18: Large values ───
-    #[test]
-    fn test_large_values() {
-        let (pool, mut fl) = setup_large();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_large_values() {
+        let (pool, mut fl) = setup_large().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         let value = vec![0xABu8; 512];
         let count = 100;
         for i in 0..count {
             let key = format!("key_{:04}", i).into_bytes();
-            tree.insert(&key, &value, &mut fl).unwrap();
+            tree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
         for i in 0..count {
             let key = format!("key_{:04}", i).into_bytes();
-            let got = tree.get(&key).unwrap();
+            let got = tree.get(&key).await.unwrap();
             assert_eq!(
                 got.as_deref(),
                 Some(value.as_slice()),
@@ -1624,54 +1617,53 @@ mod tests {
     }
 
     // ─── Test 19: Empty tree operations ───
-    #[test]
-    fn test_empty_tree_operations() {
-        let (pool, mut fl) = setup();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_empty_tree_operations() {
+        let (pool, mut fl) = setup().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         // get on empty tree.
-        assert_eq!(tree.get(b"anything").unwrap(), None);
+        assert_eq!(tree.get(b"anything").await.unwrap(), None);
 
         // scan on empty tree.
-        let results: Vec<_> = tree
-            .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .collect::<io::Result<Vec<_>>>()
-            .unwrap();
+        let results = collect_scan(
+            tree.scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward),
+        ).await.unwrap();
         assert!(results.is_empty());
 
         // delete on empty tree.
-        assert!(!tree.delete(b"anything", &mut fl).unwrap());
+        assert!(!tree.delete(b"anything", &mut fl).await.unwrap());
     }
 
     // ─── Test 20: Concurrent readers ───
-    #[test]
-    fn test_concurrent_readers() {
-        let (pool, mut fl) = setup_large();
-        let tree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn test_concurrent_readers() {
+        let (pool, mut fl) = setup_large().await;
+        let tree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         // Insert some entries.
         for i in 0..100u32 {
             let key = format!("key_{:04}", i).into_bytes();
             let value = format!("val_{:04}", i).into_bytes();
-            tree.insert(&key, &value, &mut fl).unwrap();
+            tree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
         let root_page = tree.root_page();
 
-        // Spawn multiple reader threads.
+        // Spawn multiple reader tasks.
         let mut handles = Vec::new();
         for t in 0..8 {
             let pool_clone = pool.clone();
-            let handle = std::thread::spawn(move || {
+            let handle = tokio::spawn(async move {
                 let tree = BTree::open(root_page, pool_clone);
                 for i in 0..100u32 {
                     let key = format!("key_{:04}", i).into_bytes();
                     let value = format!("val_{:04}", i).into_bytes();
-                    let got = tree.get(&key).unwrap();
+                    let got = tree.get(&key).await.unwrap();
                     assert_eq!(
                         got.as_deref(),
                         Some(value.as_slice()),
-                        "thread {} failed on key_{:04}",
+                        "task {} failed on key_{:04}",
                         t,
                         i
                     );
@@ -1681,7 +1673,7 @@ mod tests {
         }
 
         for h in handles {
-            h.join().unwrap();
+            h.await.unwrap();
         }
     }
 }

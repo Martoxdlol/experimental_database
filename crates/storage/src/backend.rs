@@ -8,10 +8,12 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
 
+use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 
 // ─── Type Aliases ───
@@ -23,25 +25,26 @@ pub type PageId = u32;
 
 /// Backend for fixed-size page I/O.
 /// Implementations must be thread-safe (Send + Sync).
+#[async_trait]
 pub trait PageStorage: Send + Sync {
     /// Read page `page_id` into `buf`. `buf.len()` must equal `page_size`.
     /// Returns an error if `page_id >= page_count`.
-    fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> io::Result<()>;
+    async fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> io::Result<()>;
 
     /// Write `buf` to page `page_id`. `buf.len()` must equal `page_size`.
     /// Returns an error if `page_id >= page_count`.
-    fn write_page(&self, page_id: PageId, buf: &[u8]) -> io::Result<()>;
+    async fn write_page(&self, page_id: PageId, buf: &[u8]) -> io::Result<()>;
 
     /// Flush all pending writes to durable storage.
     /// No-op for in-memory backends.
-    fn sync(&self) -> io::Result<()>;
+    async fn sync(&self) -> io::Result<()>;
 
     /// Current number of allocated pages.
     fn page_count(&self) -> u64;
 
     /// Extend the store to at least `new_count` pages.
     /// Newly allocated pages are zero-filled.
-    fn extend(&self, new_count: u64) -> io::Result<()>;
+    async fn extend(&self, new_count: u64) -> io::Result<()>;
 
     /// Returns the page size this backend was configured with.
     fn page_size(&self) -> usize;
@@ -53,16 +56,17 @@ pub trait PageStorage: Send + Sync {
 // ─── WAL Storage Trait ───
 
 /// Backend for append-only WAL I/O.
+#[async_trait]
 pub trait WalStorage: Send + Sync {
     /// Append `data` to the log. Returns the byte offset where data was written.
-    fn append(&self, data: &[u8]) -> io::Result<u64>;
+    async fn append(&self, data: &[u8]) -> io::Result<u64>;
 
     /// Flush all pending appends to durable storage.
-    fn sync(&self) -> io::Result<()>;
+    async fn sync(&self) -> io::Result<()>;
 
     /// Read up to `buf.len()` bytes starting at `offset`.
     /// Returns number of bytes actually read.
-    fn read_from(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
+    async fn read_from(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
 
     /// Discard all data before `offset` (segment reclamation).
     ///
@@ -74,7 +78,7 @@ pub trait WalStorage: Send + Sync {
     /// - Snapshot checkpoints (for incremental restore)
     ///
     /// Do not call this with an offset that would discard data needed for recovery.
-    fn truncate_before(&self, offset: u64) -> io::Result<()>;
+    async fn truncate_before(&self, offset: u64) -> io::Result<()>;
 
     /// Returns the LSN of the oldest retained WAL segment.
     ///
@@ -103,7 +107,7 @@ pub trait WalStorage: Send + Sync {
 /// Durable page storage backed by a single data file.
 /// Uses pread/pwrite (`read_at`/`write_at`) for concurrent positional I/O.
 pub struct FilePageStorage {
-    file: File,
+    file: Arc<File>,
     page_size: usize,
     page_count: AtomicU64,
 }
@@ -116,7 +120,7 @@ impl FilePageStorage {
         let file_size = metadata.len();
         let page_count = file_size / page_size as u64;
         Ok(Self {
-            file,
+            file: Arc::new(file),
             page_size,
             page_count: AtomicU64::new(page_count),
         })
@@ -131,15 +135,16 @@ impl FilePageStorage {
             .truncate(true)
             .open(path)?;
         Ok(Self {
-            file,
+            file: Arc::new(file),
             page_size,
             page_count: AtomicU64::new(0),
         })
     }
 }
 
+#[async_trait]
 impl PageStorage for FilePageStorage {
-    fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> io::Result<()> {
+    async fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> io::Result<()> {
         if page_id as u64 >= self.page_count.load(Ordering::Acquire) {
             return Err(crate::error::StorageError::InvalidConfig(format!(
                 "page_id {} out of range (page_count {})",
@@ -147,12 +152,19 @@ impl PageStorage for FilePageStorage {
                 self.page_count.load(Ordering::Acquire)
             )).into());
         }
+        let file = self.file.clone();
         let offset = page_id as u64 * self.page_size as u64;
-        self.file.read_at(buf, offset)?;
+        let len = buf.len();
+        let data = tokio::task::spawn_blocking(move || {
+            let mut tmp = vec![0u8; len];
+            file.read_at(&mut tmp, offset)?;
+            Ok::<_, io::Error>(tmp)
+        }).await.map_err(|e| io::Error::other(e))??;
+        buf.copy_from_slice(&data);
         Ok(())
     }
 
-    fn write_page(&self, page_id: PageId, buf: &[u8]) -> io::Result<()> {
+    async fn write_page(&self, page_id: PageId, buf: &[u8]) -> io::Result<()> {
         if page_id as u64 >= self.page_count.load(Ordering::Acquire) {
             return Err(crate::error::StorageError::InvalidConfig(format!(
                 "page_id {} out of range (page_count {})",
@@ -160,27 +172,38 @@ impl PageStorage for FilePageStorage {
                 self.page_count.load(Ordering::Acquire)
             )).into());
         }
+        let file = self.file.clone();
         let offset = page_id as u64 * self.page_size as u64;
-        self.file.write_at(buf, offset)?;
+        let data = buf.to_vec();
+        tokio::task::spawn_blocking(move || {
+            file.write_at(&data, offset)?;
+            Ok::<_, io::Error>(())
+        }).await.map_err(|e| io::Error::other(e))??;
         Ok(())
     }
 
-    fn sync(&self) -> io::Result<()> {
-        self.file.sync_data()
+    async fn sync(&self) -> io::Result<()> {
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || {
+            file.sync_data()
+        }).await.map_err(|e| io::Error::other(e))?
     }
 
     fn page_count(&self) -> u64 {
         self.page_count.load(Ordering::Acquire)
     }
 
-    fn extend(&self, new_count: u64) -> io::Result<()> {
+    async fn extend(&self, new_count: u64) -> io::Result<()> {
         let current = self.page_count.load(Ordering::Acquire);
         if new_count <= current {
             return Ok(());
         }
+        let file = self.file.clone();
         let new_len = new_count * self.page_size as u64;
-        self.file.set_len(new_len)?;
-        self.file.sync_data()?;
+        tokio::task::spawn_blocking(move || {
+            file.set_len(new_len)?;
+            file.sync_data()
+        }).await.map_err(|e| io::Error::other(e))??;
         self.page_count.store(new_count, Ordering::Release);
         Ok(())
     }
@@ -236,7 +259,7 @@ struct FileWalInner {
 pub struct FileWalStorage {
     dir: PathBuf,
     segment_size: usize,
-    inner: Mutex<FileWalInner>,
+    inner: Arc<Mutex<FileWalInner>>,
 }
 
 impl FileWalStorage {
@@ -292,13 +315,13 @@ impl FileWalStorage {
         Ok(Self {
             dir: dir.to_path_buf(),
             segment_size,
-            inner: Mutex::new(FileWalInner {
+            inner: Arc::new(Mutex::new(FileWalInner {
                 active_segment,
                 active_segment_id,
                 active_base_lsn,
                 write_offset,
                 segments,
-            }),
+            })),
         })
     }
 
@@ -335,13 +358,13 @@ impl FileWalStorage {
         Ok(Self {
             dir: dir.to_path_buf(),
             segment_size,
-            inner: Mutex::new(FileWalInner {
+            inner: Arc::new(Mutex::new(FileWalInner {
                 active_segment,
                 active_segment_id: segment_id,
                 active_base_lsn: base_lsn,
                 write_offset: 0,
                 segments,
-            }),
+            })),
         })
     }
 
@@ -422,122 +445,141 @@ impl FileWalStorage {
     }
 }
 
+#[async_trait]
 impl WalStorage for FileWalStorage {
-    fn append(&self, data: &[u8]) -> io::Result<u64> {
-        let mut inner = self.inner.lock();
+    async fn append(&self, data: &[u8]) -> io::Result<u64> {
+        let inner = self.inner.clone();
+        let data = data.to_vec();
+        let dir = self.dir.clone();
+        let segment_size = self.segment_size;
+        tokio::task::spawn_blocking(move || {
+            let mut inner = inner.lock();
 
-        let offset = inner.write_offset;
+            let offset = inner.write_offset;
 
-        // Write to active segment
-        inner.active_segment.write_all(data)?;
-        inner.write_offset += data.len() as u64;
+            // Write to active segment
+            inner.active_segment.write_all(&data)?;
+            inner.write_offset += data.len() as u64;
 
-        // Update the file_size in the segment info for the active segment
-        if let Some(seg) = inner.segments.last_mut() {
-            seg.file_size += data.len() as u64;
-        }
-
-        // Check if we need to roll over
-        if let Some(seg) = inner.segments.last()
-            && seg.file_size > self.segment_size as u64 {
-                Self::rollover(&mut inner, &self.dir)?;
+            // Update the file_size in the segment info for the active segment
+            if let Some(seg) = inner.segments.last_mut() {
+                seg.file_size += data.len() as u64;
             }
 
-        Ok(offset)
+            // Check if we need to roll over
+            if let Some(seg) = inner.segments.last()
+                && seg.file_size > segment_size as u64 {
+                    Self::rollover(&mut inner, &dir)?;
+                }
+
+            Ok(offset)
+        }).await.map_err(|e| io::Error::other(e))?
     }
 
-    fn sync(&self) -> io::Result<()> {
-        let inner = self.inner.lock();
-        inner.active_segment.sync_data()
+    async fn sync(&self) -> io::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let inner = inner.lock();
+            inner.active_segment.sync_data()
+        }).await.map_err(|e| io::Error::other(e))?
     }
 
-    fn read_from(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let inner = self.inner.lock();
+    async fn read_from(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let inner = self.inner.clone();
+        let buf_len = buf.len();
+        let data = tokio::task::spawn_blocking(move || {
+            let inner = inner.lock();
 
-        if buf.is_empty() || offset >= inner.write_offset {
-            return Ok(0);
-        }
+            if buf_len == 0 || offset >= inner.write_offset {
+                return Ok(Vec::new());
+            }
 
-        let mut total_read = 0usize;
-        let mut current_offset = offset;
-        let end_offset = std::cmp::min(offset + buf.len() as u64, inner.write_offset);
+            let mut result = vec![0u8; buf_len];
+            let mut total_read = 0usize;
+            let mut current_offset = offset;
+            let end_offset = std::cmp::min(offset + buf_len as u64, inner.write_offset);
 
-        while current_offset < end_offset && total_read < buf.len() {
-            // Find the segment containing current_offset via binary search.
-            // We want the last segment whose base_lsn <= current_offset.
-            let seg_idx =
-                match inner
-                    .segments
-                    .binary_search_by_key(&current_offset, |s| s.base_lsn)
-                {
-                    Ok(i) => i,
-                    Err(i) => {
-                        if i == 0 {
-                            // current_offset is before the first segment
-                            return Ok(total_read);
+            while current_offset < end_offset && total_read < buf_len {
+                // Find the segment containing current_offset via binary search.
+                let seg_idx =
+                    match inner
+                        .segments
+                        .binary_search_by_key(&current_offset, |s| s.base_lsn)
+                    {
+                        Ok(i) => i,
+                        Err(i) => {
+                            if i == 0 {
+                                break;
+                            }
+                            i - 1
                         }
-                        i - 1
-                    }
-                };
+                    };
 
-            let seg = &inner.segments[seg_idx];
+                let seg = &inner.segments[seg_idx];
 
-            // File position within this segment
-            let offset_in_segment = current_offset - seg.base_lsn;
-            let file_offset = SEGMENT_HEADER_SIZE + offset_in_segment;
+                // File position within this segment
+                let offset_in_segment = current_offset - seg.base_lsn;
+                let file_offset = SEGMENT_HEADER_SIZE + offset_in_segment;
 
-            // How many data bytes are available in this segment
-            let data_in_segment = seg.file_size - SEGMENT_HEADER_SIZE;
-            let remaining_in_segment = data_in_segment.saturating_sub(offset_in_segment);
+                // How many data bytes are available in this segment
+                let data_in_segment = seg.file_size - SEGMENT_HEADER_SIZE;
+                let remaining_in_segment = data_in_segment.saturating_sub(offset_in_segment);
 
-            if remaining_in_segment == 0 {
-                break;
+                if remaining_in_segment == 0 {
+                    break;
+                }
+
+                // How many bytes to read from this segment
+                let want = std::cmp::min(
+                    (end_offset - current_offset) as usize,
+                    remaining_in_segment as usize,
+                );
+                let want = std::cmp::min(want, buf_len - total_read);
+
+                // Open the segment file for reading and use pread
+                let file = File::open(&seg.path)?;
+                let n = file.read_at(&mut result[total_read..total_read + want], file_offset)?;
+
+                total_read += n;
+                current_offset += n as u64;
+
+                if n == 0 {
+                    break;
+                }
             }
 
-            // How many bytes to read from this segment
-            let want = std::cmp::min(
-                (end_offset - current_offset) as usize,
-                remaining_in_segment as usize,
-            );
-            let want = std::cmp::min(want, buf.len() - total_read);
+            result.truncate(total_read);
+            Ok::<_, io::Error>(result)
+        }).await.map_err(|e| io::Error::other(e))??;
 
-            // Open the segment file for reading and use pread
-            let file = File::open(&seg.path)?;
-            let n = file.read_at(&mut buf[total_read..total_read + want], file_offset)?;
-
-            total_read += n;
-            current_offset += n as u64;
-
-            if n == 0 {
-                break;
-            }
-        }
-
-        Ok(total_read)
+        let n = data.len();
+        buf[..n].copy_from_slice(&data);
+        Ok(n)
     }
 
-    fn truncate_before(&self, offset: u64) -> io::Result<()> {
-        let mut inner = self.inner.lock();
+    async fn truncate_before(&self, offset: u64) -> io::Result<()> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut inner = inner.lock();
 
-        // Delete segments whose highest LSN is below the given offset.
-        // A segment's "highest LSN" is base_lsn + (file_size - header_size).
-        // We retain a segment if its data range overlaps with [offset, ...).
-        let mut to_remove = Vec::new();
+            // Delete segments whose highest LSN is below the given offset.
+            let mut to_remove = Vec::new();
 
-        for (i, seg) in inner.segments.iter().enumerate() {
-            let seg_end_lsn = seg.base_lsn + (seg.file_size - SEGMENT_HEADER_SIZE);
-            if seg_end_lsn <= offset {
-                to_remove.push(i);
+            for (i, seg) in inner.segments.iter().enumerate() {
+                let seg_end_lsn = seg.base_lsn + (seg.file_size - SEGMENT_HEADER_SIZE);
+                if seg_end_lsn <= offset {
+                    to_remove.push(i);
+                }
             }
-        }
 
-        // Remove in reverse order to preserve indices, and delete files.
-        for &i in to_remove.iter().rev() {
-            let seg = inner.segments.remove(i);
-            let _ = fs::remove_file(&seg.path);
-        }
+            // Remove in reverse order to preserve indices, and delete files.
+            for &i in to_remove.iter().rev() {
+                let seg = inner.segments.remove(i);
+                let _ = fs::remove_file(&seg.path);
+            }
 
-        Ok(())
+            Ok(())
+        }).await.map_err(|e| io::Error::other(e))?
     }
 
     fn oldest_lsn(&self) -> Option<u64> {
@@ -582,8 +624,9 @@ impl MemoryPageStorage {
     }
 }
 
+#[async_trait]
 impl PageStorage for MemoryPageStorage {
-    fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> io::Result<()> {
+    async fn read_page(&self, page_id: PageId, buf: &mut [u8]) -> io::Result<()> {
         let pages = self.pages.read();
         if page_id as usize >= pages.len() {
             return Err(crate::error::StorageError::InvalidConfig(format!(
@@ -596,7 +639,7 @@ impl PageStorage for MemoryPageStorage {
         Ok(())
     }
 
-    fn write_page(&self, page_id: PageId, buf: &[u8]) -> io::Result<()> {
+    async fn write_page(&self, page_id: PageId, buf: &[u8]) -> io::Result<()> {
         let mut pages = self.pages.write();
         if page_id as usize >= pages.len() {
             return Err(crate::error::StorageError::InvalidConfig(format!(
@@ -609,7 +652,7 @@ impl PageStorage for MemoryPageStorage {
         Ok(())
     }
 
-    fn sync(&self) -> io::Result<()> {
+    async fn sync(&self) -> io::Result<()> {
         Ok(())
     }
 
@@ -617,7 +660,7 @@ impl PageStorage for MemoryPageStorage {
         self.pages.read().len() as u64
     }
 
-    fn extend(&self, new_count: u64) -> io::Result<()> {
+    async fn extend(&self, new_count: u64) -> io::Result<()> {
         let mut pages = self.pages.write();
         let current = pages.len() as u64;
         if new_count <= current {
@@ -671,19 +714,20 @@ impl Default for MemoryWalStorage {
     }
 }
 
+#[async_trait]
 impl WalStorage for MemoryWalStorage {
-    fn append(&self, data: &[u8]) -> io::Result<u64> {
+    async fn append(&self, data: &[u8]) -> io::Result<u64> {
         let mut inner = self.inner.write();
         let offset = inner.base_offset + inner.log.len() as u64;
         inner.log.extend_from_slice(data);
         Ok(offset)
     }
 
-    fn sync(&self) -> io::Result<()> {
+    async fn sync(&self) -> io::Result<()> {
         Ok(())
     }
 
-    fn read_from(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    async fn read_from(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         let inner = self.inner.read();
 
         if buf.is_empty() {
@@ -704,7 +748,7 @@ impl WalStorage for MemoryWalStorage {
         Ok(to_read)
     }
 
-    fn truncate_before(&self, offset: u64) -> io::Result<()> {
+    async fn truncate_before(&self, offset: u64) -> io::Result<()> {
         let mut inner = self.inner.write();
 
         if offset <= inner.base_offset {
@@ -764,15 +808,15 @@ mod tests {
 
     // ─── Test 1: FilePageStorage roundtrip ───
 
-    #[test]
-    fn file_page_storage_roundtrip() {
+    #[tokio::test]
+    async fn file_page_storage_roundtrip() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("data.db");
 
         // Create and write
         {
             let storage = FilePageStorage::create(&path, PAGE_SIZE).unwrap();
-            storage.extend(4).unwrap();
+            storage.extend(4).await.unwrap();
 
             for i in 0..4u32 {
                 let mut page = vec![0u8; PAGE_SIZE];
@@ -780,9 +824,9 @@ mod tests {
                 for (j, byte) in page.iter_mut().enumerate() {
                     *byte = ((i as usize + j) % 256) as u8;
                 }
-                storage.write_page(i, &page).unwrap();
+                storage.write_page(i, &page).await.unwrap();
             }
-            storage.sync().unwrap();
+            storage.sync().await.unwrap();
         }
 
         // Reopen and read back
@@ -792,7 +836,7 @@ mod tests {
 
             for i in 0..4u32 {
                 let mut buf = vec![0u8; PAGE_SIZE];
-                storage.read_page(i, &mut buf).unwrap();
+                storage.read_page(i, &mut buf).await.unwrap();
 
                 for (j, &byte) in buf.iter().enumerate() {
                     assert_eq!(byte, ((i as usize + j) % 256) as u8);
@@ -803,71 +847,71 @@ mod tests {
 
     // ─── Test 2: FilePageStorage extend ───
 
-    #[test]
-    fn file_page_storage_extend() {
+    #[tokio::test]
+    async fn file_page_storage_extend() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("data.db");
 
         let storage = FilePageStorage::create(&path, PAGE_SIZE).unwrap();
         assert_eq!(storage.page_count(), 0);
 
-        storage.extend(100).unwrap();
+        storage.extend(100).await.unwrap();
         assert_eq!(storage.page_count(), 100);
 
         // Write and read every page
         for i in 0..100u32 {
             let page = vec![i as u8; PAGE_SIZE];
-            storage.write_page(i, &page).unwrap();
+            storage.write_page(i, &page).await.unwrap();
 
             let mut buf = vec![0u8; PAGE_SIZE];
-            storage.read_page(i, &mut buf).unwrap();
+            storage.read_page(i, &mut buf).await.unwrap();
             assert_eq!(buf, page);
         }
 
         // Out of range should fail
         let mut buf = vec![0u8; PAGE_SIZE];
-        assert!(storage.read_page(100, &mut buf).is_err());
+        assert!(storage.read_page(100, &mut buf).await.is_err());
     }
 
     // ─── Test 3: FilePageStorage concurrent reads ───
 
-    #[test]
-    fn file_page_storage_concurrent_reads() {
+    #[tokio::test]
+    async fn file_page_storage_concurrent_reads() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("data.db");
 
-        let storage = std::sync::Arc::new(FilePageStorage::create(&path, PAGE_SIZE).unwrap());
-        storage.extend(16).unwrap();
+        let storage = Arc::new(FilePageStorage::create(&path, PAGE_SIZE).unwrap());
+        storage.extend(16).await.unwrap();
 
         // Write distinct patterns to each page
         for i in 0..16u32 {
             let page = vec![i as u8; PAGE_SIZE];
-            storage.write_page(i, &page).unwrap();
+            storage.write_page(i, &page).await.unwrap();
         }
-        storage.sync().unwrap();
+        storage.sync().await.unwrap();
 
-        // Spawn threads to read different pages concurrently
+        // Spawn tasks to read different pages concurrently
         let mut handles = Vec::new();
         for i in 0..16u32 {
             let s = storage.clone();
-            handles.push(std::thread::spawn(move || {
+            handles.push(tokio::spawn(async move {
                 let mut buf = vec![0u8; PAGE_SIZE];
-                s.read_page(i, &mut buf).unwrap();
+                s.read_page(i, &mut buf).await.unwrap();
                 assert!(buf.iter().all(|&b| b == i as u8));
             }));
         }
 
         for h in handles {
-            h.join().unwrap();
+            h.await.unwrap();
         }
     }
 
     // ─── Test 4: MemoryPageStorage roundtrip ───
 
-    #[test]
-    fn memory_page_storage_roundtrip() {
+    #[tokio::test]
+    async fn memory_page_storage_roundtrip() {
         let storage = MemoryPageStorage::new(PAGE_SIZE);
-        storage.extend(4).unwrap();
+        storage.extend(4).await.unwrap();
         assert_eq!(storage.page_count(), 4);
 
         // Write pages with known patterns
@@ -876,13 +920,13 @@ mod tests {
             for (j, byte) in page.iter_mut().enumerate() {
                 *byte = ((i as usize * 37 + j) % 256) as u8;
             }
-            storage.write_page(i, &page).unwrap();
+            storage.write_page(i, &page).await.unwrap();
         }
 
         // Read back and verify
         for i in 0..4u32 {
             let mut buf = vec![0u8; PAGE_SIZE];
-            storage.read_page(i, &mut buf).unwrap();
+            storage.read_page(i, &mut buf).await.unwrap();
 
             for (j, &byte) in buf.iter().enumerate() {
                 assert_eq!(byte, ((i as usize * 37 + j) % 256) as u8);
@@ -891,23 +935,23 @@ mod tests {
 
         // Out of range
         let mut buf = vec![0u8; PAGE_SIZE];
-        assert!(storage.read_page(4, &mut buf).is_err());
+        assert!(storage.read_page(4, &mut buf).await.is_err());
     }
 
     // ─── Test 5: MemoryPageStorage extend ───
 
-    #[test]
-    fn memory_page_storage_extend() {
+    #[tokio::test]
+    async fn memory_page_storage_extend() {
         let storage = MemoryPageStorage::new(PAGE_SIZE);
         assert_eq!(storage.page_count(), 0);
 
-        storage.extend(10).unwrap();
+        storage.extend(10).await.unwrap();
         assert_eq!(storage.page_count(), 10);
 
         // Verify zero-fill
         for i in 0..10u32 {
             let mut buf = vec![0xFFu8; PAGE_SIZE];
-            storage.read_page(i, &mut buf).unwrap();
+            storage.read_page(i, &mut buf).await.unwrap();
             assert!(
                 buf.iter().all(|&b| b == 0),
                 "page {} should be zero-filled",
@@ -916,18 +960,18 @@ mod tests {
         }
 
         // Extend again (should be a no-op for smaller count)
-        storage.extend(5).unwrap();
+        storage.extend(5).await.unwrap();
         assert_eq!(storage.page_count(), 10);
 
         // Extend further
-        storage.extend(20).unwrap();
+        storage.extend(20).await.unwrap();
         assert_eq!(storage.page_count(), 20);
     }
 
     // ─── Test 6: FileWalStorage write + read ───
 
-    #[test]
-    fn file_wal_storage_write_and_read() {
+    #[tokio::test]
+    async fn file_wal_storage_write_and_read() {
         let tmp = TempDir::new().unwrap();
         let wal_dir = tmp.path().join("wal");
 
@@ -937,9 +981,9 @@ mod tests {
         let data2 = b"second record";
         let data3 = b"third record!";
 
-        let off1 = storage.append(data1).unwrap();
-        let off2 = storage.append(data2).unwrap();
-        let off3 = storage.append(data3).unwrap();
+        let off1 = storage.append(data1).await.unwrap();
+        let off2 = storage.append(data2).await.unwrap();
+        let off3 = storage.append(data3).await.unwrap();
 
         assert_eq!(off1, 0);
         assert_eq!(off2, data1.len() as u64);
@@ -952,7 +996,7 @@ mod tests {
         // Read everything from offset 0
         let total_len = data1.len() + data2.len() + data3.len();
         let mut buf = vec![0u8; total_len];
-        let n = storage.read_from(0, &mut buf).unwrap();
+        let n = storage.read_from(0, &mut buf).await.unwrap();
         assert_eq!(n, total_len);
         assert_eq!(&buf[..data1.len()], data1);
         assert_eq!(
@@ -963,15 +1007,15 @@ mod tests {
 
         // Read from a specific offset
         let mut buf2 = vec![0u8; data2.len()];
-        let n = storage.read_from(off2, &mut buf2).unwrap();
+        let n = storage.read_from(off2, &mut buf2).await.unwrap();
         assert_eq!(n, data2.len());
         assert_eq!(&buf2, data2.as_slice());
     }
 
     // ─── Test 7: FileWalStorage segment rollover ───
 
-    #[test]
-    fn file_wal_storage_segment_rollover() {
+    #[tokio::test]
+    async fn file_wal_storage_segment_rollover() {
         let tmp = TempDir::new().unwrap();
         let wal_dir = tmp.path().join("wal");
 
@@ -986,7 +1030,7 @@ mod tests {
         let mut offsets = Vec::new();
 
         for _ in 0..num_records {
-            let off = storage.append(&record).unwrap();
+            let off = storage.append(&record).await.unwrap();
             offsets.push(off);
         }
 
@@ -1003,7 +1047,7 @@ mod tests {
         // Read all data back and verify
         for (i, &off) in offsets.iter().enumerate() {
             let mut buf = vec![0u8; record.len()];
-            let n = storage.read_from(off, &mut buf).unwrap();
+            let n = storage.read_from(off, &mut buf).await.unwrap();
             assert_eq!(n, record.len(), "record {} short read", i);
             assert_eq!(buf, record, "record {} mismatch", i);
         }
@@ -1013,7 +1057,7 @@ mod tests {
         assert_eq!(total_size, (num_records * record.len()) as u64);
 
         let mut all = vec![0u8; total_size as usize];
-        let n = storage.read_from(0, &mut all).unwrap();
+        let n = storage.read_from(0, &mut all).await.unwrap();
         assert_eq!(n, total_size as usize);
 
         for i in 0..num_records {
@@ -1024,8 +1068,8 @@ mod tests {
 
     // ─── Test 8: FileWalStorage reopen ───
 
-    #[test]
-    fn file_wal_storage_reopen() {
+    #[tokio::test]
+    async fn file_wal_storage_reopen() {
         let tmp = TempDir::new().unwrap();
         let wal_dir = tmp.path().join("wal");
 
@@ -1036,8 +1080,8 @@ mod tests {
         let size_before;
         {
             let storage = FileWalStorage::create(&wal_dir, 1024 * 1024).unwrap();
-            storage.append(data1).unwrap();
-            storage.sync().unwrap();
+            storage.append(data1).await.unwrap();
+            storage.sync().await.unwrap();
             size_before = storage.size();
             assert_eq!(size_before, data1.len() as u64);
         }
@@ -1049,18 +1093,18 @@ mod tests {
 
             // Read old data
             let mut buf = vec![0u8; data1.len()];
-            let n = storage.read_from(0, &mut buf).unwrap();
+            let n = storage.read_from(0, &mut buf).await.unwrap();
             assert_eq!(n, data1.len());
             assert_eq!(&buf, data1.as_slice());
 
             // Append new data
-            let off2 = storage.append(data2).unwrap();
+            let off2 = storage.append(data2).await.unwrap();
             assert_eq!(off2, data1.len() as u64);
 
             // Read everything
             let total = data1.len() + data2.len();
             let mut all = vec![0u8; total];
-            let n = storage.read_from(0, &mut all).unwrap();
+            let n = storage.read_from(0, &mut all).await.unwrap();
             assert_eq!(n, total);
             assert_eq!(&all[..data1.len()], data1.as_slice());
             assert_eq!(&all[data1.len()..], data2.as_slice());
@@ -1069,8 +1113,8 @@ mod tests {
 
     // ─── Test 9: FileWalStorage truncate_before ───
 
-    #[test]
-    fn file_wal_storage_truncate_before() {
+    #[tokio::test]
+    async fn file_wal_storage_truncate_before() {
         let tmp = TempDir::new().unwrap();
         let wal_dir = tmp.path().join("wal");
 
@@ -1082,7 +1126,7 @@ mod tests {
         let record = vec![0xCDu8; 100];
         let mut offsets = Vec::new();
         for _ in 0..10 {
-            let off = storage.append(&record).unwrap();
+            let off = storage.append(&record).await.unwrap();
             offsets.push(off);
         }
 
@@ -1094,7 +1138,7 @@ mod tests {
 
         // Truncate before the 5th record's offset
         let truncate_point = offsets[5];
-        storage.truncate_before(truncate_point).unwrap();
+        storage.truncate_before(truncate_point).await.unwrap();
 
         let seg_count_after = {
             let inner = storage.inner.lock();
@@ -1108,7 +1152,7 @@ mod tests {
         // Data at and after the truncate point should still be readable
         for &off in &offsets[5..] {
             let mut buf = vec![0u8; record.len()];
-            let n = storage.read_from(off, &mut buf).unwrap();
+            let n = storage.read_from(off, &mut buf).await.unwrap();
             assert_eq!(
                 n,
                 record.len(),
@@ -1121,17 +1165,17 @@ mod tests {
 
     // ─── Test 10: MemoryWalStorage roundtrip ───
 
-    #[test]
-    fn memory_wal_storage_roundtrip() {
+    #[tokio::test]
+    async fn memory_wal_storage_roundtrip() {
         let storage = MemoryWalStorage::new();
 
         let data1 = b"alpha";
         let data2 = b"bravo";
         let data3 = b"charlie";
 
-        let off1 = storage.append(data1).unwrap();
-        let off2 = storage.append(data2).unwrap();
-        let off3 = storage.append(data3).unwrap();
+        let off1 = storage.append(data1).await.unwrap();
+        let off2 = storage.append(data2).await.unwrap();
+        let off3 = storage.append(data3).await.unwrap();
 
         assert_eq!(off1, 0);
         assert_eq!(off2, 5);
@@ -1140,7 +1184,7 @@ mod tests {
 
         // Read all
         let mut buf = vec![0u8; 17];
-        let n = storage.read_from(0, &mut buf).unwrap();
+        let n = storage.read_from(0, &mut buf).await.unwrap();
         assert_eq!(n, 17);
         assert_eq!(&buf[0..5], b"alpha");
         assert_eq!(&buf[5..10], b"bravo");
@@ -1148,21 +1192,21 @@ mod tests {
 
         // Read from offset
         let mut buf2 = vec![0u8; 5];
-        let n = storage.read_from(5, &mut buf2).unwrap();
+        let n = storage.read_from(5, &mut buf2).await.unwrap();
         assert_eq!(n, 5);
         assert_eq!(&buf2, b"bravo");
 
         // Truncate before offset 10
-        storage.truncate_before(10).unwrap();
+        storage.truncate_before(10).await.unwrap();
 
         // Old data gone
         let mut buf3 = vec![0u8; 5];
-        let n = storage.read_from(0, &mut buf3).unwrap();
+        let n = storage.read_from(0, &mut buf3).await.unwrap();
         assert_eq!(n, 0, "data before truncation point should be gone");
 
         // New data still there
         let mut buf4 = vec![0u8; 7];
-        let n = storage.read_from(10, &mut buf4).unwrap();
+        let n = storage.read_from(10, &mut buf4).await.unwrap();
         assert_eq!(n, 7);
         assert_eq!(&buf4, b"charlie");
 
@@ -1176,15 +1220,15 @@ mod tests {
         assert_eq!(storage.oldest_lsn(), Some(10));
 
         // Can still append after truncation
-        let off4 = storage.append(b"delta").unwrap();
+        let off4 = storage.append(b"delta").await.unwrap();
         assert_eq!(off4, 17);
         assert_eq!(storage.size(), 22);
     }
 
     // ─── Test 11: is_durable ───
 
-    #[test]
-    fn is_durable() {
+    #[tokio::test]
+    async fn is_durable() {
         let tmp = TempDir::new().unwrap();
 
         // File backends are durable
@@ -1206,24 +1250,24 @@ mod tests {
 
     // ─── Test 12: FileWalStorage empty read ───
 
-    #[test]
-    fn file_wal_storage_empty_read() {
+    #[tokio::test]
+    async fn file_wal_storage_empty_read() {
         let tmp = TempDir::new().unwrap();
         let wal_dir = tmp.path().join("wal");
 
         let storage = FileWalStorage::create(&wal_dir, 1024 * 1024).unwrap();
 
         // Write a small amount
-        storage.append(b"data").unwrap();
+        storage.append(b"data").await.unwrap();
 
         // Read beyond the end
         let mut buf = vec![0u8; 100];
-        let n = storage.read_from(1000, &mut buf).unwrap();
+        let n = storage.read_from(1000, &mut buf).await.unwrap();
         assert_eq!(n, 0, "read beyond size should return 0 bytes");
 
         // Read with empty buffer
         let mut empty_buf = vec![];
-        let n = storage.read_from(0, &mut empty_buf).unwrap();
+        let n = storage.read_from(0, &mut empty_buf).await.unwrap();
         assert_eq!(n, 0, "read with empty buffer should return 0 bytes");
     }
 }

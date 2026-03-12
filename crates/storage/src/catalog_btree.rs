@@ -453,17 +453,18 @@ pub fn index_name_scan_prefix() -> [u8; 1] {
 mod tests {
     use super::*;
     use crate::backend::{MemoryPageStorage, PageStorage};
-    use crate::btree::{BTree, ScanDirection};
+    use crate::btree::{BTree, ScanDirection, ScanStream};
     use crate::buffer_pool::{BufferPool, BufferPoolConfig};
     use crate::free_list::FreeList;
     use std::ops::Bound;
     use std::sync::Arc;
+    use tokio_stream::StreamExt;
 
     const PAGE_SIZE: usize = 4096;
 
-    fn setup() -> (Arc<BufferPool>, FreeList) {
+    async fn setup() -> (Arc<BufferPool>, FreeList) {
         let storage = Arc::new(MemoryPageStorage::new(PAGE_SIZE));
-        storage.extend(256).unwrap();
+        storage.extend(256).await.unwrap();
         let pool = Arc::new(BufferPool::new(
             BufferPoolConfig {
                 page_size: PAGE_SIZE,
@@ -473,6 +474,15 @@ mod tests {
         ));
         let free_list = FreeList::new(0, pool.clone());
         (pool, free_list)
+    }
+
+    async fn collect_scan(stream: ScanStream<'_>) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        tokio::pin!(stream);
+        let mut results = Vec::new();
+        while let Some(item) = stream.next().await {
+            results.push(item?);
+        }
+        Ok(results)
     }
 
     // ─── Test 1: Collection key roundtrip ───
@@ -578,12 +588,12 @@ mod tests {
     // ─── Test 7: Dual B-tree insert + lookup ───
     // Insert a collection into both ID and Name B-trees. Look up by ID -> full entry.
     // Look up by name -> get ID.
-    #[test]
-    fn dual_btree_insert_and_lookup() {
-        let (pool, mut fl) = setup();
+    #[tokio::test]
+    async fn dual_btree_insert_and_lookup() {
+        let (pool, mut fl) = setup().await;
 
-        let id_btree = BTree::create(pool.clone(), &mut fl).unwrap();
-        let name_btree = BTree::create(pool.clone(), &mut fl).unwrap();
+        let id_btree = BTree::create(pool.clone(), &mut fl).await.unwrap();
+        let name_btree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         let entry = CollectionEntry {
             collection_id: 42,
@@ -595,21 +605,22 @@ mod tests {
         // Insert into ID B-tree.
         let id_key = make_catalog_id_key(CatalogEntityType::Collection, entry.collection_id);
         let id_value = serialize_collection(&entry);
-        id_btree.insert(&id_key, &id_value, &mut fl).unwrap();
+        id_btree.insert(&id_key, &id_value, &mut fl).await.unwrap();
 
         // Insert into Name B-tree.
         let name_key = make_catalog_name_key(CatalogEntityType::Collection, &entry.name);
         let name_value = serialize_name_value(entry.collection_id);
-        name_btree.insert(&name_key, &name_value, &mut fl).unwrap();
+        name_btree.insert(&name_key, &name_value, &mut fl).await.unwrap();
 
         // Look up by ID.
-        let found_value = id_btree.get(&id_key).unwrap().expect("should find by ID");
+        let found_value = id_btree.get(&id_key).await.unwrap().expect("should find by ID");
         let found_entry = deserialize_collection(&found_value).unwrap();
         assert_eq!(found_entry, entry);
 
         // Look up by name.
         let found_name_value = name_btree
             .get(&name_key)
+            .await
             .unwrap()
             .expect("should find by name");
         let found_id = deserialize_name_value(&found_name_value).unwrap();
@@ -618,10 +629,10 @@ mod tests {
 
     // ─── Test 8: Scan all collections ───
     // Insert 5 collections + 3 indexes. Scan with collection prefix -> get exactly 5 entries.
-    #[test]
-    fn scan_all_collections() {
-        let (pool, mut fl) = setup();
-        let id_btree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn scan_all_collections() {
+        let (pool, mut fl) = setup().await;
+        let id_btree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         // Insert 5 collections.
         for i in 1u64..=5 {
@@ -633,7 +644,7 @@ mod tests {
             };
             let key = make_catalog_id_key(CatalogEntityType::Collection, i);
             let value = serialize_collection(&entry);
-            id_btree.insert(&key, &value, &mut fl).unwrap();
+            id_btree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
         // Insert 3 indexes.
@@ -651,7 +662,7 @@ mod tests {
             };
             let key = make_catalog_id_key(CatalogEntityType::Index, i);
             let value = serialize_index(&entry);
-            id_btree.insert(&key, &value, &mut fl).unwrap();
+            id_btree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
         // Scan with collection prefix.
@@ -661,10 +672,9 @@ mod tests {
         let upper_prefix = index_id_scan_prefix();
         let upper = Bound::Excluded(upper_prefix.as_slice());
 
-        let results: Vec<(Vec<u8>, Vec<u8>)> = id_btree
-            .scan(lower, upper, ScanDirection::Forward)
-            .collect::<io::Result<Vec<_>>>()
-            .unwrap();
+        let results = collect_scan(
+            id_btree.scan(lower, upper, ScanDirection::Forward),
+        ).await.unwrap();
 
         assert_eq!(results.len(), 5);
 
@@ -678,10 +688,10 @@ mod tests {
 
     // ─── Test 9: Scan all indexes ───
     // Same setup, scan with index prefix -> get exactly 3 entries.
-    #[test]
-    fn scan_all_indexes() {
-        let (pool, mut fl) = setup();
-        let id_btree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn scan_all_indexes() {
+        let (pool, mut fl) = setup().await;
+        let id_btree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         // Insert 5 collections.
         for i in 1u64..=5 {
@@ -693,7 +703,7 @@ mod tests {
             };
             let key = make_catalog_id_key(CatalogEntityType::Collection, i);
             let value = serialize_collection(&entry);
-            id_btree.insert(&key, &value, &mut fl).unwrap();
+            id_btree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
         // Insert 3 indexes.
@@ -711,7 +721,7 @@ mod tests {
             };
             let key = make_catalog_id_key(CatalogEntityType::Index, i);
             let value = serialize_index(&entry);
-            id_btree.insert(&key, &value, &mut fl).unwrap();
+            id_btree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
         // Scan with index prefix. Index keys start with 0x02.
@@ -721,10 +731,9 @@ mod tests {
         let upper_byte: [u8; 1] = [0x03];
         let upper = Bound::Excluded(upper_byte.as_slice());
 
-        let results: Vec<(Vec<u8>, Vec<u8>)> = id_btree
-            .scan(lower, upper, ScanDirection::Forward)
-            .collect::<io::Result<Vec<_>>>()
-            .unwrap();
+        let results = collect_scan(
+            id_btree.scan(lower, upper, ScanDirection::Forward),
+        ).await.unwrap();
 
         assert_eq!(results.len(), 3);
 
@@ -934,10 +943,10 @@ mod tests {
     }
 
     // ─── Test 20: GIN in dual B-tree catalog ───
-    #[test]
-    fn gin_in_dual_btree_catalog() {
-        let (pool, mut fl) = setup();
-        let id_btree = BTree::create(pool.clone(), &mut fl).unwrap();
+    #[tokio::test]
+    async fn gin_in_dual_btree_catalog() {
+        let (pool, mut fl) = setup().await;
+        let id_btree = BTree::create(pool.clone(), &mut fl).await.unwrap();
 
         // Insert a BTree index and a GIN index.
         let btree_idx = IndexEntry {
@@ -966,16 +975,16 @@ mod tests {
         for entry in [&btree_idx, &gin_idx] {
             let key = make_catalog_id_key(CatalogEntityType::Index, entry.index_id);
             let value = serialize_index(entry);
-            id_btree.insert(&key, &value, &mut fl).unwrap();
+            id_btree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
         // Retrieve and verify both.
         let key1 = make_catalog_id_key(CatalogEntityType::Index, 1);
-        let found1 = deserialize_index(&id_btree.get(&key1).unwrap().unwrap()).unwrap();
+        let found1 = deserialize_index(&id_btree.get(&key1).await.unwrap().unwrap()).unwrap();
         assert_eq!(found1, btree_idx);
 
         let key2 = make_catalog_id_key(CatalogEntityType::Index, 2);
-        let found2 = deserialize_index(&id_btree.get(&key2).unwrap().unwrap()).unwrap();
+        let found2 = deserialize_index(&id_btree.get(&key2).await.unwrap().unwrap()).unwrap();
         assert_eq!(found2, gin_idx);
     }
 

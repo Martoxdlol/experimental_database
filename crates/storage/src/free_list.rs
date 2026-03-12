@@ -33,18 +33,18 @@ impl FreeList {
 
     /// Allocate a page. Pops from the free list, or extends the file.
     /// Returns the allocated PageId.
-    pub fn allocate(&mut self) -> io::Result<PageId> {
+    pub async fn allocate(&mut self) -> io::Result<PageId> {
         if self.head == 0 {
             // List empty — extend the file by 1 page
             let storage = self.buffer_pool.page_storage();
             let old_count = storage.page_count();
-            storage.extend(old_count + 1)?;
+            storage.extend(old_count + 1).await?;
             let new_page_id = old_count as PageId;
             Ok(new_page_id)
         } else {
             // Pop from head
             let old_head = self.head;
-            let guard = self.buffer_pool.fetch_page_exclusive(old_head)?;
+            let guard = self.buffer_pool.fetch_page_exclusive(old_head).await?;
             let page = SlottedPage::from_buf_ref(guard.data())?;
             let next_free = page.prev_or_ptr();
             drop(page);
@@ -59,7 +59,7 @@ impl FreeList {
     /// # Panics
     /// Panics in debug mode if `page_id == 0` (page 0 is the file header
     /// and must never be freed).
-    pub fn deallocate(&mut self, page_id: PageId) -> io::Result<()> {
+    pub async fn deallocate(&mut self, page_id: PageId) -> io::Result<()> {
         debug_assert!(page_id != 0, "page 0 must never be placed on the free list");
         if page_id == 0 {
             return Err(crate::error::StorageError::InternalBug(
@@ -68,7 +68,7 @@ impl FreeList {
             .into());
         }
 
-        let mut guard = self.buffer_pool.fetch_page_exclusive(page_id)?;
+        let mut guard = self.buffer_pool.fetch_page_exclusive(page_id).await?;
         {
             let buf = guard.data_mut();
             let mut page = SlottedPage::init(buf, page_id, PageType::Free);
@@ -87,12 +87,12 @@ impl FreeList {
     }
 
     /// Count free pages (walks the list — O(n), for diagnostics only).
-    pub fn count(&self) -> io::Result<usize> {
+    pub async fn count(&self) -> io::Result<usize> {
         let mut count = 0;
         let mut current = self.head;
         while current != 0 {
             count += 1;
-            let guard = self.buffer_pool.fetch_page_shared(current)?;
+            let guard = self.buffer_pool.fetch_page_shared(current).await?;
             let page = SlottedPage::from_buf_ref(guard.data())?;
             current = page.prev_or_ptr();
         }
@@ -106,9 +106,9 @@ mod tests {
     use crate::backend::{MemoryPageStorage, PageStorage};
     use crate::buffer_pool::BufferPoolConfig;
 
-    fn setup(num_pages: u64) -> (Arc<BufferPool>, FreeList) {
+    async fn setup(num_pages: u64) -> (Arc<BufferPool>, FreeList) {
         let storage = Arc::new(MemoryPageStorage::new(4096));
-        storage.extend(num_pages).unwrap();
+        storage.extend(num_pages).await.unwrap();
         let pool = Arc::new(BufferPool::new(
             BufferPoolConfig {
                 page_size: 4096,
@@ -121,98 +121,98 @@ mod tests {
     }
 
     // Test 1: Allocate from empty list extends file
-    #[test]
-    fn allocate_from_empty() {
-        let (pool, mut fl) = setup(1); // page 0 exists
+    #[tokio::test]
+    async fn allocate_from_empty() {
+        let (pool, mut fl) = setup(1).await; // page 0 exists
         assert_eq!(fl.head(), 0);
-        let page_id = fl.allocate().unwrap();
+        let page_id = fl.allocate().await.unwrap();
         assert_eq!(page_id, 1); // extended file, new page
         assert_eq!(pool.page_storage().page_count(), 2);
     }
 
     // Test 2: Deallocate + allocate roundtrip
-    #[test]
-    fn deallocate_allocate_roundtrip() {
-        let (_pool, mut fl) = setup(10);
-        fl.deallocate(5).unwrap();
+    #[tokio::test]
+    async fn deallocate_allocate_roundtrip() {
+        let (_pool, mut fl) = setup(10).await;
+        fl.deallocate(5).await.unwrap();
         assert_eq!(fl.head(), 5);
-        let page_id = fl.allocate().unwrap();
+        let page_id = fl.allocate().await.unwrap();
         assert_eq!(page_id, 5);
         assert_eq!(fl.head(), 0);
     }
 
     // Test 3: LIFO order
-    #[test]
-    fn lifo_order() {
-        let (_pool, mut fl) = setup(20);
-        fl.deallocate(3).unwrap();
-        fl.deallocate(7).unwrap();
-        fl.deallocate(11).unwrap();
-        assert_eq!(fl.allocate().unwrap(), 11);
-        assert_eq!(fl.allocate().unwrap(), 7);
-        assert_eq!(fl.allocate().unwrap(), 3);
+    #[tokio::test]
+    async fn lifo_order() {
+        let (_pool, mut fl) = setup(20).await;
+        fl.deallocate(3).await.unwrap();
+        fl.deallocate(7).await.unwrap();
+        fl.deallocate(11).await.unwrap();
+        assert_eq!(fl.allocate().await.unwrap(), 11);
+        assert_eq!(fl.allocate().await.unwrap(), 7);
+        assert_eq!(fl.allocate().await.unwrap(), 3);
         assert_eq!(fl.head(), 0);
     }
 
     // Test 4: Mixed allocate/deallocate
-    #[test]
-    fn mixed_operations() {
-        let (_pool, mut fl) = setup(20);
-        fl.deallocate(2).unwrap();
-        fl.deallocate(4).unwrap();
-        let a = fl.allocate().unwrap();
+    #[tokio::test]
+    async fn mixed_operations() {
+        let (_pool, mut fl) = setup(20).await;
+        fl.deallocate(2).await.unwrap();
+        fl.deallocate(4).await.unwrap();
+        let a = fl.allocate().await.unwrap();
         assert_eq!(a, 4);
-        fl.deallocate(6).unwrap();
-        let b = fl.allocate().unwrap();
+        fl.deallocate(6).await.unwrap();
+        let b = fl.allocate().await.unwrap();
         assert_eq!(b, 6);
-        let c = fl.allocate().unwrap();
+        let c = fl.allocate().await.unwrap();
         assert_eq!(c, 2);
         assert_eq!(fl.head(), 0);
     }
 
     // Test 5: count()
-    #[test]
-    fn count_free_pages() {
-        let (_pool, mut fl) = setup(20);
-        fl.deallocate(1).unwrap();
-        fl.deallocate(2).unwrap();
-        fl.deallocate(3).unwrap();
-        fl.deallocate(4).unwrap();
-        fl.deallocate(5).unwrap();
-        assert_eq!(fl.count().unwrap(), 5);
+    #[tokio::test]
+    async fn count_free_pages() {
+        let (_pool, mut fl) = setup(20).await;
+        fl.deallocate(1).await.unwrap();
+        fl.deallocate(2).await.unwrap();
+        fl.deallocate(3).await.unwrap();
+        fl.deallocate(4).await.unwrap();
+        fl.deallocate(5).await.unwrap();
+        assert_eq!(fl.count().await.unwrap(), 5);
     }
 
     // Test 6: head() tracking
-    #[test]
-    fn head_tracking() {
-        let (_pool, mut fl) = setup(20);
+    #[tokio::test]
+    async fn head_tracking() {
+        let (_pool, mut fl) = setup(20).await;
         assert_eq!(fl.head(), 0);
-        fl.deallocate(5).unwrap();
+        fl.deallocate(5).await.unwrap();
         assert_eq!(fl.head(), 5);
-        fl.deallocate(10).unwrap();
+        fl.deallocate(10).await.unwrap();
         assert_eq!(fl.head(), 10);
-        fl.allocate().unwrap();
+        fl.allocate().await.unwrap();
         assert_eq!(fl.head(), 5);
-        fl.allocate().unwrap();
+        fl.allocate().await.unwrap();
         assert_eq!(fl.head(), 0);
     }
 
     // Test 7: File growth
-    #[test]
-    fn file_growth() {
-        let (pool, mut fl) = setup(10);
+    #[tokio::test]
+    async fn file_growth() {
+        let (pool, mut fl) = setup(10).await;
         assert_eq!(pool.page_storage().page_count(), 10);
         // Empty free list, should extend
-        let page_id = fl.allocate().unwrap();
+        let page_id = fl.allocate().await.unwrap();
         assert_eq!(page_id, 10);
         assert_eq!(pool.page_storage().page_count(), 11);
     }
 
     // Test 8: Deallocate page 0 panics in debug mode
-    #[test]
+    #[tokio::test]
     #[should_panic(expected = "page 0 must never be placed on the free list")]
-    fn deallocate_page_zero_errors() {
-        let (_pool, mut fl) = setup(10);
-        let _ = fl.deallocate(0);
+    async fn deallocate_page_zero_errors() {
+        let (_pool, mut fl) = setup(10).await;
+        let _ = fl.deallocate(0).await;
     }
 }

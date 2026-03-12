@@ -1,6 +1,6 @@
 //! Scan execution (DESIGN.md sections 4.1, 4.2, 4.5).
 //!
-//! Executes an `AccessMethod` by driving L3 iterators through the three-stage
+//! Executes an `AccessMethod` by driving L3 streams through the three-stage
 //! pipeline: Source → PostFilter → Terminal.
 
 use crate::access::AccessMethod;
@@ -9,9 +9,11 @@ use exdb_core::encoding::decode_document;
 use exdb_core::filter::Filter;
 use exdb_core::types::{CollectionId, DocId, IndexId, Ts};
 use exdb_docstore::key_encoding::successor_key;
-use exdb_docstore::{PrimaryIndex, SecondaryIndex, SecondaryScanner};
+use exdb_docstore::{PrimaryIndex, SecondaryIndex};
+use futures_core::Stream;
 use std::collections::HashMap;
 use std::ops::Bound;
+use std::pin::Pin;
 
 /// A single result row from a query scan.
 #[derive(Debug)]
@@ -44,16 +46,19 @@ pub struct ScanStats {
 /// Convention: IndexId(0) for the primary index.
 const PRIMARY_INDEX_ID: IndexId = IndexId(0);
 
+/// Stream type for query scans.
+pub type QueryScanStream<'a> = Pin<Box<dyn Stream<Item = std::io::Result<ScanRow>> + Send + 'a>>;
+
 /// Execute an access method against the indexes at the given read timestamp.
 ///
-/// Returns a `QueryScanner` that lazily produces documents through the
+/// Returns a `QueryScanStream` that lazily produces documents through the
 /// Source → PostFilter → Terminal pipeline.
-pub fn execute_scan<'a>(
-    method: &AccessMethod,
+pub async fn execute_scan<'a>(
+    method: &'a AccessMethod,
     primary_index: &'a PrimaryIndex,
     secondary_indexes: &'a HashMap<IndexId, SecondaryIndex>,
     read_ts: Ts,
-) -> std::io::Result<QueryScanner<'a>> {
+) -> std::io::Result<(QueryScanStream<'a>, ReadIntervalInfo)> {
     let read_interval = compute_read_interval(method);
 
     match method {
@@ -61,8 +66,8 @@ pub fn execute_scan<'a>(
             doc_id,
             ..
         } => {
-            let body = primary_index.get_at_ts(doc_id, read_ts)?;
-            let version_ts = primary_index.get_version_ts(doc_id, read_ts)?;
+            let body = primary_index.get_at_ts(doc_id, read_ts).await?;
+            let version_ts = primary_index.get_version_ts(doc_id, read_ts).await?;
             let row = match (body, version_ts) {
                 (Some(body_bytes), Some(ts)) => {
                     let doc = decode_document(&body_bytes)
@@ -75,15 +80,12 @@ pub fn execute_scan<'a>(
                 }
                 _ => None,
             };
-            Ok(QueryScanner {
-                source: ScanSource::Point(row),
-                post_filter: None,
-                limit: None,
-                read_interval,
-                stats: ScanStats::default(),
-                primary_index,
-                read_ts,
-            })
+            let stream: QueryScanStream<'a> = Box::pin(async_stream::try_stream! {
+                if let Some(r) = row {
+                    yield r;
+                }
+            });
+            Ok((stream, read_interval))
         }
 
         AccessMethod::IndexScan {
@@ -103,22 +105,20 @@ pub fn execute_scan<'a>(
                 _ => unreachable!(),
             };
 
-            let scanner = sec_index.scan_at_ts(
+            let post_filter = post_filter.clone();
+            let limit = *limit;
+
+            let stream: QueryScanStream<'a> = Box::pin(make_secondary_scan_stream(
+                sec_index,
                 bound_as_ref(lower),
                 bound_as_ref(upper),
                 read_ts,
                 direction,
-            );
-
-            Ok(QueryScanner {
-                source: ScanSource::Secondary(scanner),
-                post_filter: post_filter.clone(),
-                limit: *limit,
-                read_interval,
-                stats: ScanStats::default(),
                 primary_index,
-                read_ts,
-            })
+                post_filter,
+                limit,
+            ));
+            Ok((stream, read_interval))
         }
 
         AccessMethod::TableScan {
@@ -132,115 +132,71 @@ pub fn execute_scan<'a>(
                 .get(index_id)
                 .ok_or_else(|| std::io::Error::other("_created_at index not found"))?;
 
-            let scanner = sec_index.scan_at_ts(
+            let post_filter = post_filter.clone();
+            let limit = *limit;
+
+            let stream: QueryScanStream<'a> = Box::pin(make_secondary_scan_stream(
+                sec_index,
                 Bound::Unbounded,
                 Bound::Unbounded,
                 read_ts,
                 *direction,
-            );
-
-            Ok(QueryScanner {
-                source: ScanSource::Secondary(scanner),
-                post_filter: post_filter.clone(),
-                limit: *limit,
-                read_interval,
-                stats: ScanStats::default(),
                 primary_index,
-                read_ts,
-            })
+                post_filter,
+                limit,
+            ));
+            Ok((stream, read_interval))
         }
     }
 }
 
-enum ScanSource {
-    /// Point lookup result (0 or 1 documents).
-    Point(Option<ScanRow>),
-    /// Secondary index scan — yields (doc_id, ts), needs primary fetch.
-    Secondary(SecondaryScanner),
-}
-
-/// Lazy iterator over query results.
-pub struct QueryScanner<'a> {
-    source: ScanSource,
+fn make_secondary_scan_stream<'a>(
+    sec_index: &'a SecondaryIndex,
+    lower: Bound<&'a [u8]>,
+    upper: Bound<&'a [u8]>,
+    read_ts: Ts,
+    direction: exdb_storage::btree::ScanDirection,
+    primary_index: &'a PrimaryIndex,
     post_filter: Option<Filter>,
     limit: Option<usize>,
-    read_interval: ReadIntervalInfo,
-    stats: ScanStats,
-    primary_index: &'a PrimaryIndex,
-    read_ts: Ts,
-}
+) -> impl Stream<Item = std::io::Result<ScanRow>> + Send + 'a {
+    async_stream::try_stream! {
+        use tokio_stream::StreamExt;
 
-impl<'a> QueryScanner<'a> {
-    /// The read set interval for this scan.
-    pub fn read_interval(&self) -> &ReadIntervalInfo {
-        &self.read_interval
-    }
+        let mut scanner = sec_index.scan_at_ts(lower, upper, read_ts, direction);
+        let mut returned = 0usize;
 
-    /// Accumulated scan statistics.
-    pub fn stats(&self) -> &ScanStats {
-        &self.stats
-    }
-}
-
-impl Iterator for QueryScanner<'_> {
-    type Item = std::io::Result<ScanRow>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Check limit
-        if let Some(limit) = self.limit {
-            if self.stats.returned_docs >= limit {
-                return None;
-            }
-        }
-
-        match &mut self.source {
-            ScanSource::Point(row) => {
-                let row = row.take()?;
-                self.stats.returned_docs += 1;
-                Some(Ok(row))
-            }
-            ScanSource::Secondary(scanner) => loop {
-                // Check limit again inside loop
-                if let Some(limit) = self.limit {
-                    if self.stats.returned_docs >= limit {
-                        return None;
-                    }
+        while let Some(result) = scanner.next().await {
+            if let Some(limit) = limit {
+                if returned >= limit {
+                    break;
                 }
+            }
 
-                let (doc_id, version_ts) = match scanner.next()? {
-                    Ok(pair) => pair,
-                    Err(e) => return Some(Err(e)),
-                };
+            let (doc_id, version_ts) = result?;
 
-                // Fetch document body from primary index
-                let body_bytes = match self.primary_index.get_at_ts(&doc_id, self.read_ts) {
-                    Ok(Some(b)) => b,
-                    Ok(None) => continue, // tombstone race — skip defensively
-                    Err(e) => return Some(Err(e)),
-                };
+            // Fetch document body from primary index
+            let body_bytes = match primary_index.get_at_ts(&doc_id, read_ts).await? {
+                Some(b) => b,
+                None => continue, // tombstone race — skip defensively
+            };
 
-                self.stats.scanned_docs += 1;
-                self.stats.scanned_bytes += body_bytes.len();
+            let doc = decode_document(&body_bytes)
+                .map_err(|e| std::io::Error::other(e))?;
 
-                let doc = match decode_document(&body_bytes) {
-                    Ok(d) => d,
-                    Err(e) => return Some(Err(std::io::Error::other(e))),
-                };
-
-                // Apply post-filter
-                if let Some(ref filter) = self.post_filter {
-                    if !filter_matches(&doc, filter) {
-                        continue;
-                    }
+            // Apply post-filter
+            if let Some(ref filter) = post_filter {
+                if !filter_matches(&doc, filter) {
+                    continue;
                 }
+            }
 
-                self.stats.returned_docs += 1;
-                return Some(Ok(ScanRow {
-                    doc_id,
-                    version_ts,
-                    doc,
-                }));
-            },
+            returned += 1;
+            yield ScanRow {
+                doc_id,
+                version_ts,
+                doc,
+            };
         }
     }
 }

@@ -110,15 +110,17 @@ pub fn ConsoleModule() -> Element {
                                     sep = if p2.is_empty() { "" } else { ", " });
 
                                 if let Some(db) = db {
-                                    let result = execute_command(&db, &tgt, &mth, &p1, &p2);
-                                    let (result_text, success) = match result {
-                                        Ok(s) => (s, true),
-                                        Err(e) => (e, false),
-                                    };
-                                    history.write().push(ConsoleLine {
-                                        command: cmd,
-                                        result: result_text,
-                                        success,
+                                    spawn(async move {
+                                        let result = execute_command(&db, &tgt, &mth, &p1, &p2).await;
+                                        let (result_text, success) = match result {
+                                            Ok(s) => (s, true),
+                                            Err(e) => (e, false),
+                                        };
+                                        history.write().push(ConsoleLine {
+                                            command: cmd,
+                                            result: result_text,
+                                            success,
+                                        });
                                     });
                                 }
                             },
@@ -161,7 +163,7 @@ pub fn ConsoleModule() -> Element {
     }
 }
 
-fn execute_command(
+async fn execute_command(
     db: &crate::engine::DbHandle,
     target: &str,
     method: &str,
@@ -170,7 +172,7 @@ fn execute_command(
 ) -> Result<String, String> {
     match (target, method) {
         ("storage", "file_header") => {
-            let fh = db.read_file_header();
+            let fh = db.read_file_header().await;
             Ok(format!(
                 "FileHeader {{ magic: 0x{:08X}, version: {}, page_size: {}, page_count: {}, \
                  free_list_head: {}, catalog_root: {}, checkpoint_lsn: {}, generation: {} }}",
@@ -186,7 +188,7 @@ fn execute_command(
         }
         ("storage", "page_count") => Ok(format!("{}", db.page_count())),
         ("storage", "create_btree") => {
-            db.create_btree()
+            db.create_btree().await
                 .map(|root| format!("BTreeHandle {{ root_page: {root} }}"))
                 .map_err(|e| e.to_string())
         }
@@ -194,7 +196,7 @@ fn execute_command(
         ("btree", "scan") => {
             let root = p1.parse::<u32>().map_err(|_| "Invalid root page".to_string())?;
             let limit = p2.parse::<usize>().unwrap_or(20);
-            let entries = db.btree_scan(root, limit).map_err(|e| e.to_string())?;
+            let entries = db.btree_scan(root, limit).await.map_err(|e| e.to_string())?;
             let lines: Vec<String> = entries
                 .iter()
                 .map(|(k, v)| format!("  {} -> {} bytes", hex_short(k), v.len()))
@@ -204,7 +206,7 @@ fn execute_command(
         ("btree", "get") => {
             let root = p1.parse::<u32>().map_err(|_| "Invalid root page".to_string())?;
             let key = parse_hex(p2).ok_or("Invalid hex key")?;
-            match db.btree_get(root, &key).map_err(|e| e.to_string())? {
+            match db.btree_get(root, &key).await.map_err(|e| e.to_string())? {
                 Some(v) => Ok(format!("{} bytes: {}", v.len(), hex_short(&v))),
                 None => Ok("Not found".into()),
             }
@@ -218,20 +220,20 @@ fn execute_command(
             }
             let key = parse_hex(parts[0]).ok_or("Invalid hex key")?;
             let value = parse_hex(parts[1]).ok_or("Invalid hex value")?;
-            db.btree_insert(root, &key, &value)
+            db.btree_insert(root, &key, &value).await
                 .map(|_| "OK".into())
                 .map_err(|e| e.to_string())
         }
         ("btree", "delete") => {
             let root = p1.parse::<u32>().map_err(|_| "Invalid root page".to_string())?;
             let key = parse_hex(p2).ok_or("Invalid hex key")?;
-            db.btree_delete(root, &key)
+            db.btree_delete(root, &key).await
                 .map(|existed| if existed { "Deleted" } else { "Key not found" }.into())
                 .map_err(|e| e.to_string())
         }
         ("page", "read") => {
             let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
-            let info = db.read_page(page_id).map_err(|e| e.to_string())?;
+            let info = db.read_page(page_id).await.map_err(|e| e.to_string())?;
             let type_name = info
                 .page_type
                 .map(|pt| format!("{pt:?}"))
@@ -253,14 +255,14 @@ fn execute_command(
                 "Free" | "free" => exdb_storage::page::PageType::Free,
                 _ => return Err("Unknown page type. Use: BTreeLeaf, BTreeInternal, Heap, Overflow, Free".into()),
             };
-            db.init_page(page_id, pt)
+            db.init_page(page_id, pt).await
                 .map(|_| format!("Page #{page_id} initialized as {p2}"))
                 .map_err(|e| e.to_string())
         }
         ("page", "insert_slot") => {
             let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
             let data = parse_hex(p2).ok_or("Invalid hex data")?;
-            db.insert_slot(page_id, &data)
+            db.insert_slot(page_id, &data).await
                 .map(|slot_id| format!("Inserted slot #{slot_id}"))
                 .map_err(|e| e.to_string())
         }
@@ -273,31 +275,31 @@ fn execute_command(
             }
             let slot_id = parts[0].parse::<u16>().map_err(|_| "Invalid slot ID")?;
             let data = parse_hex(parts[1]).ok_or("Invalid hex data")?;
-            db.update_slot(page_id, slot_id, &data)
+            db.update_slot(page_id, slot_id, &data).await
                 .map(|_| format!("Updated slot #{slot_id}"))
                 .map_err(|e| e.to_string())
         }
         ("page", "delete_slot") => {
             let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
             let slot_id = p2.parse::<u16>().map_err(|_| "Invalid slot ID".to_string())?;
-            db.delete_slot(page_id, slot_id)
+            db.delete_slot(page_id, slot_id).await
                 .map(|_| format!("Deleted slot #{slot_id}"))
                 .map_err(|e| e.to_string())
         }
         ("page", "compact") => {
             let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
-            db.compact_page(page_id)
+            db.compact_page(page_id).await
                 .map(|_| "Compacted".into())
                 .map_err(|e| e.to_string())
         }
         ("page", "stamp_checksum") => {
             let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
-            db.stamp_checksum(page_id)
+            db.stamp_checksum(page_id).await
                 .map(|_| "Checksum stamped".into())
                 .map_err(|e| e.to_string())
         }
         ("freelist", "walk") => {
-            let info = db.walk_free_list().map_err(|e| e.to_string())?;
+            let info = db.walk_free_list().await.map_err(|e| e.to_string())?;
             if info.chain.is_empty() {
                 Ok("Free list is empty".into())
             } else {
@@ -306,20 +308,20 @@ fn execute_command(
             }
         }
         ("freelist", "allocate") => {
-            db.free_list_allocate()
+            db.free_list_allocate().await
                 .map(|id| format!("Allocated page #{id}"))
                 .map_err(|e| e.to_string())
         }
         ("freelist", "deallocate") => {
             let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
-            db.free_list_deallocate(page_id)
+            db.free_list_deallocate(page_id).await
                 .map(|_| format!("Deallocated page #{page_id}"))
                 .map_err(|e| e.to_string())
         }
         ("heap", "load") => {
             let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
             let slot_id = p2.parse::<u16>().map_err(|_| "Invalid slot ID".to_string())?;
-            let data = db.heap_load(page_id, slot_id).map_err(|e| e.to_string())?;
+            let data = db.heap_load(page_id, slot_id).await.map_err(|e| e.to_string())?;
             if let Ok(text) = std::str::from_utf8(&data) {
                 Ok(format!("{} bytes: {}", data.len(), &text[..text.len().min(200)]))
             } else {
@@ -332,18 +334,18 @@ fn execute_command(
             } else {
                 parse_hex(p1).ok_or("Invalid hex data")?
             };
-            let (page_id, slot_id) = db.heap_store(&data).map_err(|e| e.to_string())?;
+            let (page_id, slot_id) = db.heap_store(&data).await.map_err(|e| e.to_string())?;
             Ok(format!("HeapRef {{ page: {page_id}, slot: {slot_id} }}"))
         }
         ("heap", "free") => {
             let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
             let slot_id = p2.parse::<u16>().map_err(|_| "Invalid slot ID".to_string())?;
-            db.heap_free(page_id, slot_id)
+            db.heap_free(page_id, slot_id).await
                 .map(|_| "Freed".into())
                 .map_err(|e| e.to_string())
         }
         ("catalog", "list") => {
-            let cols = db.list_collections().map_err(|e| e.to_string())?;
+            let cols = db.list_collections().await.map_err(|e| e.to_string())?;
             if cols.is_empty() {
                 Ok("No collections".into())
             } else {
@@ -358,14 +360,14 @@ fn execute_command(
             if p1.is_empty() {
                 return Err("Name required in param1".into());
             }
-            db.catalog_create_collection(p1)
+            db.catalog_create_collection(p1).await
                 .map(|info| format!("Created '{}' (id={}, root={})", info.name, info.id, info.data_root_page))
                 .map_err(|e| e.to_string())
         }
         ("catalog", "drop_collection") => {
             let col_id = p1.parse::<u64>().map_err(|_| "Invalid collection ID in param1".to_string())?;
             let name = if p2.is_empty() { "unknown" } else { p2 };
-            db.catalog_drop_collection(col_id, name)
+            db.catalog_drop_collection(col_id, name).await
                 .map(|_| format!("Dropped collection #{col_id}"))
                 .map_err(|e| e.to_string())
         }
@@ -381,13 +383,13 @@ fn execute_command(
                 .split(',')
                 .map(|f| f.trim().split('.').map(|s| s.to_string()).collect())
                 .collect();
-            db.catalog_create_index(col_id, name, field_paths)
+            db.catalog_create_index(col_id, name, field_paths).await
                 .map(|info| format!("Created index '{}' (id={}, root={})", info.name, info.id, info.root_page))
                 .map_err(|e| e.to_string())
         }
         ("catalog", "drop_index") => {
             let idx_id = p1.parse::<u64>().map_err(|_| "Invalid index ID in param1".to_string())?;
-            db.catalog_drop_index(idx_id)
+            db.catalog_drop_index(idx_id).await
                 .map(|_| format!("Dropped index #{idx_id}"))
                 .map_err(|e| e.to_string())
         }
@@ -398,7 +400,7 @@ fn execute_command(
             } else {
                 p2.parse::<u64>().map_err(|_| "Invalid read_ts in param2".to_string())?
             };
-            let entries = db.docstore_scan(root, read_ts, 50).map_err(|e| e.to_string())?;
+            let entries = db.docstore_scan(root, read_ts, 50).await.map_err(|e| e.to_string())?;
             if entries.is_empty() {
                 Ok("No visible documents".into())
             } else {
@@ -417,7 +419,7 @@ fn execute_command(
                 return Err("Format: root_page:doc_id_hex".into());
             }
             let root = parts[0].parse::<u32>().map_err(|_| "Invalid root page".to_string())?;
-            let versions = db.docstore_versions(root, parts[1]).map_err(|e| e.to_string())?;
+            let versions = db.docstore_versions(root, parts[1]).await.map_err(|e| e.to_string())?;
             if versions.is_empty() {
                 Ok("No versions found".into())
             } else {
@@ -455,7 +457,7 @@ fn execute_command(
                 (p2, u64::MAX)
             };
 
-            let hits = db.secondary_scan(sec_root, primary_root, scalars_json, read_ts, 50)
+            let hits = db.secondary_scan(sec_root, primary_root, scalars_json, read_ts, 50).await
                 .map_err(|e| e.to_string())?;
             if hits.is_empty() {
                 Ok("No results".into())

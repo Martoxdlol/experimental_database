@@ -12,6 +12,7 @@ use exdb_core::field_path::FieldPath;
 use exdb_core::types::Ts;
 use exdb_storage::btree::ScanDirection;
 use std::sync::Arc;
+use tokio_stream::StreamExt;
 
 /// Progress report emitted periodically during build.
 #[derive(Debug, Clone)]
@@ -52,11 +53,11 @@ impl IndexBuilder {
         progress_tx: Option<tokio::sync::watch::Sender<BuildProgress>>,
     ) -> Result<u64, std::io::Error> {
         let start = std::time::Instant::now();
-        let scanner = self.primary.scan_at_ts(build_snapshot_ts, ScanDirection::Forward);
+        let mut scanner = self.primary.scan_at_ts(build_snapshot_ts, ScanDirection::Forward);
         let mut entries_inserted: u64 = 0;
         let mut docs_scanned: u64 = 0;
 
-        for result in scanner {
+        while let Some(result) = scanner.next().await {
             let (doc_id, version_ts, body_bytes) = result?;
             docs_scanned += 1;
 
@@ -68,7 +69,7 @@ impl IndexBuilder {
 
             for prefix in key_prefixes {
                 let full_key = make_secondary_key_from_prefix(&prefix, &doc_id, version_ts);
-                self.secondary.insert_entry(&full_key)?;
+                self.secondary.insert_entry(&full_key).await?;
                 entries_inserted += 1;
             }
 
@@ -95,11 +96,11 @@ mod tests {
     use exdb_core::types::DocId;
     use exdb_storage::engine::{StorageConfig, StorageEngine};
 
-    fn setup() -> (Arc<StorageEngine>, Arc<PrimaryIndex>, Arc<SecondaryIndex>) {
-        let engine = Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).unwrap());
-        let primary_btree = engine.create_btree().unwrap();
+    async fn setup() -> (Arc<StorageEngine>, Arc<PrimaryIndex>, Arc<SecondaryIndex>) {
+        let engine = Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap());
+        let primary_btree = engine.create_btree().await.unwrap();
         let primary = Arc::new(PrimaryIndex::new(primary_btree, engine.clone(), 4096));
-        let sec_btree = engine.create_btree().unwrap();
+        let sec_btree = engine.create_btree().await.unwrap();
         let sec = Arc::new(SecondaryIndex::new(sec_btree, primary.clone()));
         (engine, primary, sec)
     }
@@ -112,7 +113,7 @@ mod tests {
 
     #[tokio::test]
     async fn build_empty_collection() {
-        let (_engine, primary, secondary) = setup();
+        let (_engine, primary, secondary) = setup().await;
         let builder =
             IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
         let count = builder.build(10, None).await.unwrap();
@@ -121,12 +122,12 @@ mod tests {
 
     #[tokio::test]
     async fn build_single_doc() {
-        let (_engine, primary, secondary) = setup();
+        let (_engine, primary, secondary) = setup().await;
         let doc = serde_json::json!({"name": "Alice"});
         let body = encode_document(&doc);
         primary
             .insert_version(&doc_id(1), 5, Some(&body))
-            .unwrap();
+            .await.unwrap();
 
         let builder =
             IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
@@ -136,13 +137,13 @@ mod tests {
 
     #[tokio::test]
     async fn build_multiple_docs() {
-        let (_engine, primary, secondary) = setup();
+        let (_engine, primary, secondary) = setup().await;
         for i in 0..10u8 {
             let doc = serde_json::json!({"name": format!("user_{i}")});
             let body = encode_document(&doc);
             primary
                 .insert_version(&doc_id(i), 5, Some(&body))
-                .unwrap();
+                .await.unwrap();
         }
 
         let builder =
@@ -153,12 +154,12 @@ mod tests {
 
     #[tokio::test]
     async fn build_with_array() {
-        let (_engine, primary, secondary) = setup();
+        let (_engine, primary, secondary) = setup().await;
         let doc = serde_json::json!({"tags": ["a", "b", "c"]});
         let body = encode_document(&doc);
         primary
             .insert_version(&doc_id(1), 5, Some(&body))
-            .unwrap();
+            .await.unwrap();
 
         let builder =
             IndexBuilder::new(primary, secondary, vec![FieldPath::single("tags")]);
@@ -168,15 +169,15 @@ mod tests {
 
     #[tokio::test]
     async fn build_snapshot_isolation() {
-        let (_engine, primary, secondary) = setup();
+        let (_engine, primary, secondary) = setup().await;
         let doc1 = serde_json::json!({"name": "Alice"});
         let doc2 = serde_json::json!({"name": "Bob"});
         primary
             .insert_version(&doc_id(1), 5, Some(&encode_document(&doc1)))
-            .unwrap();
+            .await.unwrap();
         primary
             .insert_version(&doc_id(2), 10, Some(&encode_document(&doc2)))
-            .unwrap();
+            .await.unwrap();
 
         // Build at snapshot_ts=7, should only see doc1
         let builder =
@@ -187,12 +188,12 @@ mod tests {
 
     #[tokio::test]
     async fn build_skips_tombstones() {
-        let (_engine, primary, secondary) = setup();
+        let (_engine, primary, secondary) = setup().await;
         let doc = serde_json::json!({"name": "Alice"});
         primary
             .insert_version(&doc_id(1), 5, Some(&encode_document(&doc)))
-            .unwrap();
-        primary.insert_version(&doc_id(1), 8, None).unwrap(); // tombstone
+            .await.unwrap();
+        primary.insert_version(&doc_id(1), 8, None).await.unwrap(); // tombstone
 
         let builder =
             IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
@@ -202,12 +203,12 @@ mod tests {
 
     #[tokio::test]
     async fn build_with_progress() {
-        let (_engine, primary, secondary) = setup();
+        let (_engine, primary, secondary) = setup().await;
         for i in 0..5u8 {
             let doc = serde_json::json!({"name": format!("user_{i}")});
             primary
                 .insert_version(&doc_id(i), 5, Some(&encode_document(&doc)))
-                .unwrap();
+                .await.unwrap();
         }
 
         let (tx, mut rx) = tokio::sync::watch::channel(BuildProgress {

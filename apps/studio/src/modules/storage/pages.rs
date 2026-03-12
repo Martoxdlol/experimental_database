@@ -24,10 +24,7 @@ pub fn PagesModule() -> Element {
         let _rev = *state.revision.read();
         let db = db.clone();
         async move {
-            tokio::task::spawn_blocking(move || db.scan_page_types())
-                .await
-                .ok()
-                .and_then(|r| r.ok())
+            db.scan_page_types().await.ok()
         }
     });
 
@@ -146,10 +143,7 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
         let _rev = *state.revision.read();
         let db = db.clone();
         async move {
-            tokio::task::spawn_blocking(move || db.read_page(page_id))
-                .await
-                .ok()
-                .and_then(|r| r.ok())
+            db.read_page(page_id).await.ok()
         }
     });
 
@@ -332,17 +326,19 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
                                                                     onclick: move |e| {
                                                                         e.stop_propagation();
                                                                         let db = state.db.read().clone();
-                                                                        if let Some(db) = db {
-                                                                            match db.delete_slot(page_id, idx) {
-                                                                                Ok(()) => {
-                                                                                    state.last_result.set(Some(OperationResult::Success(
-                                                                                        format!("Deleted slot #{idx}")
-                                                                                    )));
-                                                                                    state.notify_mutation();
+                                                                        spawn(async move {
+                                                                            if let Some(db) = db {
+                                                                                match db.delete_slot(page_id, idx).await {
+                                                                                    Ok(()) => {
+                                                                                        state.last_result.set(Some(OperationResult::Success(
+                                                                                            format!("Deleted slot #{idx}")
+                                                                                        )));
+                                                                                        state.notify_mutation();
+                                                                                    }
+                                                                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                                                 }
-                                                                                Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                                             }
-                                                                        }
+                                                                        });
                                                                     },
                                                                     "\u{2717}"
                                                                 }
@@ -369,15 +365,17 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
                                     class: "btn btn-action",
                                     onclick: move |_| {
                                         let db = state.db.read().clone();
-                                        if let Some(db) = db {
-                                            match db.compact_page(page_id) {
-                                                Ok(()) => {
-                                                    state.last_result.set(Some(OperationResult::Success("Page compacted".into())));
-                                                    state.notify_mutation();
+                                        spawn(async move {
+                                            if let Some(db) = db {
+                                                match db.compact_page(page_id).await {
+                                                    Ok(()) => {
+                                                        state.last_result.set(Some(OperationResult::Success("Page compacted".into())));
+                                                        state.notify_mutation();
+                                                    }
+                                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                 }
-                                                Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                             }
-                                        }
+                                        });
                                     },
                                     "Compact"
                                 }
@@ -385,15 +383,17 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
                                     class: "btn btn-action",
                                     onclick: move |_| {
                                         let db = state.db.read().clone();
-                                        if let Some(db) = db {
-                                            match db.stamp_checksum(page_id) {
-                                                Ok(()) => {
-                                                    state.last_result.set(Some(OperationResult::Success("Checksum stamped".into())));
-                                                    state.notify_mutation();
+                                        spawn(async move {
+                                            if let Some(db) = db {
+                                                match db.stamp_checksum(page_id).await {
+                                                    Ok(()) => {
+                                                        state.last_result.set(Some(OperationResult::Success("Checksum stamped".into())));
+                                                        state.notify_mutation();
+                                                    }
+                                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                                 }
-                                                Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                             }
-                                        }
+                                        });
                                     },
                                     "Stamp Checksum"
                                 }
@@ -489,19 +489,21 @@ fn InsertSlotForm(page_id: u32) -> Element {
                         };
                         if let Some(data) = data {
                             let db = state.db.read().clone();
-                            if let Some(db) = db {
-                                match db.insert_slot(page_id, &data) {
-                                    Ok(slot_id) => {
-                                        state.last_result.set(Some(OperationResult::Success(
-                                            format!("Inserted slot #{slot_id} ({} bytes)", data.len())
-                                        )));
-                                        state.notify_mutation();
-                                        hex_input.set(String::new());
-                                        text_input.set(String::new());
+                            spawn(async move {
+                                if let Some(db) = db {
+                                    match db.insert_slot(page_id, &data).await {
+                                        Ok(slot_id) => {
+                                            state.last_result.set(Some(OperationResult::Success(
+                                                format!("Inserted slot #{slot_id} ({} bytes)", data.len())
+                                            )));
+                                            state.notify_mutation();
+                                            hex_input.set(String::new());
+                                            text_input.set(String::new());
+                                        }
+                                        Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                     }
-                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                 }
-                            }
+                            });
                         } else {
                             state.last_result.set(Some(OperationResult::Error("Invalid hex input".into())));
                         }
@@ -535,18 +537,20 @@ fn UpdateSlotForm(page_id: u32, slot_index: u16) -> Element {
                         let h = hex_input.read().clone();
                         if let Some(data) = parse_hex_bytes(&h) {
                             let db = state.db.read().clone();
-                            if let Some(db) = db {
-                                match db.update_slot(page_id, slot_index, &data) {
-                                    Ok(()) => {
-                                        state.last_result.set(Some(OperationResult::Success(
-                                            format!("Updated slot #{slot_index}")
-                                        )));
-                                        state.notify_mutation();
-                                        hex_input.set(String::new());
+                            spawn(async move {
+                                if let Some(db) = db {
+                                    match db.update_slot(page_id, slot_index, &data).await {
+                                        Ok(()) => {
+                                            state.last_result.set(Some(OperationResult::Success(
+                                                format!("Updated slot #{slot_index}")
+                                            )));
+                                            state.notify_mutation();
+                                            hex_input.set(String::new());
+                                        }
+                                        Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                     }
-                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                 }
-                            }
+                            });
                         } else {
                             state.last_result.set(Some(OperationResult::Error("Invalid hex input".into())));
                         }
@@ -594,17 +598,19 @@ fn InitPageForm(page_id: u32) -> Element {
                                 _ => return,
                             };
                             let db = state.db.read().clone();
-                            if let Some(db) = db {
-                                match db.init_page(page_id, pt) {
-                                    Ok(()) => {
-                                        state.last_result.set(Some(OperationResult::Success(
-                                            format!("Page #{page_id} re-initialized as {pt_name}")
-                                        )));
-                                        state.notify_mutation();
+                            spawn(async move {
+                                if let Some(db) = db {
+                                    match db.init_page(page_id, pt).await {
+                                        Ok(()) => {
+                                            state.last_result.set(Some(OperationResult::Success(
+                                                format!("Page #{page_id} re-initialized as {pt_name}")
+                                            )));
+                                            state.notify_mutation();
+                                        }
+                                        Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                     }
-                                    Err(e) => state.last_result.set(Some(OperationResult::Error(e.to_string()))),
                                 }
-                            }
+                            });
                         },
                         "Re-Initialize (destructive)"
                     }

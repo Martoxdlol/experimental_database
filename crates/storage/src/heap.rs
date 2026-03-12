@@ -90,7 +90,7 @@ impl Heap {
     ///
     /// Always uses the overflow header format (flags + total_length + overflow_page + chunk).
     /// When no overflow is needed, flags=0 and overflow_page=0.
-    pub fn store(&mut self, data: &[u8], free_list: &mut FreeList) -> io::Result<HeapRef> {
+    pub async fn store(&mut self, data: &[u8], free_list: &mut FreeList) -> io::Result<HeapRef> {
         let page_size = self.buffer_pool.page_storage().page_size();
 
         // Maximum data per heap page slot (one slot):
@@ -123,7 +123,7 @@ impl Heap {
         let first_overflow_page = if remaining_data.is_empty() {
             0u32
         } else {
-            self.build_overflow_chain(remaining_data, overflow_page_capacity, free_list)?
+            self.build_overflow_chain(remaining_data, overflow_page_capacity, free_list).await?
         };
 
         // Build the heap slot payload
@@ -144,10 +144,10 @@ impl Heap {
         let needed_space = slot_payload_len + SLOT_ENTRY_SIZE;
 
         // Find or allocate a heap page with enough space
-        let heap_page_id = self.find_or_allocate_heap_page(needed_space, free_list)?;
+        let heap_page_id = self.find_or_allocate_heap_page(needed_space, free_list).await?;
 
         // Insert the slot
-        let mut guard = self.buffer_pool.fetch_page_exclusive(heap_page_id)?;
+        let mut guard = self.buffer_pool.fetch_page_exclusive(heap_page_id).await?;
         let slot_id = {
             let buf = guard.data_mut();
             let mut page = SlottedPage::from_buf(buf)?;
@@ -172,48 +172,51 @@ impl Heap {
     }
 
     /// Load a blob by reference. Reassembles overflow chains.
-    pub fn load(&self, href: HeapRef) -> io::Result<Vec<u8>> {
-        let guard = self.buffer_pool.fetch_page_shared(href.page_id)?;
-        let page = SlottedPageRef::from_buf(guard.data())?;
+    pub async fn load(&self, href: HeapRef) -> io::Result<Vec<u8>> {
+        // Read first page in a block so !Send guard is dropped before any further .await
+        let (flags, total_length, overflow_page, mut result) = {
+            let guard = self.buffer_pool.fetch_page_shared(href.page_id).await?;
+            let page = SlottedPageRef::from_buf(guard.data())?;
 
-        if href.slot_id >= page.num_slots() {
-            return Err(crate::error::StorageError::Corruption(format!(
-                "slot {} out of range (num_slots {}) on page {}",
-                href.slot_id,
-                page.num_slots(),
-                href.page_id,
-            )).into());
-        }
+            if href.slot_id >= page.num_slots() {
+                return Err(crate::error::StorageError::Corruption(format!(
+                    "slot {} out of range (num_slots {}) on page {}",
+                    href.slot_id,
+                    page.num_slots(),
+                    href.page_id,
+                )).into());
+            }
 
-        let slot_data = page.slot_data(href.slot_id);
-        if slot_data.is_empty() {
-            return Err(crate::error::StorageError::Corruption(format!(
-                "slot {} on page {} is deleted (tombstone)",
-                href.slot_id, href.page_id,
-            )).into());
-        }
+            let slot_data = page.slot_data(href.slot_id);
+            if slot_data.is_empty() {
+                return Err(crate::error::StorageError::Corruption(format!(
+                    "slot {} on page {} is deleted (tombstone)",
+                    href.slot_id, href.page_id,
+                )).into());
+            }
 
-        if slot_data.len() < HEAP_SLOT_HEADER_SIZE {
-            return Err(crate::error::StorageError::DataTruncated {
-                offset: 0,
-                needed: HEAP_SLOT_HEADER_SIZE,
-                available: slot_data.len(),
-            }.into());
-        }
+            if slot_data.len() < HEAP_SLOT_HEADER_SIZE {
+                return Err(crate::error::StorageError::DataTruncated {
+                    offset: 0,
+                    needed: HEAP_SLOT_HEADER_SIZE,
+                    available: slot_data.len(),
+                }.into());
+            }
 
-        // Parse heap slot header
-        let flags = slot_data[0];
-        let total_length =
-            u32::from_le_bytes([slot_data[1], slot_data[2], slot_data[3], slot_data[4]]) as usize;
-        let overflow_page =
-            u32::from_le_bytes([slot_data[5], slot_data[6], slot_data[7], slot_data[8]]);
-        let first_chunk = &slot_data[HEAP_SLOT_HEADER_SIZE..];
+            // Parse heap slot header
+            let flags = slot_data[0];
+            let total_length =
+                u32::from_le_bytes([slot_data[1], slot_data[2], slot_data[3], slot_data[4]]) as usize;
+            let overflow_page =
+                u32::from_le_bytes([slot_data[5], slot_data[6], slot_data[7], slot_data[8]]);
+            let first_chunk = &slot_data[HEAP_SLOT_HEADER_SIZE..];
 
-        let mut result = Vec::with_capacity(total_length);
-        result.extend_from_slice(first_chunk);
+            let mut result = Vec::with_capacity(total_length);
+            result.extend_from_slice(first_chunk);
 
-        drop(page);
-        drop(guard);
+            (flags, total_length, overflow_page, result)
+            // guard and page dropped here
+        };
 
         // Follow overflow chain if present
         if flags & HAS_OVERFLOW != 0 {
@@ -228,46 +231,53 @@ impl Heap {
                     ).into());
                 }
 
-                let ov_guard = self.buffer_pool.fetch_page_shared(next_page)?;
-                let ov_page = SlottedPageRef::from_buf(ov_guard.data())?;
+                // Extract all data from the overflow page and drop the guard
+                // before the next loop iteration's .await to keep the future Send.
+                let (next_overflow, chunk) = {
+                    let ov_guard = self.buffer_pool.fetch_page_shared(next_page).await?;
+                    let ov_page = SlottedPageRef::from_buf(ov_guard.data())?;
 
-                // Validate page type
-                if ov_page.page_type_checked()? != PageType::Overflow {
-                    return Err(crate::error::StorageError::Corruption(format!(
-                        "expected overflow page at {}, got {:?}", next_page, ov_page.page_type_checked()
-                    )).into());
-                }
+                    // Validate page type
+                    if ov_page.page_type_checked()? != PageType::Overflow {
+                        return Err(crate::error::StorageError::Corruption(format!(
+                            "expected overflow page at {}, got {:?}", next_page, ov_page.page_type_checked()
+                        )).into());
+                    }
 
-                // next_overflow_page is stored in prev_or_ptr
-                let next_overflow = ov_page.prev_or_ptr();
+                    // next_overflow_page is stored in prev_or_ptr
+                    let next_overflow = ov_page.prev_or_ptr();
 
-                // Read data_length (u32 LE) at PAGE_HEADER_SIZE offset
-                let buf = ov_guard.data();
-                if buf.len() < PAGE_HEADER_SIZE + OVERFLOW_DATA_LEN_SIZE {
-                    return Err(crate::error::StorageError::DataTruncated {
-                        offset: PAGE_HEADER_SIZE,
-                        needed: OVERFLOW_DATA_LEN_SIZE,
-                        available: buf.len().saturating_sub(PAGE_HEADER_SIZE),
-                    }.into());
-                }
-                let data_len = u32::from_le_bytes([
-                    buf[PAGE_HEADER_SIZE],
-                    buf[PAGE_HEADER_SIZE + 1],
-                    buf[PAGE_HEADER_SIZE + 2],
-                    buf[PAGE_HEADER_SIZE + 3],
-                ]) as usize;
+                    // Read data_length (u32 LE) at PAGE_HEADER_SIZE offset
+                    let buf = ov_guard.data();
+                    if buf.len() < PAGE_HEADER_SIZE + OVERFLOW_DATA_LEN_SIZE {
+                        return Err(crate::error::StorageError::DataTruncated {
+                            offset: PAGE_HEADER_SIZE,
+                            needed: OVERFLOW_DATA_LEN_SIZE,
+                            available: buf.len().saturating_sub(PAGE_HEADER_SIZE),
+                        }.into());
+                    }
+                    let data_len = u32::from_le_bytes([
+                        buf[PAGE_HEADER_SIZE],
+                        buf[PAGE_HEADER_SIZE + 1],
+                        buf[PAGE_HEADER_SIZE + 2],
+                        buf[PAGE_HEADER_SIZE + 3],
+                    ]) as usize;
 
-                let data_start = PAGE_HEADER_SIZE + OVERFLOW_DATA_LEN_SIZE;
-                let data_end = data_start + data_len;
-                if data_end > buf.len() {
-                    return Err(crate::error::StorageError::Corruption(format!(
-                        "overflow page {} data_length {} exceeds page bounds",
-                        next_page, data_len
-                    )).into());
-                }
+                    let data_start = PAGE_HEADER_SIZE + OVERFLOW_DATA_LEN_SIZE;
+                    let data_end = data_start + data_len;
+                    if data_end > buf.len() {
+                        return Err(crate::error::StorageError::Corruption(format!(
+                            "overflow page {} data_length {} exceeds page bounds",
+                            next_page, data_len
+                        )).into());
+                    }
 
-                result.extend_from_slice(&buf[data_start..data_end]);
+                    let chunk = buf[data_start..data_end].to_vec();
+                    (next_overflow, chunk)
+                    // ov_guard and ov_page dropped here
+                };
 
+                result.extend_from_slice(&chunk);
                 next_page = next_overflow;
             }
         }
@@ -285,10 +295,10 @@ impl Heap {
     }
 
     /// Free a blob and reclaim its pages.
-    pub fn free(&mut self, href: HeapRef, free_list: &mut FreeList) -> io::Result<()> {
+    pub async fn free(&mut self, href: HeapRef, free_list: &mut FreeList) -> io::Result<()> {
         // Read the slot to find overflow chain info
         let (flags, overflow_page) = {
-            let guard = self.buffer_pool.fetch_page_shared(href.page_id)?;
+            let guard = self.buffer_pool.fetch_page_shared(href.page_id).await?;
             let page = SlottedPageRef::from_buf(guard.data())?;
 
             if href.slot_id >= page.num_slots() {
@@ -338,19 +348,19 @@ impl Heap {
 
                 // Read the next pointer before deallocating
                 let next_overflow = {
-                    let guard = self.buffer_pool.fetch_page_shared(next_page)?;
+                    let guard = self.buffer_pool.fetch_page_shared(next_page).await?;
                     let page = SlottedPageRef::from_buf(guard.data())?;
                     page.prev_or_ptr()
                 };
 
-                free_list.deallocate(next_page)?;
+                free_list.deallocate(next_page).await?;
                 next_page = next_overflow;
             }
         }
 
         // Delete the slot in the heap page
         let should_deallocate_page = {
-            let mut guard = self.buffer_pool.fetch_page_exclusive(href.page_id)?;
+            let mut guard = self.buffer_pool.fetch_page_exclusive(href.page_id).await?;
             {
                 let buf = guard.data_mut();
                 let mut page = SlottedPage::from_buf(buf)?;
@@ -376,7 +386,7 @@ impl Heap {
 
         if should_deallocate_page {
             self.free_space_map.remove(&href.page_id);
-            free_list.deallocate(href.page_id)?;
+            free_list.deallocate(href.page_id).await?;
         }
 
         Ok(())
@@ -386,13 +396,13 @@ impl Heap {
     ///
     /// Called on startup after recovery. Iterates all pages (0..page_count),
     /// checks each page header; if page_type == Heap, records (page_id, free_space).
-    pub fn rebuild_free_space_map(&mut self) -> io::Result<()> {
+    pub async fn rebuild_free_space_map(&mut self) -> io::Result<()> {
         self.free_space_map.clear();
 
         let page_count = self.buffer_pool.page_storage().page_count();
 
         for pid in 0..page_count as PageId {
-            let guard = self.buffer_pool.fetch_page_shared(pid)?;
+            let guard = self.buffer_pool.fetch_page_shared(pid).await?;
             let page = SlottedPageRef::from_buf(guard.data())?;
 
             if page.page_type_checked()? == PageType::Heap {
@@ -411,7 +421,7 @@ impl Heap {
     ///
     /// Pages are allocated and written back-to-front: the last overflow page
     /// is written first (with next=0), then the second-to-last (with next=last), etc.
-    fn build_overflow_chain(
+    async fn build_overflow_chain(
         &self,
         data: &[u8],
         overflow_page_capacity: usize,
@@ -430,7 +440,7 @@ impl Heap {
         let mut next_page: PageId = 0;
 
         for chunk in chunks.iter().rev() {
-            let ov_page_id = free_list.allocate()?;
+            let ov_page_id = free_list.allocate().await?;
 
             let mut guard = self.buffer_pool.new_page(ov_page_id)?;
             {
@@ -461,7 +471,7 @@ impl Heap {
     }
 
     /// Find a heap page with enough free space, or allocate a new one.
-    fn find_or_allocate_heap_page(
+    async fn find_or_allocate_heap_page(
         &mut self,
         needed_space: usize,
         free_list: &mut FreeList,
@@ -478,7 +488,7 @@ impl Heap {
         }
 
         // No existing page has enough space; allocate a new heap page
-        let page_id = free_list.allocate()?;
+        let page_id = free_list.allocate().await?;
 
         let mut guard = self.buffer_pool.new_page(page_id)?;
         {
@@ -510,15 +520,15 @@ mod tests {
 
     /// Helper: create MemoryPageStorage + BufferPool + FreeList + Heap.
     /// Page 0 is pre-allocated and reserved for the file header.
-    fn setup() -> (Heap, FreeList) {
+    async fn setup() -> (Heap, FreeList) {
         let storage = Arc::new(MemoryPageStorage::new(PAGE_SIZE));
-        storage.extend(1).unwrap(); // page 0 reserved
+        storage.extend(1).await.unwrap(); // page 0 reserved
 
         // Initialize page 0 as FileHeader so it's not confused during scans
         {
             let mut buf = vec![0u8; PAGE_SIZE];
             SlottedPage::init(&mut buf, 0, PageType::FileHeader);
-            storage.write_page(0, &buf).unwrap();
+            storage.write_page(0, &buf).await.unwrap();
         }
 
         let pool = Arc::new(BufferPool::new(
@@ -537,44 +547,44 @@ mod tests {
 
     // ─── Test 1: Store + load small blob ───
 
-    #[test]
-    fn test_store_load_small_blob() {
-        let (mut heap, mut free_list) = setup();
+    #[tokio::test]
+    async fn test_store_load_small_blob() {
+        let (mut heap, mut free_list) = setup().await;
 
         let data: Vec<u8> = (0..100).map(|i| (i % 256) as u8).collect();
-        let href = heap.store(&data, &mut free_list).unwrap();
-        let loaded = heap.load(href).unwrap();
+        let href = heap.store(&data, &mut free_list).await.unwrap();
+        let loaded = heap.load(href).await.unwrap();
 
         assert_eq!(loaded, data);
     }
 
     // ─── Test 2: Store + load page-sized blob ───
 
-    #[test]
-    fn test_store_load_page_sized_blob() {
-        let (mut heap, mut free_list) = setup();
+    #[tokio::test]
+    async fn test_store_load_page_sized_blob() {
+        let (mut heap, mut free_list) = setup().await;
 
         // Maximum data that fits in one slot:
         // page_size - PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE - HEAP_SLOT_HEADER_SIZE
         let max_first_chunk = PAGE_SIZE - PAGE_HEADER_SIZE - SLOT_ENTRY_SIZE - HEAP_SLOT_HEADER_SIZE;
         let data: Vec<u8> = (0..max_first_chunk).map(|i| (i % 256) as u8).collect();
-        let href = heap.store(&data, &mut free_list).unwrap();
-        let loaded = heap.load(href).unwrap();
+        let href = heap.store(&data, &mut free_list).await.unwrap();
+        let loaded = heap.load(href).await.unwrap();
 
         assert_eq!(loaded, data);
     }
 
     // ─── Test 3: Store + load large blob (overflow) ───
 
-    #[test]
-    fn test_store_load_large_blob() {
-        let (mut heap, mut free_list) = setup();
+    #[tokio::test]
+    async fn test_store_load_large_blob() {
+        let (mut heap, mut free_list) = setup().await;
 
         // 50 KB blob - requires overflow
         let size = 50 * 1024;
         let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
-        let href = heap.store(&data, &mut free_list).unwrap();
-        let loaded = heap.load(href).unwrap();
+        let href = heap.store(&data, &mut free_list).await.unwrap();
+        let loaded = heap.load(href).await.unwrap();
 
         assert_eq!(loaded.len(), data.len());
         assert_eq!(loaded, data);
@@ -582,15 +592,15 @@ mod tests {
 
     // ─── Test 4: Store + load maximum blob ───
 
-    #[test]
-    fn test_store_load_maximum_blob() {
-        let (mut heap, mut free_list) = setup();
+    #[tokio::test]
+    async fn test_store_load_maximum_blob() {
+        let (mut heap, mut free_list) = setup().await;
 
         // 1 MB blob with overflow chain
         let size = 1024 * 1024;
         let data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
-        let href = heap.store(&data, &mut free_list).unwrap();
-        let loaded = heap.load(href).unwrap();
+        let href = heap.store(&data, &mut free_list).await.unwrap();
+        let loaded = heap.load(href).await.unwrap();
 
         assert_eq!(loaded.len(), data.len());
         assert_eq!(loaded, data);
@@ -598,49 +608,49 @@ mod tests {
 
     // ─── Test 5: Free small blob ───
 
-    #[test]
-    fn test_free_small_blob() {
-        let (mut heap, mut free_list) = setup();
+    #[tokio::test]
+    async fn test_free_small_blob() {
+        let (mut heap, mut free_list) = setup().await;
 
         let data = vec![42u8; 100];
-        let href = heap.store(&data, &mut free_list).unwrap();
+        let href = heap.store(&data, &mut free_list).await.unwrap();
 
         // Verify it loads
-        assert_eq!(heap.load(href).unwrap(), data);
+        assert_eq!(heap.load(href).await.unwrap(), data);
 
         // Free it
-        heap.free(href, &mut free_list).unwrap();
+        heap.free(href, &mut free_list).await.unwrap();
 
         // Loading should now fail (slot is deleted/tombstone)
-        let result = heap.load(href);
+        let result = heap.load(href).await;
         assert!(result.is_err());
     }
 
     // ─── Test 6: Free large blob with overflow ───
 
-    #[test]
-    fn test_free_large_blob_with_overflow() {
-        let (mut heap, mut free_list) = setup();
+    #[tokio::test]
+    async fn test_free_large_blob_with_overflow() {
+        let (mut heap, mut free_list) = setup().await;
 
         // 50 KB blob requires overflow pages
         let data: Vec<u8> = (0..50 * 1024).map(|i| (i % 256) as u8).collect();
-        let href = heap.store(&data, &mut free_list).unwrap();
+        let href = heap.store(&data, &mut free_list).await.unwrap();
 
         // Count pages allocated (file extensions)
         let pages_before_free = heap.buffer_pool.page_storage().page_count();
 
         // Free the blob
-        heap.free(href, &mut free_list).unwrap();
+        heap.free(href, &mut free_list).await.unwrap();
 
         // Overflow pages should have been returned to the free list
-        let free_count = free_list.count().unwrap();
+        let free_count = free_list.count().await.unwrap();
         assert!(
             free_count > 0,
             "overflow pages should have been deallocated to free list"
         );
 
         // Loading should fail
-        let result = heap.load(href);
+        let result = heap.load(href).await;
         assert!(result.is_err());
 
         // Total pages should remain the same (pages are deallocated, not removed from file)
@@ -652,9 +662,9 @@ mod tests {
 
     // ─── Test 7: Multiple blobs ───
 
-    #[test]
-    fn test_multiple_blobs() {
-        let (mut heap, mut free_list) = setup();
+    #[tokio::test]
+    async fn test_multiple_blobs() {
+        let (mut heap, mut free_list) = setup().await;
 
         let mut refs = Vec::new();
         let mut data_sets = Vec::new();
@@ -663,14 +673,14 @@ mod tests {
         for i in 0..20 {
             let size = 50 + i * 500; // sizes from 50 to 9550 bytes
             let data: Vec<u8> = (0..size).map(|j| ((i + j) % 256) as u8).collect();
-            let href = heap.store(&data, &mut free_list).unwrap();
+            let href = heap.store(&data, &mut free_list).await.unwrap();
             refs.push(href);
             data_sets.push(data);
         }
 
         // Load all and verify
         for (i, href) in refs.iter().enumerate() {
-            let loaded = heap.load(*href).unwrap();
+            let loaded = heap.load(*href).await.unwrap();
             assert_eq!(
                 loaded, data_sets[i],
                 "blob {} mismatch (size {})",
@@ -682,22 +692,22 @@ mod tests {
 
     // ─── Test 8: Free space reuse ───
 
-    #[test]
-    fn test_free_space_reuse() {
-        let (mut heap, mut free_list) = setup();
+    #[tokio::test]
+    async fn test_free_space_reuse() {
+        let (mut heap, mut free_list) = setup().await;
 
         // Store blob A
         let data_a = vec![0xAAu8; 200];
-        let href_a = heap.store(&data_a, &mut free_list).unwrap();
+        let href_a = heap.store(&data_a, &mut free_list).await.unwrap();
         // Free blob A
-        heap.free(href_a, &mut free_list).unwrap();
+        heap.free(href_a, &mut free_list).await.unwrap();
 
         // Store blob B (similar size) - should reuse the freed page (via free list)
         let data_b = vec![0xBBu8; 200];
-        let href_b = heap.store(&data_b, &mut free_list).unwrap();
+        let href_b = heap.store(&data_b, &mut free_list).await.unwrap();
 
         // Verify blob B is correct
-        let loaded = heap.load(href_b).unwrap();
+        let loaded = heap.load(href_b).await.unwrap();
         assert_eq!(loaded, data_b);
 
         // The page should have been reused (either same heap page or free list page reused).
@@ -707,16 +717,16 @@ mod tests {
 
     // ─── Test 9: rebuild_free_space_map ───
 
-    #[test]
-    fn test_rebuild_free_space_map() {
+    #[tokio::test]
+    async fn test_rebuild_free_space_map() {
         let storage = Arc::new(MemoryPageStorage::new(PAGE_SIZE));
-        storage.extend(1).unwrap(); // page 0 reserved
+        storage.extend(1).await.unwrap(); // page 0 reserved
 
         // Initialize page 0 as FileHeader
         {
             let mut buf = vec![0u8; PAGE_SIZE];
             SlottedPage::init(&mut buf, 0, PageType::FileHeader);
-            storage.write_page(0, &buf).unwrap();
+            storage.write_page(0, &buf).await.unwrap();
         }
 
         let pool = Arc::new(BufferPool::new(
@@ -734,8 +744,8 @@ mod tests {
         let href2;
         {
             let mut heap1 = Heap::new(pool.clone());
-            href1 = heap1.store(&[1u8; 100], &mut free_list).unwrap();
-            href2 = heap1.store(&[2u8; 200], &mut free_list).unwrap();
+            href1 = heap1.store(&[1u8; 100], &mut free_list).await.unwrap();
+            href2 = heap1.store(&[2u8; 200], &mut free_list).await.unwrap();
         }
 
         // Create a new Heap instance (simulating restart) with empty free space map
@@ -743,18 +753,18 @@ mod tests {
         assert!(heap2.free_space_map.is_empty());
 
         // Rebuild free space map
-        heap2.rebuild_free_space_map().unwrap();
+        heap2.rebuild_free_space_map().await.unwrap();
 
         // Verify the free space map is not empty (should have found heap pages)
         assert!(!heap2.free_space_map.is_empty());
 
         // Verify we can still load existing blobs
-        assert_eq!(heap2.load(href1).unwrap(), vec![1u8; 100]);
-        assert_eq!(heap2.load(href2).unwrap(), vec![2u8; 200]);
+        assert_eq!(heap2.load(href1).await.unwrap(), vec![1u8; 100]);
+        assert_eq!(heap2.load(href2).await.unwrap(), vec![2u8; 200]);
 
         // Verify store works with rebuilt map (finds free space)
-        let href3 = heap2.store(&[3u8; 150], &mut free_list).unwrap();
-        assert_eq!(heap2.load(href3).unwrap(), vec![3u8; 150]);
+        let href3 = heap2.store(&[3u8; 150], &mut free_list).await.unwrap();
+        assert_eq!(heap2.load(href3).await.unwrap(), vec![3u8; 150]);
     }
 
     // ─── Test 10: HeapRef serialization ───
@@ -793,9 +803,9 @@ mod tests {
 
     // ─── Test 11: Empty heap operations ───
 
-    #[test]
-    fn test_empty_heap_load_error() {
-        let (heap, _free_list) = setup();
+    #[tokio::test]
+    async fn test_empty_heap_load_error() {
+        let (heap, _free_list) = setup().await;
 
         // Load from a non-existent HeapRef (page 0 is FileHeader, not Heap)
         // This should fail because page 0 doesn't have the right slot
@@ -803,7 +813,7 @@ mod tests {
             page_id: 0,
             slot_id: 0,
         };
-        let result = heap.load(href);
+        let result = heap.load(href).await;
         assert!(result.is_err(), "loading from non-existent HeapRef should error");
 
         // Also test with a page_id that doesn't exist at all
@@ -811,7 +821,7 @@ mod tests {
             page_id: 999,
             slot_id: 0,
         };
-        let result2 = heap.load(href_bad);
+        let result2 = heap.load(href_bad).await;
         assert!(
             result2.is_err(),
             "loading from non-existent page should error"

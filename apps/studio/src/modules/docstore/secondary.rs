@@ -22,12 +22,7 @@ pub fn SecondaryIndexModule() -> Element {
     let collections = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db.clone();
-        async move {
-            tokio::task::spawn_blocking(move || db.list_collections())
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-        }
+        async move { db.list_collections().await.ok() }
     });
 
     rsx! {
@@ -165,18 +160,20 @@ pub fn SecondaryIndexModule() -> Element {
                                         } else {
                                             ts_str.parse().unwrap_or(u64::MAX)
                                         };
-                                        if let Some(db) = db {
-                                            match db.secondary_scan(sec_root, primary_root, &sv, read_ts, 200) {
-                                                Ok(hits) => results.set(Some(hits)),
-                                                Err(e) => {
-                                                    let mut s = state;
-                                                    s.last_result.set(Some(crate::state::OperationResult::Error(
-                                                        e.to_string()
-                                                    )));
-                                                    results.set(None);
+                                        spawn(async move {
+                                            if let Some(db) = db {
+                                                match db.secondary_scan(sec_root, primary_root, &sv, read_ts, 200).await {
+                                                    Ok(hits) => results.set(Some(hits)),
+                                                    Err(e) => {
+                                                        let mut s = state;
+                                                        s.last_result.set(Some(crate::state::OperationResult::Error(
+                                                            e.to_string()
+                                                        )));
+                                                        results.set(None);
+                                                    }
                                                 }
                                             }
-                                        }
+                                        });
                                     },
                                     "Scan"
                                 }

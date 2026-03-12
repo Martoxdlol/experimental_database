@@ -17,20 +17,25 @@ pub fn OverviewModule() -> Element {
         };
     };
 
-    let fh = db.read_file_header();
+    // Load file header asynchronously
+    let db_for_fh = db.clone();
+    let fh_resource = use_resource(move || {
+        let _rev = *state.revision.read();
+        let db = db_for_fh.clone();
+        async move { db.read_file_header().await }
+    });
 
     // Count pages by type
     let db_for_scan = db.clone();
     let type_counts = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db_for_scan.clone();
-        async move {
-            tokio::task::spawn_blocking(move || db.scan_page_types())
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-        }
+        async move { db.scan_page_types().await.ok() }
     });
+
+    let Some(fh) = fh_resource.read().clone() else {
+        return rsx! { div { class: "empty-state", "Loading..." } };
+    };
 
     // Editing state
     let mut editing_field: Signal<Option<String>> = use_signal(|| None);
@@ -163,19 +168,21 @@ fn header_row(
                                 let fn_c = fn_clone.clone();
                                 if let Ok(val) = val_str.parse::<u64>() {
                                     let db = state.db.read().clone();
-                                    if let Some(db) = db {
-                                        match db.update_file_header_field(&fn_c, val) {
-                                            Ok(()) => {
-                                                state.last_result.set(Some(OperationResult::Success(
-                                                    format!("Updated {fn_c} to {val}")
-                                                )));
-                                                state.notify_mutation();
+                                    spawn(async move {
+                                        if let Some(db) = db {
+                                            match db.update_file_header_field(&fn_c, val).await {
+                                                Ok(()) => {
+                                                    state.last_result.set(Some(OperationResult::Success(
+                                                        format!("Updated {fn_c} to {val}")
+                                                    )));
+                                                    state.notify_mutation();
+                                                }
+                                                Err(e) => state.last_result.set(Some(OperationResult::Error(
+                                                    e.to_string()
+                                                ))),
                                             }
-                                            Err(e) => state.last_result.set(Some(OperationResult::Error(
-                                                e.to_string()
-                                            ))),
                                         }
-                                    }
+                                    });
                                 }
                                 editing_field.set(None);
                             } else if e.key() == Key::Escape {

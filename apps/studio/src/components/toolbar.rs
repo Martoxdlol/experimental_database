@@ -13,18 +13,26 @@ pub fn Toolbar() -> Element {
     let write_enabled = *state.write_enabled.read();
     let dirty = *state.dirty_page_count.read();
 
-    // Db info line
-    let info_text = if let Some(db) = state.db.read().as_ref() {
-        let fh = db.read_file_header();
-        format!(
-            "{} ({} B pages, {} pages)",
-            db.path,
-            fh.page_size.get(),
-            fh.page_count.get()
-        )
-    } else {
-        "No database open".to_string()
-    };
+    // Db info line (async because read_file_header is async)
+    let db_for_info = state.db.read().clone();
+    let info_resource = use_resource(move || {
+        let _rev = *state.revision.read();
+        let db = db_for_info.clone();
+        async move {
+            if let Some(db) = db {
+                let fh = db.read_file_header().await;
+                format!(
+                    "{} ({} B pages, {} pages)",
+                    db.path,
+                    fh.page_size.get(),
+                    fh.page_count.get()
+                )
+            } else {
+                "No database open".to_string()
+            }
+        }
+    });
+    let info_text = info_resource.read().clone().unwrap_or_else(|| "No database open".to_string());
 
     rsx! {
         div { class: "toolbar",
@@ -34,19 +42,16 @@ pub fn Toolbar() -> Element {
                     onclick: move |_| {
                         spawn(async move {
                             if let Some(path) = pick_database_dir().await {
-                                match tokio::task::spawn_blocking(move || DbHandle::open(&path)).await {
-                                    Ok(Ok(handle)) => {
+                                match DbHandle::open(&path).await {
+                                    Ok(handle) => {
                                         state.db.set(Some(Arc::new(handle)));
                                         state.active_tab.set(LayerTab::Overview);
                                         state.breadcrumb.set(vec!["Database".to_string(), "Overview".to_string()]);
                                         state.write_enabled.set(false);
                                         state.last_result.set(Some(OperationResult::Success("Database opened".into())));
                                     }
-                                    Ok(Err(e)) => {
-                                        state.last_result.set(Some(OperationResult::Error(format!("Failed to open: {e}"))));
-                                    }
                                     Err(e) => {
-                                        state.last_result.set(Some(OperationResult::Error(format!("Task error: {e}"))));
+                                        state.last_result.set(Some(OperationResult::Error(format!("Failed to open: {e}"))));
                                     }
                                 }
                             }
@@ -59,19 +64,16 @@ pub fn Toolbar() -> Element {
                     onclick: move |_| {
                         spawn(async move {
                             if let Some(path) = pick_new_database_dir().await {
-                                match tokio::task::spawn_blocking(move || DbHandle::open(&path)).await {
-                                    Ok(Ok(handle)) => {
+                                match DbHandle::open(&path).await {
+                                    Ok(handle) => {
                                         state.db.set(Some(Arc::new(handle)));
                                         state.active_tab.set(LayerTab::Overview);
                                         state.breadcrumb.set(vec!["Database".to_string(), "Overview".to_string()]);
                                         state.write_enabled.set(true);
                                         state.last_result.set(Some(OperationResult::Success("New database created".into())));
                                     }
-                                    Ok(Err(e)) => {
-                                        state.last_result.set(Some(OperationResult::Error(format!("Failed to create: {e}"))));
-                                    }
                                     Err(e) => {
-                                        state.last_result.set(Some(OperationResult::Error(format!("Task error: {e}"))));
+                                        state.last_result.set(Some(OperationResult::Error(format!("Failed to create: {e}"))));
                                     }
                                 }
                             }

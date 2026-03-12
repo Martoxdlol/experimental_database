@@ -5,7 +5,7 @@
 //! checkpoint, recovery, and vacuum into a single coherent interface.
 
 use crate::backend::{MemoryPageStorage, MemoryWalStorage, PageId, PageStorage, WalStorage};
-use crate::btree::{BTree, ScanDirection, ScanIterator};
+use crate::btree::{BTree, ScanDirection, ScanStream};
 use crate::buffer_pool::{BufferPool, BufferPoolConfig};
 use crate::checkpoint::Checkpoint;
 use crate::dwb::DoubleWriteBuffer;
@@ -14,14 +14,14 @@ use crate::heap::{Heap, HeapRef};
 use crate::page::{PageType, SlottedPage};
 use crate::recovery::{Recovery, RecoveryMode, WalRecordHandler};
 use crate::vacuum::{VacuumEntry, VacuumTask};
-use crate::wal::{Lsn, WalConfig, WalIterator, WalReader, WalWriter};
+use crate::wal::{Lsn, WalConfig, WalReader, WalStream, WalWriter};
 
-use parking_lot::Mutex;
 use std::io;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use zerocopy::byteorder::{LittleEndian, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
@@ -221,20 +221,20 @@ pub struct BTreeHandle {
 
 impl BTreeHandle {
     /// Point lookup. Returns value bytes if found.
-    pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
-        self.btree.get(key)
+    pub async fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        self.btree.get(key).await
     }
 
     /// Insert a key-value pair.
-    pub fn insert(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        let mut free_list = self.free_list.lock();
-        self.btree.insert(key, value, &mut free_list)
+    pub async fn insert(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        let mut free_list = self.free_list.lock().await;
+        self.btree.insert(key, value, &mut free_list).await
     }
 
     /// Delete a key. Returns true if the key existed.
-    pub fn delete(&self, key: &[u8]) -> io::Result<bool> {
-        let mut free_list = self.free_list.lock();
-        self.btree.delete(key, &mut free_list)
+    pub async fn delete(&self, key: &[u8]) -> io::Result<bool> {
+        let mut free_list = self.free_list.lock().await;
+        self.btree.delete(key, &mut free_list).await
     }
 
     /// Range scan.
@@ -243,7 +243,7 @@ impl BTreeHandle {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
         direction: ScanDirection,
-    ) -> ScanIterator {
+    ) -> ScanStream<'_> {
         self.btree.scan(lower, upper, direction)
     }
 
@@ -289,7 +289,7 @@ impl StorageEngine {
     ///
     /// Creates directories if needed, opens or creates the data file and WAL,
     /// and runs recovery if an existing database is detected.
-    pub fn open(
+    pub async fn open(
         path: &Path,
         config: StorageConfig,
         handler: &mut dyn WalRecordHandler,
@@ -329,11 +329,11 @@ impl StorageEngine {
                 true,
                 Some(dwb_path),
                 Some(path.to_path_buf()),
-            )
+            ).await
         } else {
             // Existing database: read file header, run recovery.
             let mut buf = vec![0u8; config.page_size];
-            page_storage.read_page(0, &mut buf)?;
+            page_storage.read_page(0, &mut buf).await?;
             let file_header = read_file_header(&buf)?;
             file_header.verify()?;
 
@@ -357,7 +357,7 @@ impl StorageEngine {
                 config.page_size,
                 handler,
                 RecoveryMode::Strict,
-            )?;
+            ).await?;
 
             // Build components.
             Self::build_from_existing(
@@ -373,7 +373,7 @@ impl StorageEngine {
     }
 
     /// Open an ephemeral in-memory storage engine.
-    pub fn open_in_memory(config: StorageConfig) -> io::Result<Self> {
+    pub async fn open_in_memory(config: StorageConfig) -> io::Result<Self> {
         let page_storage: Arc<dyn PageStorage> =
             Arc::new(MemoryPageStorage::new(config.page_size));
         let wal_storage: Arc<dyn WalStorage> = Arc::new(MemoryWalStorage::new());
@@ -385,7 +385,7 @@ impl StorageEngine {
             false,
             None,
             None,
-        )
+        ).await
     }
 
     /// Open with custom backends.
@@ -393,7 +393,7 @@ impl StorageEngine {
     /// If the backend is durable and `handler` is Some, runs recovery.
     /// If the backend is durable and `handler` is None, recovery is skipped.
     /// If the backend is not durable, `handler` is ignored.
-    pub fn open_with_backend(
+    pub async fn open_with_backend(
         page_storage: Arc<dyn PageStorage>,
         wal_storage: Arc<dyn WalStorage>,
         config: StorageConfig,
@@ -411,11 +411,11 @@ impl StorageEngine {
                 is_durable,
                 None,
                 None,
-            )
+            ).await
         } else {
             // Existing database.
             let mut buf = vec![0u8; config.page_size];
-            page_storage.read_page(0, &mut buf)?;
+            page_storage.read_page(0, &mut buf).await?;
             let file_header = read_file_header(&buf)?;
             file_header.verify()?;
 
@@ -431,7 +431,7 @@ impl StorageEngine {
                         config.page_size,
                         h,
                         RecoveryMode::Strict,
-                    )?;
+                    ).await?;
                 }
 
             Self::build_from_existing(
@@ -456,19 +456,19 @@ impl StorageEngine {
         // Update file header with current free list head and page count
         // before writing to disk.
         {
-            let free_list_head = self.free_list.lock().head();
+            let free_list_head = self.free_list.lock().await.head();
             let page_count = self.page_storage.page_count();
             self.update_file_header(|fh| {
                 fh.free_list_head = U32::new(free_list_head);
                 fh.page_count = U64::new(page_count);
-            })?;
+            }).await?;
         }
 
         // Write final file header to page 0.
-        self.write_file_header_to_page0()?;
+        self.write_file_header_to_page0().await?;
 
         // Sync page storage.
-        self.page_storage.sync()?;
+        self.page_storage.sync().await?;
 
         Ok(())
     }
@@ -481,9 +481,9 @@ impl StorageEngine {
     // ─── B-Tree Management ───
 
     /// Create a new B-tree with an empty root. Returns a handle.
-    pub fn create_btree(&self) -> io::Result<BTreeHandle> {
-        let mut free_list = self.free_list.lock();
-        let btree = BTree::create(self.buffer_pool.clone(), &mut free_list)?;
+    pub async fn create_btree(&self) -> io::Result<BTreeHandle> {
+        let mut free_list = self.free_list.lock().await;
+        let btree = BTree::create(self.buffer_pool.clone(), &mut free_list).await?;
         Ok(BTreeHandle {
             btree,
             free_list: self.free_list.clone(),
@@ -504,23 +504,23 @@ impl StorageEngine {
     // ─── Heap ───
 
     /// Store a blob in the heap. Returns a reference for later retrieval.
-    pub fn heap_store(&self, data: &[u8]) -> io::Result<HeapRef> {
-        let mut heap = self.heap.lock();
-        let mut free_list = self.free_list.lock();
-        heap.store(data, &mut free_list)
+    pub async fn heap_store(&self, data: &[u8]) -> io::Result<HeapRef> {
+        let mut heap = self.heap.lock().await;
+        let mut free_list = self.free_list.lock().await;
+        heap.store(data, &mut free_list).await
     }
 
     /// Load a blob from the heap.
-    pub fn heap_load(&self, href: HeapRef) -> io::Result<Vec<u8>> {
-        let heap = self.heap.lock();
-        heap.load(href)
+    pub async fn heap_load(&self, href: HeapRef) -> io::Result<Vec<u8>> {
+        let heap = self.heap.lock().await;
+        heap.load(href).await
     }
 
     /// Free a blob from the heap.
-    pub fn heap_free(&self, href: HeapRef) -> io::Result<()> {
-        let mut heap = self.heap.lock();
-        let mut free_list = self.free_list.lock();
-        heap.free(href, &mut free_list)
+    pub async fn heap_free(&self, href: HeapRef) -> io::Result<()> {
+        let mut heap = self.heap.lock().await;
+        let mut free_list = self.free_list.lock().await;
+        heap.free(href, &mut free_list).await
     }
 
     // ─── WAL ───
@@ -531,7 +531,7 @@ impl StorageEngine {
     }
 
     /// Read WAL records starting from a given LSN.
-    pub fn read_wal_from(&self, lsn: Lsn) -> WalIterator {
+    pub fn read_wal_from(&self, lsn: Lsn) -> WalStream {
         self.wal_reader.read_from(lsn)
     }
 
@@ -545,15 +545,15 @@ impl StorageEngine {
         let checkpoint_lsn = self.checkpoint.wal_lsn();
         self.update_file_header(|fh| {
             fh.checkpoint_lsn = U64::new(checkpoint_lsn);
-        })?;
+        }).await?;
         self.checkpoint.run().await?;
         Ok(())
     }
 
     /// Vacuum entries from B-trees. Returns the number of entries removed.
-    pub fn vacuum(&self, entries: &[VacuumEntry]) -> io::Result<usize> {
-        let mut free_list = self.free_list.lock();
-        self.vacuum_task.remove_entries(entries, &mut free_list)
+    pub async fn vacuum(&self, entries: &[VacuumEntry]) -> io::Result<usize> {
+        let mut free_list = self.free_list.lock().await;
+        self.vacuum_task.remove_entries(entries, &mut free_list).await
     }
 
     // ─── Accessors (for integration layer) ───
@@ -564,20 +564,20 @@ impl StorageEngine {
     }
 
     /// Return a copy of the current file header.
-    pub fn file_header(&self) -> FileHeader {
-        self.file_header.lock().clone()
+    pub async fn file_header(&self) -> FileHeader {
+        self.file_header.lock().await.clone()
     }
 
     /// Update the file header via a closure, then write page 0 through
     /// the buffer pool.
-    pub fn update_file_header<F>(&self, f: F) -> io::Result<()>
+    pub async fn update_file_header<F>(&self, f: F) -> io::Result<()>
     where
         F: FnOnce(&mut FileHeader),
     {
-        let mut fh = self.file_header.lock();
+        let mut fh = self.file_header.lock().await;
         f(&mut fh);
         // Write updated header to page 0 through buffer pool.
-        let mut guard = self.buffer_pool.fetch_page_exclusive(0)?;
+        let mut guard = self.buffer_pool.fetch_page_exclusive(0).await?;
         let buf = guard.data_mut();
         write_file_header(buf, &fh);
         // guard.mark_dirty() is called implicitly by data_mut()
@@ -603,7 +603,7 @@ impl StorageEngine {
 
     /// Initialize a brand-new database: extend to page 0, write file header,
     /// create catalog B-trees.
-    fn init_new_database(
+    async fn init_new_database(
         page_storage: Arc<dyn PageStorage>,
         wal_storage: Arc<dyn WalStorage>,
         config: StorageConfig,
@@ -616,7 +616,7 @@ impl StorageEngine {
         let frame_count = config.memory_budget / page_size;
 
         // Extend page storage to have page 0.
-        page_storage.extend(1)?;
+        page_storage.extend(1).await?;
 
         // Initialize page 0 as FileHeader page.
         {
@@ -624,7 +624,7 @@ impl StorageEngine {
             SlottedPage::init(&mut buf, 0, PageType::FileHeader);
             let fh = FileHeader::new(page_size);
             write_file_header(&mut buf, &fh);
-            page_storage.write_page(0, &buf)?;
+            page_storage.write_page(0, &buf).await?;
         }
 
         // Build buffer pool.
@@ -643,11 +643,11 @@ impl StorageEngine {
         let catalog_root_page;
         let catalog_name_root_page;
         {
-            let mut fl = free_list.lock();
-            let id_btree = BTree::create(buffer_pool.clone(), &mut fl)?;
+            let mut fl = free_list.lock().await;
+            let id_btree = BTree::create(buffer_pool.clone(), &mut fl).await?;
             catalog_root_page = id_btree.root_page();
 
-            let name_btree = BTree::create(buffer_pool.clone(), &mut fl)?;
+            let name_btree = BTree::create(buffer_pool.clone(), &mut fl).await?;
             catalog_name_root_page = name_btree.root_page();
         }
 
@@ -657,20 +657,20 @@ impl StorageEngine {
             fh.catalog_root_page = U32::new(catalog_root_page);
             fh.catalog_name_root_page = U32::new(catalog_name_root_page);
             fh.page_count = U64::new(page_storage.page_count());
-            fh.free_list_head = U32::new(free_list.lock().head());
+            fh.free_list_head = U32::new(free_list.lock().await.head());
             fh
         };
 
         // Write updated header to page 0 through buffer pool.
         {
-            let mut guard = buffer_pool.fetch_page_exclusive(0)?;
+            let mut guard = buffer_pool.fetch_page_exclusive(0).await?;
             let buf = guard.data_mut();
             write_file_header(buf, &file_header);
         }
 
         // Flush all dirty pages (page 0 + catalog B-tree roots) so they're durable.
         for (page_id, _, _) in buffer_pool.dirty_pages() {
-            buffer_pool.flush_page(page_id)?;
+            buffer_pool.flush_page(page_id).await?;
         }
 
         // Build WAL writer and reader.
@@ -791,13 +791,13 @@ impl StorageEngine {
     }
 
     /// Write the current file header to page 0 via the buffer pool and flush.
-    fn write_file_header_to_page0(&self) -> io::Result<()> {
-        let fh = self.file_header.lock().clone();
-        let mut guard = self.buffer_pool.fetch_page_exclusive(0)?;
+    async fn write_file_header_to_page0(&self) -> io::Result<()> {
+        let fh = self.file_header.lock().await.clone();
+        let mut guard = self.buffer_pool.fetch_page_exclusive(0).await?;
         let buf = guard.data_mut();
         write_file_header(buf, &fh);
         drop(guard);
-        self.buffer_pool.flush_page(0)?;
+        self.buffer_pool.flush_page(0).await?;
         Ok(())
     }
 }
@@ -829,10 +829,11 @@ mod tests {
             config,
             &mut NoOpHandler,
         )
+        .await
         .unwrap();
 
         assert!(engine.is_durable());
-        let fh = engine.file_header();
+        let fh = engine.file_header().await;
         assert_eq!(fh.magic.get(), FILE_HEADER_MAGIC);
         assert_eq!(fh.version.get(), FILE_HEADER_VERSION);
         assert_eq!(fh.page_size.get(), 4096);
@@ -853,9 +854,10 @@ mod tests {
             config2,
             &mut NoOpHandler,
         )
+        .await
         .unwrap();
 
-        let fh2 = engine2.file_header();
+        let fh2 = engine2.file_header().await;
         assert_eq!(fh2.magic.get(), FILE_HEADER_MAGIC);
         assert_eq!(fh2.catalog_root_page.get(), fh.catalog_root_page.get());
         assert_eq!(
@@ -875,10 +877,10 @@ mod tests {
             memory_budget: 4096 * 64,
             ..Default::default()
         };
-        let engine = StorageEngine::open_in_memory(config).unwrap();
+        let engine = StorageEngine::open_in_memory(config).await.unwrap();
 
         assert!(!engine.is_durable());
-        let fh = engine.file_header();
+        let fh = engine.file_header().await;
         assert_eq!(fh.magic.get(), FILE_HEADER_MAGIC);
         assert_eq!(fh.version.get(), FILE_HEADER_VERSION);
         assert!(fh.catalog_root_page.get() > 0);
@@ -893,26 +895,26 @@ mod tests {
             memory_budget: 4096 * 64,
             ..Default::default()
         };
-        let engine = StorageEngine::open_in_memory(config).unwrap();
+        let engine = StorageEngine::open_in_memory(config).await.unwrap();
 
-        let handle = engine.create_btree().unwrap();
-        handle.insert(b"key1", b"value1").unwrap();
-        handle.insert(b"key2", b"value2").unwrap();
-        handle.insert(b"key3", b"value3").unwrap();
+        let handle = engine.create_btree().await.unwrap();
+        handle.insert(b"key1", b"value1").await.unwrap();
+        handle.insert(b"key2", b"value2").await.unwrap();
+        handle.insert(b"key3", b"value3").await.unwrap();
 
         assert_eq!(
-            handle.get(b"key1").unwrap(),
+            handle.get(b"key1").await.unwrap(),
             Some(b"value1".to_vec())
         );
         assert_eq!(
-            handle.get(b"key2").unwrap(),
+            handle.get(b"key2").await.unwrap(),
             Some(b"value2".to_vec())
         );
         assert_eq!(
-            handle.get(b"key3").unwrap(),
+            handle.get(b"key3").await.unwrap(),
             Some(b"value3".to_vec())
         );
-        assert_eq!(handle.get(b"key4").unwrap(), None);
+        assert_eq!(handle.get(b"key4").await.unwrap(), None);
     }
 
     // ─── Test 4: Multiple B-trees ───
@@ -924,22 +926,22 @@ mod tests {
             memory_budget: 4096 * 64,
             ..Default::default()
         };
-        let engine = StorageEngine::open_in_memory(config).unwrap();
+        let engine = StorageEngine::open_in_memory(config).await.unwrap();
 
-        let bt1 = engine.create_btree().unwrap();
-        let bt2 = engine.create_btree().unwrap();
-        let bt3 = engine.create_btree().unwrap();
+        let bt1 = engine.create_btree().await.unwrap();
+        let bt2 = engine.create_btree().await.unwrap();
+        let bt3 = engine.create_btree().await.unwrap();
 
-        bt1.insert(b"a", b"tree1").unwrap();
-        bt2.insert(b"a", b"tree2").unwrap();
-        bt3.insert(b"a", b"tree3").unwrap();
+        bt1.insert(b"a", b"tree1").await.unwrap();
+        bt2.insert(b"a", b"tree2").await.unwrap();
+        bt3.insert(b"a", b"tree3").await.unwrap();
 
-        assert_eq!(bt1.get(b"a").unwrap(), Some(b"tree1".to_vec()));
-        assert_eq!(bt2.get(b"a").unwrap(), Some(b"tree2".to_vec()));
-        assert_eq!(bt3.get(b"a").unwrap(), Some(b"tree3".to_vec()));
+        assert_eq!(bt1.get(b"a").await.unwrap(), Some(b"tree1".to_vec()));
+        assert_eq!(bt2.get(b"a").await.unwrap(), Some(b"tree2".to_vec()));
+        assert_eq!(bt3.get(b"a").await.unwrap(), Some(b"tree3".to_vec()));
 
         // Verify isolation: keys from other trees are not visible.
-        assert_eq!(bt1.get(b"b").unwrap(), None);
+        assert_eq!(bt1.get(b"b").await.unwrap(), None);
     }
 
     // ─── Test 5: Heap store + load ───
@@ -951,11 +953,11 @@ mod tests {
             memory_budget: 4096 * 64,
             ..Default::default()
         };
-        let engine = StorageEngine::open_in_memory(config).unwrap();
+        let engine = StorageEngine::open_in_memory(config).await.unwrap();
 
         let data = b"hello, heap storage!";
-        let href = engine.heap_store(data).unwrap();
-        let loaded = engine.heap_load(href).unwrap();
+        let href = engine.heap_store(data).await.unwrap();
+        let loaded = engine.heap_load(href).await.unwrap();
 
         assert_eq!(loaded, data);
     }
@@ -969,18 +971,19 @@ mod tests {
             memory_budget: 4096 * 64,
             ..Default::default()
         };
-        let engine = StorageEngine::open_in_memory(config).unwrap();
+        let engine = StorageEngine::open_in_memory(config).await.unwrap();
 
         let lsn = engine.append_wal(0x01, b"test-payload").await.unwrap();
         assert_eq!(lsn, 0);
 
-        let mut iter = engine.read_wal_from(0);
-        let record = iter.next().unwrap().unwrap();
+        let mut stream = engine.read_wal_from(0);
+        use tokio_stream::StreamExt;
+        let record = stream.next().await.unwrap().unwrap();
         assert_eq!(record.lsn, 0);
         assert_eq!(record.record_type, 0x01);
         assert_eq!(record.payload, b"test-payload");
 
-        assert!(iter.next().is_none());
+        assert!(stream.next().await.is_none());
     }
 
     // ─── Test 7: Checkpoint persists data ───
@@ -1003,10 +1006,11 @@ mod tests {
                 config,
                 &mut NoOpHandler,
             )
+            .await
             .unwrap();
 
-            let handle = engine.create_btree().unwrap();
-            handle.insert(b"persist-key", b"persist-value").unwrap();
+            let handle = engine.create_btree().await.unwrap();
+            handle.insert(b"persist-key", b"persist-value").await.unwrap();
             root_page = handle.root_page();
 
             engine.checkpoint().await.unwrap();
@@ -1025,10 +1029,11 @@ mod tests {
                 config,
                 &mut NoOpHandler,
             )
+            .await
             .unwrap();
 
             let handle = engine.open_btree(root_page);
-            let value = handle.get(b"persist-key").unwrap();
+            let value = handle.get(b"persist-key").await.unwrap();
             assert_eq!(value, Some(b"persist-value".to_vec()));
 
             engine.close().await.unwrap();
@@ -1062,9 +1067,9 @@ mod tests {
             memory_budget: 4096 * 64,
             ..Default::default()
         };
-        let engine = StorageEngine::open_in_memory(config).unwrap();
+        let engine = StorageEngine::open_in_memory(config).await.unwrap();
 
-        let fh_before = engine.file_header();
+        let fh_before = engine.file_header().await;
         assert_eq!(fh_before.visible_ts.get(), 0);
 
         engine
@@ -1072,9 +1077,10 @@ mod tests {
                 fh.visible_ts = U64::new(12345);
                 fh.next_collection_id = U64::new(100);
             })
+            .await
             .unwrap();
 
-        let fh_after = engine.file_header();
+        let fh_after = engine.file_header().await;
         assert_eq!(fh_after.visible_ts.get(), 12345);
         assert_eq!(fh_after.next_collection_id.get(), 100);
 
@@ -1094,7 +1100,7 @@ mod tests {
             memory_budget: 65536 * 64,
             ..Default::default()
         };
-        let result = StorageEngine::open_in_memory(config);
+        let result = StorageEngine::open_in_memory(config).await;
         assert!(
             result.is_err(),
             "page_size > 65535 should be rejected (u16 overflow in page header)"
@@ -1111,8 +1117,8 @@ mod tests {
             ..Default::default()
         };
         // Should succeed.
-        let engine = StorageEngine::open_in_memory(config).unwrap();
-        let fh = engine.file_header();
+        let engine = StorageEngine::open_in_memory(config).await.unwrap();
+        let fh = engine.file_header().await;
         assert_eq!(fh.page_size.get(), 65535);
     }
 }

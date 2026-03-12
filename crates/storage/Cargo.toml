@@ -8,9 +8,15 @@ exdb-core = { workspace = true }
 zerocopy = { workspace = true }
 crc32fast = { workspace = true }
 parking_lot = { workspace = true }
-tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "io-util"] }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "io-util", "fs"] }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures-core = { workspace = true }
+async-stream = { workspace = true }
+tracing = { workspace = true }
+tokio-stream = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { version = "1", features = ["full", "test-util"] }
+tokio-stream = { workspace = true }

@@ -1727,23 +1727,30 @@ Every read operation within a transaction is assigned an incremental **query ID*
 
 ### 5.1 Transaction Types and Options
 
-Transactions are scoped to a single database and may span multiple collections. They are parameterized with:
+Transactions are scoped to a single database and may span multiple collections. A single `begin(options)` entry point creates transactions with the following options:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `readonly` | bool | false | Read-only transactions cannot write data. No OCC validation at commit. |
-| `notify` | bool | false | One-shot: notify the client when any query in the read set is invalidated by a future commit. Fires once, then the subscription is removed. |
-| `subscribe` | bool | false | Persistent: on invalidation, report which query IDs were affected and automatically begin a new transaction at the latest committed timestamp, forming a **subscription chain** (see 5.8). |
+| `subscription` | SubscriptionMode | None | Controls post-commit read set behavior (see below). |
 
-`notify` and `subscribe` are mutually exclusive.
+The `SubscriptionMode` enum replaces the previous `notify`/`subscribe` booleans:
+
+| Mode | Persistence | On Invalidation | Read Set Update |
+|------|-------------|-----------------|-----------------|
+| `None` | — | Read set discarded after commit. | — |
+| `Notify` | One-shot | Fire once with affected query IDs, then remove subscription. | — |
+| `Watch` | Persistent | Fire on every invalidation with affected query IDs. No new transaction. | Manual (client calls `update_read_set`) |
+| `Subscribe` | Persistent | Fire with affected query IDs + auto-start new transaction + carry forward unaffected read set. | Automatic on chain commit |
 
 **Behavior matrix**:
 
-| Scenario | `subscribe: false` | `subscribe: true` |
-|----------|--------------------|--------------------|
-| Read-only commit | Read set discarded. | Read set registered as subscription. On invalidation: notify with affected query IDs + new `tx_id`. |
-| Write commit (success) | Read set discarded. | Read set registered as subscription. Chain continues reactively. |
-| Write commit (OCC conflict) | Error returned. Client retries manually. | Error returned + new **write** transaction automatically started at current timestamp for retry. |
+| Scenario | `None` | `Notify` | `Watch` | `Subscribe` |
+|----------|--------|----------|---------|-------------|
+| Read-only commit | Read set discarded | Subscription (one-shot) | Subscription (persistent) | Subscription (persistent) |
+| Write commit (success) | Read set discarded | Subscription (one-shot) | Subscription (persistent) | Subscription (persistent) |
+| Write commit (OCC conflict) | Error returned | Error returned | Error returned | Error + auto-retry transaction |
+| On invalidation | — | Notify + remove | Notify (keep watching) | Notify + new tx + carry read set |
 
 ### 5.2 Timestamps
 
@@ -1759,46 +1766,56 @@ All mutations within a transaction share the same `commit_ts`. The transaction i
 
 ### 5.3 Transaction Lifecycle
 
-**Read-only (query)**:
+**All transactions** use a unified entry point:
 
-1. `begin(readonly: true)` → acquire `read_ts` = latest committed timestamp.
-2. Execute reads. Each read is assigned an incremental `query_id` (see 4.6). All reads see the consistent snapshot at `read_ts`.
-3. `commit()` → if `subscribe` or `notify`: register read set in subscription registry. Release resources.
-
-**Read-write (mutation)**:
-
-1. `begin()` → acquire `begin_ts` = latest committed timestamp.
-2. Execute reads (recorded in read set with `query_id`s) and writes (buffered in write set).
+1. `begin(options)` → acquire `begin_ts` = `visible_ts` (latest committed + replicated timestamp).
+2. Execute reads (recorded in read set with `query_id`s). If `!readonly`: execute writes (buffered in write set).
 3. `commit()`:
-   a. Acquire the next `commit_ts` (atomic increment).
-   b. Validate the read set against the commit log (see 5.7).
-   c. If valid: persist → invalidate → replicate → notify (see 5.11 for full protocol). If `subscribe`: register read set as subscription.
-   d. If conflict and `subscribe: true`: start a new write transaction at current timestamp, notify client of conflict + new `tx_id`.
-   e. If conflict and `subscribe: false`: return error to client.
+   - Readonly + `subscription != None`: register read set in subscription registry. No OCC.
+   - Readonly + `subscription == None`: no-op (read set discarded).
+   - Read-write: OCC validate → WAL persist → materialize → replicate → register subscription.
+   - On OCC conflict + `Subscribe` mode: auto-start retry transaction, return `ConflictRetry`.
+   - On OCC conflict + other modes: return error to client.
 
-**Subscription chain** (when `subscribe: true`):
+**Subscription chain** (when `subscription: Subscribe`):
 
 ```
 T1 commit (ts=10, queries: [Q0, Q1, Q2])
   → read set registered as subscription
   → future commit at ts=15 invalidates Q1
-    → client notified: { invalidated: [1], new_tx: { id: "...", ts: 15 } }
-    → T2 begins (ts=15)
-      → client re-executes Q1 (or all queries) in T2
-      → T2 commit → subscription updated with new read set
+    → carried_read_set = T1.read_set.split_before(1)  // Q0's intervals
+    → client notified: {
+        invalidated: [1],
+        continuation: { new_tx_id: "...", new_ts: 15,
+                        carried_read_set: [Q0 intervals],
+                        first_query_id: 1 }
+      }
+    → T2 begins (ts=15, read_set initialized with Q0's carried intervals,
+                         next_query_id starts at 1)
+      → client re-executes Q1 and Q2 in T2 (query_ids 1 and 2)
+      → T2 commit → subscription updated with merged read set (carried Q0 + new Q1, Q2)
       → future commit at ts=22 invalidates Q0, Q2
-        → T3 begins (ts=22)
+        → carried_read_set = split_before(0) = empty (Q0 is first affected)
+        → T3 begins (ts=22, empty carried set, first_query_id=0)
+          → client re-executes all queries
           → ...
 ```
 
 Each link in the chain:
 1. Current transaction commits → read set becomes the subscription's watch predicate.
 2. A future commit invalidates part of the read set (detected via conflict rules in 5.7).
-3. Subscription manager creates a new transaction at the latest committed timestamp.
-4. Client is notified with the list of invalidated `query_id`s and the new transaction's ID/timestamp.
-5. Client re-executes the affected queries (or all queries) within the new transaction.
-6. New transaction commits → subscription's read set is updated.
-7. Repeat.
+3. Subscription manager calls `read_set.split_before(min(affected_query_ids))` to extract unaffected intervals.
+4. A new transaction is auto-started at the invalidating `commit_ts`, initialized with the carried read set and `next_query_id = min(affected_query_ids)`.
+5. Client is notified with the list of invalidated `query_id`s and a `ChainContinuation` containing the new transaction and carried read set.
+6. Client re-executes queries from `first_query_id` onward in the new transaction.
+7. New transaction commits → subscription's read set is updated (carried + newly produced intervals).
+8. Repeat.
+
+**Carry-forward correctness:** If intervals for Q0..Q_{min-1} were NOT in `affected_query_ids`, then by definition no commit between `old_ts` and the invalidation `ts` wrote keys overlapping those intervals. The data in those ranges is identical at both timestamps. Therefore carrying those intervals forward is equivalent to re-executing the same queries — the results and intervals would be identical. The carried intervals are byte-range bounds on the encoded key space (timestamp-independent), so they remain valid conflict detectors at the new timestamp.
+
+**Watch mode** (persistent notification without chain):
+
+Watch mode fires on every invalidation but does not auto-start transactions or carry read sets. The subscription persists with its original read set. The client receives `InvalidationEvent` with `affected_query_ids` but no `ChainContinuation`. The client decides when and how to refresh. They can explicitly call `update_read_set()` after re-querying to update the subscription's watch predicate.
 
 ### 5.4 Read-Your-Own-Writes
 
@@ -2045,16 +2062,17 @@ Checking both keys is essential. A document updated from `status="active"` to `s
 
 ### 5.9 Transaction Subscriptions
 
-Subscriptions operate at the **transaction level**: a subscription watches the entire read set of a committed transaction, not an individual query.
+Subscriptions operate at the **transaction level**: a subscription watches the entire read set of a committed transaction, not an individual query. Three subscription modes are available (see section 5.1 `SubscriptionMode`).
 
-**Registration**: when a transaction with `subscribe: true` or `notify: true` commits, its full read set (the `BTreeMap<(CollectionId, IndexId), Vec<ReadInterval>>` from section 5.6) is stored in the subscription registry.
+**Registration**: when a transaction with `subscription != None` commits, its full read set (the `BTreeMap<(CollectionId, IndexId), Vec<ReadInterval>>` from section 5.6) is stored in the subscription registry.
 
 **Invalidation**: on every new commit, check all active subscriptions against the committed index key writes using the same overlap algorithm as OCC validation (section 5.7). For each affected subscription, collect the `query_id`s of overlapping intervals.
 
 | Subscription Mode | On Invalidation |
 |-------------------|----------------|
-| `notify` | Send one-shot notification with affected `query_id`s. Remove subscription. |
-| `subscribe` | Send notification with affected `query_id`s + new transaction `(tx_id, ts)`. Subscription persists — updated when the chain transaction commits its new read set. |
+| `Notify` | Send one-shot notification with affected `query_id`s. Remove subscription. |
+| `Watch` | Send notification with affected `query_id`s. Subscription persists with same read set. No new transaction. |
+| `Subscribe` | Send notification with affected `query_id`s + `ChainContinuation` (new tx + carried read set). Subscription persists — updated when the chain transaction commits. |
 
 **Subscription registry** — indexed for fast invalidation lookup:
 
@@ -2062,6 +2080,8 @@ Subscriptions operate at the **transaction level**: a subscription watches the e
 SubscriptionRegistry {
     // Grouped by (collection, index) for range overlap checks
     index: HashMap<(CollectionId, IndexId), Vec<SubscriptionInterval>>
+    // Metadata per subscription (includes full read set for carry-forward)
+    subscriptions: HashMap<SubscriptionId, SubscriptionMeta>
 }
 
 SubscriptionInterval {
@@ -2069,6 +2089,14 @@ SubscriptionInterval {
     query_id:        QueryId
     lower:           EncodedKey
     upper:           Bound<EncodedKey>
+}
+
+SubscriptionMeta {
+    mode:      SubscriptionMode
+    session_id: u64
+    tx_id:     TxId
+    read_ts:   Ts
+    read_set:  ReadSet   // full read set, needed for split_before()
 }
 ```
 
@@ -2081,9 +2109,56 @@ The registry uses the same `(collection, index)` grouping as the read set and co
    b. For each `IndexKeyWrite`: check if `old_key` or `new_key` falls within any subscription interval (same overlap check as OCC — binary search on sorted intervals).
    c. Collect affected `(subscription_id, query_id)` pairs.
 2. Group by `subscription_id`. Within each group, deduplicate and sort `query_id`s in ascending order.
-3. For each affected subscription: fire **one** notification containing **all** invalidated `query_id`s (ascending). A single commit that overlaps N queries in the same subscription produces exactly one notification with N query IDs — never N separate notifications. For `subscribe` mode: begin a new transaction and include its `tx_id` in the notification.
+3. For each affected subscription: fire **one** notification containing **all** invalidated `query_id`s (ascending). A single commit that overlaps N queries in the same subscription produces exactly one notification with N query IDs — never N separate notifications.
+4. Mode-specific behavior:
+   - `Notify`: remove the subscription after firing.
+   - `Watch`: keep the subscription with the same read set.
+   - `Subscribe`: compute `ChainContinuation` (see below) and include in notification.
 
-**Subscription update on chain commit**: when a chain transaction (the new transaction from step 3) commits, its read set replaces the subscription's previous read set in the registry. Old intervals are removed, new intervals are inserted.
+#### 5.9.1 Chain Continuation with Read Set Carry-Forward
+
+For `Subscribe` mode, when invalidation fires with `affected_query_ids = [Q_min, ...]`:
+
+1. Call `read_set.split_before(Q_min)` to extract intervals with `query_id < Q_min`.
+2. Allocate a new transaction at `read_ts = commit_ts` (the invalidating commit).
+3. Initialize the new transaction's read set with the carried intervals and `next_query_id = Q_min`.
+4. Package as `ChainContinuation`:
+
+```
+ChainContinuation {
+    new_tx_id:         TxId
+    new_ts:            Ts              // = invalidating commit_ts
+    carried_read_set:  ReadSet         // intervals with query_id < Q_min
+    first_query_id:    QueryId         // = Q_min
+}
+```
+
+The client receives this in the `InvalidationEvent` and can:
+- Start using the new transaction immediately
+- Skip re-executing queries Q0..Q_{min-1} (their results are unchanged)
+- Re-execute queries from Q_min onward, which will use query_ids starting at Q_min
+- Commit the new transaction, merging carried + new intervals as the updated subscription
+
+**Correctness:** The carried intervals were provably unaffected — no commit between the subscription's `read_ts` and the invalidation `commit_ts` overlapped them (otherwise those query_ids would have been in the affected set). Since the data in those ranges is identical at both timestamps, carrying the intervals forward is equivalent to re-executing the same queries.
+
+**Edge case — merged intervals:** If Q1 and Q3 were merged into one interval with `query_id = min(1, 3) = 1`, and only Q3 is invalidated (`affected = [3]`), then `split_before(3)` includes the merged interval (since its `query_id = 1 < 3`). This is conservative — the carried interval covers more than strictly needed, but correctness is preserved.
+
+**Edge case — catalog conflicts:** Catalog reads have no individual query_id. A catalog conflict (e.g., collection dropped) maps to `query_id = 0`, so `first_query_id = 0` and `split_before(0)` returns an empty read set. The entire transaction must be re-executed.
+
+**Subscription update on chain commit**: when a chain transaction commits, its read set (carried intervals + newly produced intervals from re-executed queries) replaces the subscription's previous read set in the registry. Old intervals are removed, new intervals are inserted.
+
+#### 5.9.2 Watch Mode Details
+
+Watch mode subscriptions persist across multiple invalidations without auto-starting transactions:
+
+1. Commit A writes into Watch subscription's interval → fire `InvalidationEvent`
+2. Subscription remains in registry with the **same** read set
+3. Commit B writes into the same interval → fire `InvalidationEvent` again
+4. Client explicitly calls `update_read_set()` if they want to refresh, or `remove()` when done
+
+The read set is NOT automatically updated. This means the subscription keeps watching the original key ranges even as the underlying data changes. This is intentional — Watch mode is a "dirty flag" that signals "something changed in your area" without performing the work of refreshing.
+
+Clients can transition from Watch to Subscribe behavior manually by: receiving the invalidation, starting their own transaction, re-querying, and calling `update_read_set()` with the new read set. This gives full control over the refresh timing.
 
 ### 5.10 Query Result Caching
 

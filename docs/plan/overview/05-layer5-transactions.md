@@ -1,6 +1,38 @@
 # Layer 5: Transaction Manager
 
-**Layer purpose:** Timestamp allocation, read/write set management, OCC validation via commit log, subscription registry with invalidation, and the single-writer commit protocol. This is the concurrency and consistency layer.
+**Layer purpose:** Timestamp allocation, read/write set management, OCC validation via commit log, subscription registry with three modes (Notify / Watch / Subscribe), read set carry-forward for subscription chains, and the single-writer commit protocol. This is the concurrency and consistency layer.
+
+**Detailed implementation plan:** See [docs/plan/transactions/](../transactions/00-overview.md)
+
+## Subscription Mode Enum
+
+Previous design had two separate booleans (`notify`, `subscribe`). This is replaced by a single enum:
+
+```rust
+/// Subscription mode — controls post-commit read set behavior.
+/// Mutually exclusive: exactly one mode per transaction.
+pub enum SubscriptionMode {
+    /// No subscription. Read set discarded after commit.
+    None,
+    /// One-shot: fire once on first invalidation, then remove.
+    Notify,
+    /// Persistent: fire on every invalidation, subscription persists.
+    /// No new transaction is auto-started. Client manages re-queries.
+    Watch,
+    /// Persistent with chain continuation: fire, auto-start new tx,
+    /// carry forward unaffected read set intervals.
+    Subscribe,
+}
+```
+
+**Behavior matrix:**
+
+| Scenario | `None` | `Notify` | `Watch` | `Subscribe` |
+|----------|--------|----------|---------|-------------|
+| After commit | Read set discarded | Subscription (one-shot) | Subscription (persistent) | Subscription (persistent) |
+| On invalidation | — | Notify + remove | Notify (keep watching) | Notify + new tx + carry read set |
+| On OCC conflict | Error | Error | Error | Error + auto-retry tx |
+| Read set update | — | — | Manual | Automatic on chain commit |
 
 ## Modules
 
@@ -22,14 +54,16 @@ impl TsAllocator {
 
 > **Note:** `visible_ts` (the latest timestamp safe for new readers) lives on `CommitCoordinator`, not here. `TsAllocator.latest()` tracks the highest *allocated* timestamp, but that may be ahead of what has been replicated. See the "Visibility Fence" section below.
 
-### `read_set.rs` — Read Set (Scanned Intervals)
+### `read_set.rs` — Read Set (Scanned Intervals + Carry-Forward)
 
-**WHY HERE:** Tracks which portions of the index key space a transaction has observed, including catalog reads. Used for OCC validation and subscription invalidation — core transaction semantics.
+**WHY HERE:** Tracks which portions of the index key space a transaction has observed, including catalog reads. Used for OCC validation, subscription invalidation, and carry-forward — core transaction semantics.
 
 ```rust
+pub type QueryId = u32;
+
 /// A single read interval on an index
 pub struct ReadInterval {
-    pub query_id: u32,
+    pub query_id: QueryId,
     pub lower: Vec<u8>,           // inclusive lower bound (encoded key)
     pub upper: Bound<Vec<u8>>,    // Excluded(key) or Unbounded
 }
@@ -38,7 +72,7 @@ pub struct ReadInterval {
 pub struct ReadSet {
     pub intervals: BTreeMap<(CollectionId, IndexId), Vec<ReadInterval>>,
     pub catalog_reads: Vec<CatalogRead>,
-    pub next_query_id: u32,
+    next_query_id: QueryId,
 }
 
 /// Records a catalog observation made during the transaction.
@@ -63,14 +97,27 @@ pub enum CatalogRead {
 
 impl ReadSet {
     pub fn new() -> Self;
+    /// Create with a starting query_id offset (for carry-forward).
+    pub fn with_starting_query_id(first_query_id: QueryId) -> Self;
     pub fn add_interval(&mut self, collection_id: CollectionId, index_id: IndexId,
                         interval: ReadInterval);
     pub fn add_catalog_read(&mut self, read: CatalogRead);
-    pub fn next_query_id(&mut self) -> u32;
+    pub fn next_query_id(&mut self) -> QueryId;
     pub fn merge_overlapping(&mut self);  // merge adjacent/overlapping intervals
     pub fn interval_count(&self) -> usize;
+
+    /// Extract intervals with query_id < threshold into a new ReadSet.
+    /// Used for subscription chain carry-forward.
+    pub fn split_before(&self, threshold: QueryId) -> ReadSet;
+
+    /// Merge another ReadSet into this one (carried + new intervals).
+    pub fn merge_from(&mut self, other: &ReadSet);
 }
 ```
+
+**Carry-forward:** When a subscription chain fires at `query_id = Q_min`, `split_before(Q_min)` extracts unaffected intervals. These are provably unchanged (no concurrent commit touched them), so carrying them to the new transaction is equivalent to re-executing the same queries.
+
+**Interval merging:** When intervals overlap, the merged interval takes `query_id = min(both)`. This is conservative — a wider carried interval may cause more future conflicts, but never fewer.
 
 ### `write_set.rs` — Write Set (Buffered Mutations)
 
@@ -133,20 +180,20 @@ impl WriteSet {
                   previous_ts: Ts);
     pub fn get(&self, collection_id: CollectionId, doc_id: &DocId) -> Option<&MutationEntry>;
     pub fn add_catalog_mutation(&mut self, mutation: CatalogMutation);
-
-    /// Resolve a collection name within this transaction's pending catalog mutations.
-    /// Returns the provisional CollectionId if a CreateCollection is buffered for this name,
-    /// or None if no pending DDL affects this name.
     pub fn resolve_pending_collection(&self, name: &str) -> Option<CollectionId>;
-
-    /// Check if a collection is being dropped in this transaction.
     pub fn is_collection_dropped(&self, collection_id: CollectionId) -> bool;
-
-    /// Compute index deltas for all mutations (section 5.5.1)
-    pub fn compute_index_deltas(&self, catalog: &CatalogCache,
-                                 primary_indexes: &HashMap<CollectionId, PrimaryIndex>,
-                                 ) -> Result<Vec<IndexDelta>>;
+    pub fn is_empty(&self) -> bool;
+    pub fn mutations_for_collection(&self, collection_id: CollectionId)
+        -> impl Iterator<Item = (&DocId, &MutationEntry)>;
 }
+
+/// Compute index deltas (separate function, not method — needs catalog + indexes).
+pub fn compute_index_deltas(
+    write_set: &WriteSet,
+    catalog: &CatalogCache,
+    primary_indexes: &HashMap<CollectionId, PrimaryIndex>,
+    secondary_indexes: &HashMap<IndexId, SecondaryIndex>,
+) -> Result<Vec<IndexDelta>>;
 ```
 
 ### `commit_log.rs` — Commit Log (Recent Commit Tracking)
@@ -178,6 +225,8 @@ impl CommitLog {
     pub fn entries_in_range(&self, begin_ts: Ts, commit_ts: Ts) -> &[CommitLogEntry];
     /// Prune entries no longer needed (commit_ts <= oldest_active_begin_ts)
     pub fn prune(&mut self, oldest_active_begin_ts: Ts);
+    /// Remove specific entry (for rollback on quorum loss)
+    pub fn remove(&mut self, commit_ts: Ts) -> Option<CommitLogEntry>;
 }
 ```
 
@@ -199,6 +248,8 @@ pub fn validate(
 pub struct ConflictError {
     pub conflicting_ts: Ts,
     pub kind: ConflictKind,
+    /// Query IDs whose intervals were overlapped (sorted ascending).
+    pub affected_query_ids: Vec<QueryId>,
 }
 
 pub enum ConflictKind {
@@ -209,31 +260,28 @@ pub enum ConflictKind {
     },
     /// Catalog conflict (concurrent DDL vs this transaction's catalog reads)
     Catalog {
-        description: String,  // e.g., "collection 'users' was dropped"
+        description: String,
     },
 }
 
-/// Check if a key falls within any interval in a group
-fn key_overlaps_intervals(key: &[u8], intervals: &[ReadInterval]) -> Option<u32>;
-// Returns the query_id of the overlapping interval, if any
+/// Check if a key falls within any interval in a group.
+/// Returns the query_id of the overlapping interval, or None.
+/// Uses binary search: O(log I) per key.
+fn key_overlaps_intervals(key: &[u8], intervals: &[ReadInterval]) -> Option<QueryId>;
 
-/// Check if a transaction's catalog reads conflict with a concurrent commit's
-/// catalog mutations. Called as part of validate().
+/// Validate catalog reads against concurrent catalog mutations.
 fn validate_catalog(
     catalog_reads: &[CatalogRead],
     concurrent_catalog_mutations: &[CatalogMutation],
 ) -> Result<(), ConflictError>;
 ```
 
-### `subscriptions.rs` — Subscription Registry
+### `subscriptions.rs` — Subscription Registry (Notify / Watch / Subscribe)
 
-**WHY HERE:** Manages persistent read set watches for reactive invalidation on commit. Indexes intervals by (collection, index) for fast overlap checks.
+**WHY HERE:** Manages persistent read set watches for reactive invalidation on commit. Indexes intervals by (collection, index) for fast overlap checks. Supports three modes with different lifecycles.
 
 ```rust
 pub type SubscriptionId = u64;
-pub type QueryId = u32;
-
-pub enum SubscriptionMode { Notify, Subscribe }
 
 pub struct SubscriptionInterval {
     pub subscription_id: SubscriptionId,
@@ -251,50 +299,73 @@ pub struct SubscriptionRegistry {
 
 pub struct SubscriptionMeta {
     pub mode: SubscriptionMode,
-    pub session_id: u64,  // which client session owns this
+    pub session_id: u64,
     pub tx_id: TxId,
+    pub read_ts: Ts,
+    pub read_set: ReadSet,  // full read set (for split_before on chain continuation)
 }
 
+/// Invalidation event — one per affected subscription per commit.
 pub struct InvalidationEvent {
     pub subscription_id: SubscriptionId,
     pub affected_query_ids: Vec<QueryId>,  // sorted ascending
     pub commit_ts: Ts,
+    /// Chain continuation (present only for Subscribe mode).
+    pub continuation: Option<ChainContinuation>,
+}
+
+/// Chain continuation for Subscribe mode.
+pub struct ChainContinuation {
+    /// New transaction auto-started at the invalidation timestamp.
+    pub new_tx_id: TxId,
+    pub new_ts: Ts,
+    /// Read set intervals from queries BEFORE the first invalidated query.
+    /// Carried forward because they were provably unaffected.
+    pub carried_read_set: ReadSet,
+    /// The first query_id that needs re-execution (= min(affected_query_ids)).
+    pub first_query_id: QueryId,
 }
 
 impl SubscriptionRegistry {
     pub fn new() -> Self;
 
-    /// Register a read set as a subscription
+    /// Register a read set as a subscription.
     pub fn register(&mut self, mode: SubscriptionMode, session_id: u64,
-                    tx_id: TxId, read_set: &ReadSet) -> SubscriptionId;
+                    tx_id: TxId, read_ts: Ts, read_set: ReadSet) -> SubscriptionId;
 
-    /// Remove a subscription
+    /// Remove a subscription.
     pub fn remove(&mut self, id: SubscriptionId);
 
-    /// Check all subscriptions against a new commit's index writes
-    /// Returns all affected subscriptions with their invalidated query IDs
+    /// Check all subscriptions against a new commit's writes.
+    /// For Subscribe mode: computes ChainContinuation with carried read set.
+    /// For Notify mode: marks subscription for removal.
     pub fn check_invalidation(
-        &self,
+        &mut self,
+        commit_ts: Ts,
         index_writes: &BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>>,
+        catalog_mutations: &[CatalogMutation],
+        allocate_tx: impl FnMut() -> TxId,
     ) -> Vec<InvalidationEvent>;
 
-    /// Update a subscription's read set (for chain continuation)
-    pub fn update_read_set(&mut self, id: SubscriptionId, new_read_set: &ReadSet);
+    /// Update a subscription's read set (for chain commit or Watch refresh).
+    pub fn update_read_set(&mut self, id: SubscriptionId, new_read_set: ReadSet);
+
+    /// Remove all subscriptions for a session (on disconnect).
+    pub fn remove_session(&mut self, session_id: u64);
 }
 ```
 
 ### `commit.rs` — Single-Writer Commit Protocol
 
-**WHY HERE:** Orchestrates the full 10-step commit sequence. The serialization point for all writes.
+**WHY HERE:** Orchestrates the full 11-step commit sequence. The serialization point for all writes.
 
 ```rust
 pub struct CommitRequest {
     pub tx_id: TxId,
     pub begin_ts: Ts,
-    pub read_set: ReadSet,       // includes catalog_reads
-    pub write_set: WriteSet,     // includes catalog_mutations
-    pub subscribe: bool,
-    pub notify: bool,
+    pub read_set: ReadSet,
+    pub write_set: WriteSet,
+    pub subscription: SubscriptionMode,
     pub session_id: u64,
 }
 
@@ -305,13 +376,15 @@ pub enum CommitResult {
     },
     Conflict {
         error: ConflictError,
-        new_tx_id: Option<TxId>,   // if subscribe: true
-        new_ts: Option<Ts>,
+        /// For Subscribe mode: auto-retry transaction.
+        retry: Option<ConflictRetry>,
     },
-    QuorumLost {
-        /// The commit was materialized then rolled back. Client should retry
-        /// when cluster recovers.
-    },
+    QuorumLost,
+}
+
+pub struct ConflictRetry {
+    pub new_tx_id: TxId,
+    pub new_ts: Ts,
 }
 
 /// NOTE: The ReplicationHook trait is defined in L6 (database/replication_hook.rs).
@@ -320,66 +393,64 @@ pub enum CommitResult {
 
 pub struct CommitCoordinator {
     ts_allocator: TsAllocator,
-    visible_ts: AtomicU64,  // latest timestamp whose data is safe for new readers
-    commit_log: RwLock<CommitLog>,
-    subscriptions: RwLock<SubscriptionRegistry>,
-    wal_writer: WalWriter,
-    replication: Box<dyn ReplicationHook>,  // injected by L6 (Database)
+    visible_ts: AtomicU64,
+    commit_log: CommitLog,
+    subscriptions: Arc<RwLock<SubscriptionRegistry>>,
+    storage: Arc<StorageEngine>,
+    replication: Box<dyn ReplicationHook>,
     commit_rx: mpsc::Receiver<(CommitRequest, oneshot::Sender<CommitResult>)>,
+    next_tx_id: AtomicU64,
 }
 
 impl CommitCoordinator {
-    pub fn visible_ts(&self) -> Ts;  // latest timestamp safe for new readers
+    pub fn new(
+        initial_ts: Ts,
+        visible_ts: Ts,
+        storage: Arc<StorageEngine>,
+        replication: Box<dyn ReplicationHook>,
+        channel_size: usize,
+    ) -> (Self, CommitHandle);
+
+    pub fn visible_ts(&self) -> Ts;
 
     /// The single-writer commit loop
     pub async fn run(&mut self);
     // For each request:
     //   1. OCC validation (index intervals + catalog reads vs commit log)
+    //      On conflict + Subscribe mode: auto-start retry tx, return ConflictRetry
     //   2. Assign commit_ts
-    //   3. Write WAL record + fsync (includes both data mutations and catalog mutations)
-    //   4a. Apply catalog mutations (allocate B-tree pages, update catalog B-tree,
-    //       update in-memory CatalogCache) — ordered BEFORE data mutations so that
-    //       newly created collections exist before documents are inserted into them
+    //   3. Write WAL record + fsync
+    //   4a. Apply catalog mutations (ordered BEFORE data mutations)
     //   4b. Apply data mutations to page store (via L3)
-    //   5. Update commit log (includes catalog_mutations for future OCC checks)
+    //   5. Update commit log
     //   6. START CONCURRENT:
     //      a. self.replication.replicate_and_wait(lsn, record)
-    //      b. subscriptions.check_invalidation(index_writes)
+    //      b. subscriptions.check_invalidation(index_writes, catalog_mutations)
+    //         For Subscribe mode: computes ChainContinuation with carried read set
     //   7. AWAIT replication (6a)
     //      ON SUCCESS: continue to step 8
-    //      ON FAILURE (quorum lost):
-    //        a. Rollback this commit: delete materialized keys using write_set + index_deltas
-    //           + rollback catalog mutations (remove from catalog B-tree + cache)
-    //        b. Remove this commit from commit_log
-    //        c. Enter hold state (reject new commits)
-    //        d. Return CommitResult::QuorumLost to client
+    //      ON FAILURE: rollback + hold state + QuorumLost
     //   8. Write WAL_RECORD_VISIBLE_TS(commit_ts) + fsync
-    //   9. Advance visible_ts = commit_ts (in-memory)
-    //  10. Respond to committing client
-    //  11. FIRE-AND-FORGET: push invalidation events (6b results) to subscriber sessions
-    //
-    // Notes:
-    // - Steps 6a and 6b run concurrently (tokio::join! or similar).
-    // - Without replication (NoReplication), step 6a is a no-op so
-    //   visible_ts advances immediately after WAL fsync.
-    // - visible_ts is persisted to WAL (WAL_RECORD_VISIBLE_TS) so
-    //   recovery knows the last replicated point.
-    // - New readers use visible_ts (not ts_allocator.latest()) for
-    //   their read_ts.
-    // - On recovery: visible_ts = last WAL_RECORD_VISIBLE_TS found
-    //   during replay.
-    // - Catalog mutations are serialized through the same single-writer,
-    //   so CatalogCache updates never race with each other.
+    //   9. Advance visible_ts = commit_ts
+    //  10. Register subscription (if mode != None) + respond to client
+    //  11. FIRE-AND-FORGET: push invalidation events to subscriber sessions
 }
 
 /// Handle for submitting commit requests from any task
+#[derive(Clone)]
 pub struct CommitHandle {
     tx: mpsc::Sender<(CommitRequest, oneshot::Sender<CommitResult>)>,
+    visible_ts: Arc<AtomicU64>,
+    ts_allocator: Arc<TsAllocator>,
+    subscriptions: Arc<RwLock<SubscriptionRegistry>>,
+    next_tx_id: Arc<AtomicU64>,
 }
 
 impl CommitHandle {
     pub async fn commit(&self, request: CommitRequest) -> CommitResult;
-    pub fn visible_ts(&self) -> Ts;  // delegates to CommitCoordinator's AtomicU64
+    pub fn visible_ts(&self) -> Ts;
+    pub fn allocate_tx_id(&self) -> TxId;
+    pub fn subscriptions(&self) -> &Arc<RwLock<SubscriptionRegistry>>;
 }
 ```
 
@@ -389,7 +460,7 @@ impl CommitHandle {
 
 **Key rules:**
 
-- `begin_readonly()` uses `visible_ts`, **NOT** `ts_allocator.latest()`.
+- `begin()` uses `visible_ts`, **NOT** `ts_allocator.latest()`.
 - `visible_ts` only advances after replication confirms the commit **AND** the advancement is persisted to WAL (via `WAL_RECORD_VISIBLE_TS`).
 - Without replication (`NoReplication`): `visible_ts` advances immediately after the commit's WAL fsync — no fence is needed.
 
@@ -420,11 +491,12 @@ Vacuum must use `min(oldest_active_read_ts, visible_ts)` as its safe threshold -
 
 | Interface | Used By | Purpose |
 |-----------|---------|---------|
+| `SubscriptionMode` | L6 (TransactionOptions) | Transaction subscription mode |
 | `TsAllocator` | L5 internal, L6 (Database) | Timestamp management |
-| `ReadSet`, `ReadInterval`, `CatalogRead` | L4 (produces), L5 (validates), L6 (DDL), L7 (replication) | Conflict surface |
+| `ReadSet`, `ReadInterval`, `CatalogRead` | L4 (produces), L5 (validates), L6 (DDL), L7 (replication) | Conflict surface + carry-forward |
 | `WriteSet`, `MutationEntry`, `CatalogMutation` | L4 (read-your-writes), L5 (commit), L6 (DDL) | Buffered mutations (data + catalog) |
-| `CommitHandle::commit` | L6 (Database), L8 (session) | Submit commit request |
-| `CommitResult` | L6 (transaction API), L8 (session response) | Success/conflict reporting |
+| `CommitHandle::commit` | L6 (Database) | Submit commit request |
+| `CommitResult`, `ConflictRetry` | L6 (transaction API), L8 (session response) | Success/conflict/retry reporting |
 | `SubscriptionRegistry` | L5 internal, L6 (Database) | Subscription management |
-| `InvalidationEvent` | L6 (callback), L8 (push to client) | Subscription invalidation |
+| `InvalidationEvent`, `ChainContinuation` | L6 (callback), L8 (push to client) | Subscription invalidation + chain |
 | `CommitLog` | L5 internal | OCC validation data |

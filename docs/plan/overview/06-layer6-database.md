@@ -60,13 +60,17 @@ impl Database {
 
     // --- Transaction API ---
 
-    /// Begin a read-only transaction (snapshot at current visible_ts —
-    /// the latest replicated/committed timestamp, not ts_allocator.latest())
-    pub fn begin_readonly(&self) -> ReadonlyTransaction;
+    /// Begin a transaction with the given options.
+    /// The single entry point replaces the previous begin_readonly / begin_mutation split.
+    /// read_ts is set to visible_ts (latest replicated/committed timestamp).
+    /// Returns error if readonly=false and replication hook reports no quorum or hold state.
+    pub fn begin(&self, opts: TransactionOptions) -> Result<Transaction>;
 
-    /// Begin a read-write transaction.
-    /// Returns error if replication hook reports no quorum or hold state.
-    pub fn begin_mutation(&self) -> Result<MutationTransaction>;
+    // Convenience aliases:
+    // pub fn begin_readonly(&self) -> Transaction
+    //     { self.begin(TransactionOptions { readonly: true, ..Default::default() })? }
+    // pub fn begin_mutation(&self) -> Result<Transaction>
+    //     { self.begin(TransactionOptions::default())? }
 
     // --- Read-Only Catalog Access (outside transactions) ---
     // These are convenience methods that read the current committed catalog state.
@@ -97,44 +101,60 @@ impl Database {
 }
 ```
 
-### Transaction API (within `database.rs`)
+### Transaction Options
 
 ```rust
-/// Read-only transaction — snapshot isolation.
-/// `read_ts` is set to `visible_ts` (the latest replicated/committed timestamp),
-/// ensuring readers only see data that has been fully committed and replicated.
-pub struct ReadonlyTransaction<'db> {
-    db: &'db Database,
-    read_ts: Ts,
-    read_set: ReadSet,
+/// Options for beginning a transaction.
+/// Replaces the previous begin_readonly() / begin_mutation() split.
+pub struct TransactionOptions {
+    /// If true, write operations (insert, replace, patch, delete, DDL)
+    /// return an error. No OCC validation at commit. No write set allocated.
+    pub readonly: bool,
+    /// Subscription mode — controls what happens to the read set after commit.
+    /// See L5 SubscriptionMode for full semantics.
+    pub subscription: SubscriptionMode,
 }
 
-impl<'db> ReadonlyTransaction<'db> {
+impl Default for TransactionOptions {
+    fn default() -> Self {
+        Self {
+            readonly: false,
+            subscription: SubscriptionMode::None,
+        }
+    }
+}
+```
+
+### Unified Transaction API (within `database.rs`)
+
+```rust
+/// Unified transaction — handles both reads and writes.
+/// Whether writes are allowed is controlled by `opts.readonly`.
+///
+/// `begin_ts` is set to `visible_ts` (the latest replicated/committed timestamp),
+/// ensuring the snapshot only includes fully committed and replicated data.
+///
+/// For Subscribe-mode chain continuations, the transaction may be initialized
+/// with a carried read set and a non-zero starting query_id.
+pub struct Transaction<'db> {
+    db: &'db Database,
+    tx_id: TxId,
+    opts: TransactionOptions,
+    begin_ts: Ts,
+    read_set: ReadSet,
+    write_set: WriteSet,  // empty if readonly (no allocation)
+}
+
+impl<'db> Transaction<'db> {
+    // --- Read Operations (always available) ---
+
     pub fn get(&mut self, collection: &str, doc_id: &DocId) -> Result<Option<Document>>;
     pub fn query(&mut self, collection: &str, index: &str,
                  range: &[RangeExpr], filter: Option<&Filter>,
                  order: Option<ScanDirection>, limit: Option<usize>)
         -> Result<Vec<Document>>;
 
-    // --- Catalog reads (recorded in read set for subscriptions) ---
-    pub fn list_collections(&mut self) -> Vec<CollectionMeta>;
-    pub fn list_indexes(&mut self, collection: &str) -> Vec<IndexMeta>;
-
-    pub fn rollback(self);  // explicit discard (also happens on drop)
-}
-
-/// Read-write transaction — OCC with write buffering.
-/// Supports both document mutations and catalog DDL operations.
-/// All operations are buffered and applied atomically at commit time.
-pub struct MutationTransaction<'db> {
-    db: &'db Database,
-    begin_ts: Ts,
-    read_set: ReadSet,
-    write_set: WriteSet,
-}
-
-impl<'db> MutationTransaction<'db> {
-    // --- Document Operations ---
+    // --- Write Operations (error if readonly) ---
 
     pub fn insert(&mut self, collection: &str, body: serde_json::Value) -> Result<DocId>;
     pub fn replace(&mut self, collection: &str, doc_id: &DocId,
@@ -142,50 +162,67 @@ impl<'db> MutationTransaction<'db> {
     pub fn patch(&mut self, collection: &str, doc_id: &DocId,
                  patch: serde_json::Value) -> Result<()>;
     pub fn delete(&mut self, collection: &str, doc_id: &DocId) -> Result<()>;
-    pub fn get(&mut self, collection: &str, doc_id: &DocId) -> Result<Option<Document>>;
-    pub fn query(&mut self, collection: &str, index: &str,
-                 range: &[RangeExpr], filter: Option<&Filter>,
-                 order: Option<ScanDirection>, limit: Option<usize>)
-        -> Result<Vec<Document>>;
 
-    // --- Collection Management (DDL) ---
-    // These buffer CatalogMutation entries in the write set.
-    // Applied atomically with document mutations at commit time.
+    // --- Collection Management (DDL, error if readonly) ---
 
     /// Create a collection. Returns a provisional CollectionId that can be
     /// used immediately for inserts within this same transaction.
-    /// The ID is allocated eagerly from the atomic counter; on abort it is
-    /// simply never committed (harmless gap in the ID sequence).
     pub fn create_collection(&mut self, name: &str) -> Result<CollectionId>;
-
-    /// Drop a collection. All documents in the collection become inaccessible
-    /// after commit. Records a CatalogRead::CollectionByName for OCC.
     pub fn drop_collection(&mut self, name: &str) -> Result<()>;
 
-    // --- Index Management (DDL) ---
+    // --- Index Management (DDL, error if readonly) ---
 
-    /// Create a secondary index. The index starts in Building state after commit.
-    /// A background task performs the backfill scan, then transitions to Ready.
     pub fn create_index(&mut self, collection: &str, name: &str,
                         fields: Vec<FieldPath>) -> Result<IndexId>;
-
-    /// Drop an index. The index is marked Dropping at commit time and
-    /// cleaned up by a background task.
     pub fn drop_index(&mut self, collection: &str, name: &str) -> Result<()>;
 
-    // --- Catalog reads (recorded in read set for OCC) ---
+    // --- Catalog reads (recorded in read set for OCC / subscriptions) ---
     pub fn list_collections(&mut self) -> Vec<CollectionMeta>;
     pub fn list_indexes(&mut self, collection: &str) -> Vec<IndexMeta>;
 
-    /// Commit the transaction (OCC validate + persist + materialize)
-    pub async fn commit(self, options: CommitOptions) -> CommitResult;
+    // --- Lifecycle ---
 
-    pub fn rollback(self);  // explicit discard
+    /// Commit the transaction.
+    /// - Readonly + subscription: registers read set, no OCC.
+    /// - Readonly + None: no-op (read set discarded).
+    /// - Read-write: OCC validate + WAL + materialize + register subscription.
+    pub async fn commit(self) -> CommitResult;
+
+    /// Explicit rollback (also happens on drop).
+    pub fn rollback(self);
+
+    // --- Introspection ---
+
+    pub fn tx_id(&self) -> TxId;
+    pub fn begin_ts(&self) -> Ts;
+    pub fn is_readonly(&self) -> bool;
+    pub fn subscription_mode(&self) -> SubscriptionMode;
 }
+```
 
-pub struct CommitOptions {
-    pub subscribe: bool,    // register read set as subscription
-    pub notify: bool,       // one-shot invalidation notification
+### Chain Continuation Transaction
+
+When a `Subscribe`-mode subscription is invalidated, a new `Transaction` is auto-started internally by the commit coordinator. L6 constructs it with the carried read set:
+
+```rust
+impl Database {
+    /// Create a chain continuation transaction (internal, not public API).
+    /// Called when Subscribe invalidation fires.
+    fn begin_chain_continuation(
+        &self,
+        continuation: &ChainContinuation,
+        opts: TransactionOptions,
+    ) -> Transaction {
+        Transaction {
+            db: self,
+            tx_id: continuation.new_tx_id,
+            opts,
+            begin_ts: continuation.new_ts,
+            read_set: ReadSet::with_starting_query_id(continuation.first_query_id)
+                .merge_from(&continuation.carried_read_set),
+            write_set: WriteSet::new(),
+        }
+    }
 }
 ```
 
@@ -367,39 +404,59 @@ pub struct TransactionConfig {
 let db = Database::open("./mydata", DatabaseConfig::default(), None).await?;
 
 // Create collection + insert documents atomically in one transaction
-let mut tx = db.begin_mutation()?;
+let mut tx = db.begin(TransactionOptions::default())?;  // read-write, no subscription
 tx.create_collection("users")?;
 let id = tx.insert("users", json!({"name": "Alice", "age": 30}))?;
 let doc = tx.get("users", &id)?;
-tx.commit(CommitOptions::default()).await?;
+tx.commit().await?;
 
-let tx = db.begin_readonly();
+// Read-only transaction
+let mut tx = db.begin(TransactionOptions { readonly: true, ..Default::default() })?;
 let results = tx.query("users", "_created_at", &[], None, None, Some(10))?;
+tx.rollback();  // or just drop
 
 db.close().await?;
 ```
 
 ```rust
-// In-memory (ephemeral) — no files, no I/O, data lost on close
-let db = Database::open_in_memory(DatabaseConfig::default(), None).await?;
-
-let mut tx = db.begin_mutation()?;
-tx.create_collection("cache")?;
-tx.insert("cache", json!({"key": "session_123", "data": "..."}))?;
-tx.commit(CommitOptions::default()).await?;
-// Same API — everything works, just no disk persistence
+// Subscribe mode — live query subscription chain
+let mut tx = db.begin(TransactionOptions {
+    readonly: true,
+    subscription: SubscriptionMode::Subscribe,
+})?;
+let users = tx.query("users", "_created_at", &[], None, None, Some(50))?;  // query_id=0
+let orders = tx.query("orders", "by_status", &[eq("status", "active")], None, None, None)?;  // query_id=1
+let result = tx.commit().await?;
+// result.subscription_id is Some(...)
+// When a future commit invalidates query_id=1:
+//   → InvalidationEvent with affected_query_ids=[1], continuation with:
+//     carried_read_set (query_id=0's intervals), first_query_id=1
+//   → Client re-executes query_id=1 in the new transaction
 ```
 
 ```rust
-// DDL and data in separate transactions also works
-let mut tx = db.begin_mutation()?;
+// Watch mode — persistent notification without auto-transaction
+let mut tx = db.begin(TransactionOptions {
+    readonly: true,
+    subscription: SubscriptionMode::Watch,
+})?;
+let users = tx.query("users", "_created_at", &[], None, None, Some(50))?;
+let result = tx.commit().await?;
+// Every time a commit touches the watched interval:
+//   → InvalidationEvent with affected_query_ids (no continuation)
+//   → Client decides when/how to refresh
+```
+
+```rust
+// DDL and data in separate transactions
+let mut tx = db.begin(TransactionOptions::default())?;
 tx.create_collection("orders")?;
 tx.create_index("orders", "by_customer", vec![FieldPath::single("customer_id")])?;
-tx.commit(CommitOptions::default()).await?;
+tx.commit().await?;
 
-let mut tx = db.begin_mutation()?;
+let mut tx = db.begin(TransactionOptions::default())?;
 tx.insert("orders", json!({"customer_id": "c1", "total": 99.99}))?;
-tx.commit(CommitOptions::default()).await?;
+tx.commit().await?;
 ```
 
 ## Startup Sequence (Embedded)
@@ -485,12 +542,15 @@ The file header (page 0) stores the root pages of both catalog B-trees.
 | Interface | Used By | Purpose |
 |-----------|---------|---------|
 | `Database::open/close` | L7 (replication), L8 (server) | Lifecycle |
-| `Database::begin_readonly/begin_mutation` | L8 (session) | Transaction access |
-| `MutationTransaction::create/drop_collection` | L8 (session) | Transactional schema management |
-| `MutationTransaction::create/drop_index` | L8 (session) | Transactional index management |
+| `Database::begin(TransactionOptions)` | L8 (session) | Unified transaction entry point |
+| `Transaction::insert/replace/patch/delete` | L8 (session) | Document mutations |
+| `Transaction::create/drop_collection` | L8 (session) | Transactional schema management |
+| `Transaction::create/drop_index` | L8 (session) | Transactional index management |
+| `Transaction::commit()` | L8 (session) | Commit with subscription mode from options |
+| `TransactionOptions` | L8 (session) | Transaction configuration |
 | `Database::subscriptions()` | L8 (push notifications) | Subscription access |
 | `Database::storage()` | L7 (WAL streaming) | Storage access for replication |
 | `ReplicationHook` trait | L7 (implements) | Replication callback |
 | `SystemDatabase` | L8 (server) | Multi-database management |
-| `CommitResult` | L8 (session response) | Success/conflict reporting |
-| `InvalidationEvent` | L8 (push to client) | Subscription invalidation |
+| `CommitResult`, `ConflictRetry` | L8 (session response) | Success/conflict/retry reporting |
+| `InvalidationEvent`, `ChainContinuation` | L8 (push to client) | Subscription invalidation + chain |

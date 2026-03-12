@@ -1,0 +1,3 @@
+- How to end subscription?
+- Reset transaction state option (clear read/write sets)
+- drop(tx)? drop(sub)?

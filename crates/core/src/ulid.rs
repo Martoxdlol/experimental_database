@@ -89,7 +89,7 @@ pub fn encode_ulid(id: &DocId) -> String {
         let shift = 125 - (i * 5);
         *byte = CROCKFORD[(val >> shift) as usize & 0x1F];
     }
-    String::from_utf8(result.to_vec()).unwrap()
+    String::from_utf8(result.to_vec()).expect("CROCKFORD table is ASCII")
 }
 
 /// Decode Crockford Base32 string to DocId (case-insensitive).

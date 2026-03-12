@@ -304,7 +304,7 @@ impl FileWalStorage {
         segments.sort_by_key(|s| s.base_lsn);
 
         // Open the latest segment for appending
-        let last = segments.last().unwrap();
+        let last = segments.last().expect("checked non-empty above");
         let active_segment = OpenOptions::new().read(true).append(true).open(&last.path)?;
         let active_segment_id = last.segment_id;
         let active_base_lsn = last.base_lsn;

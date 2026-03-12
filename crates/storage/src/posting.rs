@@ -82,7 +82,7 @@ impl PostingList {
             .into());
         }
 
-        let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(data[0..4].try_into().expect("bounds checked above")) as usize;
         let mut offset = 4;
         let mut entries = Vec::with_capacity(count);
 
@@ -94,7 +94,7 @@ impl PostingList {
                 .into());
             }
             let key_len =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                u16::from_le_bytes(data[offset..offset + 2].try_into().expect("bounds checked above")) as usize;
             offset += 2;
 
             if offset + key_len > data.len() {
@@ -113,7 +113,7 @@ impl PostingList {
                 .into());
             }
             let value_len =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
+                u16::from_le_bytes(data[offset..offset + 2].try_into().expect("bounds checked above")) as usize;
             offset += 2;
 
             if offset + value_len > data.len() {

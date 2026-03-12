@@ -61,11 +61,11 @@ impl DwbHeader {
     /// Deserialize a header from a 16-byte buffer.
     fn from_bytes(buf: &[u8; DWB_HEADER_SIZE]) -> Self {
         Self {
-            magic: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
-            version: u16::from_le_bytes(buf[4..6].try_into().unwrap()),
-            page_size: u16::from_le_bytes(buf[6..8].try_into().unwrap()),
-            page_count: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            checksum: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            magic: u32::from_le_bytes(buf[0..4].try_into().expect("fixed-size slice")),
+            version: u16::from_le_bytes(buf[4..6].try_into().expect("fixed-size slice")),
+            page_size: u16::from_le_bytes(buf[6..8].try_into().expect("fixed-size slice")),
+            page_count: u32::from_le_bytes(buf[8..12].try_into().expect("fixed-size slice")),
+            checksum: u32::from_le_bytes(buf[12..16].try_into().expect("fixed-size slice")),
         }
     }
 
@@ -233,7 +233,7 @@ impl DoubleWriteBuffer {
                         break;
                     }
 
-                    let page_id = u32::from_le_bytes(entry_buf[0..4].try_into().unwrap());
+                    let page_id = u32::from_le_bytes(entry_buf[0..4].try_into().expect("entry_buf has at least 4 bytes"));
                     let page_data = entry_buf[DWB_ENTRY_PREFIX_SIZE..].to_vec();
                     entries.push((page_id, page_data));
                 }

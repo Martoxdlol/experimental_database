@@ -207,7 +207,7 @@ impl<'a> SlottedPage<'a> {
 
     /// Read the page header (copies 32 bytes out of the buffer).
     pub fn header(&self) -> PageHeader {
-        *PageHeader::ref_from_bytes(&self.buf[..PAGE_HEADER_SIZE]).unwrap()
+        *PageHeader::ref_from_bytes(&self.buf[..PAGE_HEADER_SIZE]).expect("buf validated in from_buf")
     }
 
     /// Write a page header into the buffer.
@@ -575,7 +575,7 @@ impl<'a> SlottedPageRef<'a> {
 
     /// Read the page header.
     pub fn header(&self) -> PageHeader {
-        *PageHeader::ref_from_bytes(&self.buf[..PAGE_HEADER_SIZE]).unwrap()
+        *PageHeader::ref_from_bytes(&self.buf[..PAGE_HEADER_SIZE]).expect("buf validated in from_buf")
     }
 
     /// Return the page identifier.

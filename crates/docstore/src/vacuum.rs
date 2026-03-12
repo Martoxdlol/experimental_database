@@ -82,8 +82,8 @@ impl VacuumCoordinator {
                 // Check if entry was external (heap-stored body)
                 if let Some(value) = primary.btree().get(&key).await? {
                     let flags = CellFlags::from_byte(value[0]);
-                    if flags.external && !flags.tombstone {
-                        let href_bytes: [u8; 6] = value[5..11].try_into().unwrap();
+                    if flags.external && !flags.tombstone && value.len() >= 11 {
+                        let href_bytes: [u8; 6] = value[5..11].try_into().expect("bounds checked above");
                         let href = exdb_storage::heap::HeapRef::from_bytes(&href_bytes);
                         primary.engine().heap_free(href).await?;
                     }

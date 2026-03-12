@@ -435,7 +435,7 @@ fn parse_single_range(v: &serde_json::Value) -> Result<RangeExpr, String> {
     if obj.len() != 1 {
         return Err("Range expr must have exactly one key (Eq, Gt, Gte, Lt, Lte)".into());
     }
-    let (op, args) = obj.iter().next().unwrap();
+    let (op, args) = obj.iter().next().expect("len == 1 checked above");
     let arr = args.as_array().ok_or("Range value must be [field, value]")?;
     if arr.len() != 2 {
         return Err("Range value must be [field, value]".into());
@@ -465,7 +465,7 @@ fn parse_filter_value(v: &serde_json::Value) -> Result<Filter, String> {
     if obj.len() != 1 {
         return Err("Filter object must have exactly one key".into());
     }
-    let (op, args) = obj.iter().next().unwrap();
+    let (op, args) = obj.iter().next().expect("len == 1 checked above");
     match op.as_str() {
         "Eq" | "eq" => parse_comparison_filter(args, |fp, s| Filter::Eq(fp, s)),
         "Ne" | "ne" => parse_comparison_filter(args, |fp, s| Filter::Ne(fp, s)),

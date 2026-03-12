@@ -24,7 +24,7 @@ pub fn apply_patch(base: &mut serde_json::Value, patch: &serde_json::Value) {
         if !base.is_object() {
             *base = serde_json::Value::Object(serde_json::Map::new());
         }
-        let base_map = base.as_object_mut().unwrap();
+        let base_map = base.as_object_mut().expect("checked is_object above");
         for (key, value) in patch_map {
             if value.is_null() {
                 base_map.remove(key);

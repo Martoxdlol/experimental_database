@@ -155,7 +155,7 @@ pub fn parse_primary_key(key: &[u8]) -> Result<(DocId, Ts), String> {
     }
     let mut id_bytes = [0u8; 16];
     id_bytes.copy_from_slice(&key[0..16]);
-    let inv = u64::from_be_bytes(key[16..24].try_into().unwrap());
+    let inv = u64::from_be_bytes(key[16..24].try_into().expect("length checked above"));
     Ok((DocId(id_bytes), u64::MAX - inv))
 }
 
@@ -187,7 +187,7 @@ pub fn parse_secondary_key_suffix(key: &[u8]) -> Result<(DocId, Ts), String> {
     let suffix = &key[key.len() - 24..];
     let mut id_bytes = [0u8; 16];
     id_bytes.copy_from_slice(&suffix[0..16]);
-    let inv = u64::from_be_bytes(suffix[16..24].try_into().unwrap());
+    let inv = u64::from_be_bytes(suffix[16..24].try_into().expect("length checked above"));
     Ok((DocId(id_bytes), u64::MAX - inv))
 }
 

@@ -240,16 +240,25 @@ impl PrimaryIndex {
 /// or the HeapRef for external storage. This is a sync helper to avoid
 /// holding !Send types in async generators.
 fn decode_cell_body(value: &[u8]) -> std::io::Result<Result<Vec<u8>, HeapRef>> {
+    if value.len() < 5 {
+        return Err(std::io::Error::other("cell value too short for header"));
+    }
     let flags = CellFlags::from_byte(value[0]);
     debug_assert!(!flags.tombstone, "decode_cell_body called on tombstone");
 
-    let body_len = u32::from_le_bytes(value[1..5].try_into().unwrap()) as usize;
+    let body_len = u32::from_le_bytes(value[1..5].try_into().expect("bounds checked above")) as usize;
 
     if flags.external {
-        let href_bytes: [u8; 6] = value[5..11].try_into().unwrap();
+        if value.len() < 11 {
+            return Err(std::io::Error::other("cell value too short for external ref"));
+        }
+        let href_bytes: [u8; 6] = value[5..11].try_into().expect("bounds checked above");
         let href = HeapRef::from_bytes(&href_bytes);
         Ok(Err(href)) // Err variant = external, needs heap_load
     } else {
+        if value.len() < 5 + body_len {
+            return Err(std::io::Error::other("cell value too short for inline body"));
+        }
         Ok(Ok(value[5..5 + body_len].to_vec())) // Ok variant = inline
     }
 }

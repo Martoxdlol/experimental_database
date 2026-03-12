@@ -749,9 +749,11 @@ impl DbHandle {
             let flags = CellFlags::from_byte(value[0]);
             let body_preview = if flags.tombstone {
                 "(tombstone)".to_string()
-            } else if flags.external {
-                let body_len = u32::from_le_bytes(value[1..5].try_into().unwrap());
+            } else if flags.external && value.len() >= 5 {
+                let body_len = u32::from_le_bytes(value[1..5].try_into().expect("bounds checked above"));
                 format!("(external, {} bytes)", body_len)
+            } else if flags.external {
+                "(external, corrupt cell)".to_string()
             } else if value.len() > 5 {
                 let body = &value[5..];
                 match decode_body_json(body) {
@@ -1068,13 +1070,13 @@ fn decode_cell(bytes: &[u8]) -> Result<String, String> {
     if bytes.len() < 5 {
         return Err("cell too short for inline/external".into());
     }
-    let body_len = u32::from_le_bytes(bytes[1..5].try_into().unwrap());
+    let body_len = u32::from_le_bytes(bytes[1..5].try_into().expect("len >= 5 checked above"));
     if flags.external {
         if bytes.len() < 11 {
             return Err("cell too short for external ref".into());
         }
-        let page_id = u32::from_le_bytes(bytes[5..9].try_into().unwrap());
-        let slot_id = u16::from_le_bytes(bytes[9..11].try_into().unwrap());
+        let page_id = u32::from_le_bytes(bytes[5..9].try_into().expect("len >= 11 checked above"));
+        let slot_id = u16::from_le_bytes(bytes[9..11].try_into().expect("len >= 11 checked above"));
         Ok(format!(
             "External\nbody_len:  {body_len}\nheap_page: {page_id}\nheap_slot: {slot_id}"
         ))

@@ -227,4 +227,144 @@ mod tests {
         // Different type tags
         assert_ne!(entries[0][0], entries[1][0]);
     }
+
+    // ─── Additional edge case tests ───
+
+    #[test]
+    fn single_element_array() {
+        let doc = json!({"tags": ["only"]});
+        let paths = [FieldPath::single("tags")];
+        let entries = compute_index_entries(&doc, &paths).unwrap();
+        assert_eq!(entries.len(), 1);
+        let expected = encode_scalar(&Scalar::String("only".into()));
+        assert_eq!(entries[0], expected);
+    }
+
+    #[test]
+    fn deeply_nested_field() {
+        let doc = json!({"a": {"b": {"c": "deep"}}});
+        let paths = [FieldPath::new(vec!["a".into(), "b".into(), "c".into()])];
+        let entries = compute_index_entries(&doc, &paths).unwrap();
+        assert_eq!(entries.len(), 1);
+        let expected = encode_scalar(&Scalar::String("deep".into()));
+        assert_eq!(entries[0], expected);
+    }
+
+    #[test]
+    fn deeply_nested_missing() {
+        let doc = json!({"a": {"b": {}}});
+        let paths = [FieldPath::new(vec!["a".into(), "b".into(), "c".into()])];
+        let entries = compute_index_entries(&doc, &paths).unwrap();
+        assert_eq!(entries.len(), 1);
+        // Missing → Undefined
+        assert_eq!(entries[0][0], 0x00);
+    }
+
+    #[test]
+    fn compound_with_missing_and_array() {
+        // First field missing, second field is array
+        let doc = json!({"tags": ["x", "y"]});
+        let paths = [FieldPath::single("name"), FieldPath::single("tags")];
+        let entries = compute_index_entries(&doc, &paths).unwrap();
+        assert_eq!(entries.len(), 2);
+        // Each should start with undefined tag (0x00) for missing name
+        for entry in &entries {
+            assert_eq!(entry[0], 0x00);
+        }
+    }
+
+    #[test]
+    fn array_of_null_values() {
+        let doc = json!({"vals": [null, null, null]});
+        let paths = [FieldPath::single("vals")];
+        let entries = compute_index_entries(&doc, &paths).unwrap();
+        assert_eq!(entries.len(), 3);
+        // All should have null tag
+        for entry in &entries {
+            assert_eq!(entry[0], 0x01);
+        }
+    }
+
+    #[test]
+    fn array_of_booleans() {
+        let doc = json!({"flags": [true, false, true]});
+        let paths = [FieldPath::single("flags")];
+        let entries = compute_index_entries(&doc, &paths).unwrap();
+        assert_eq!(entries.len(), 3);
+    }
+
+    #[test]
+    fn array_of_numbers() {
+        let doc = json!({"nums": [1, 2, 3, -1, 0]});
+        let paths = [FieldPath::single("nums")];
+        let entries = compute_index_entries(&doc, &paths).unwrap();
+        assert_eq!(entries.len(), 5);
+        // Entries should be in order-preserving encoding — verify ordering
+        // -1 < 0 < 1 < 2 < 3 in encoded form
+        let sorted: Vec<_> = {
+            let mut e = entries.clone();
+            e.sort();
+            e
+        };
+        // The entries corresponding to -1, 0, 1, 2, 3 should sort correctly
+        assert!(sorted[0] < sorted[1]); // -1 < 0
+        assert!(sorted[1] < sorted[2]); // 0 < 1
+    }
+
+    #[test]
+    fn compound_three_fields_one_array() {
+        let doc = json!({"a": 1, "b": ["x", "y"], "c": true});
+        let paths = [
+            FieldPath::single("a"),
+            FieldPath::single("b"),
+            FieldPath::single("c"),
+        ];
+        let entries = compute_index_entries(&doc, &paths).unwrap();
+        assert_eq!(entries.len(), 2); // 2 array elements
+    }
+
+    #[test]
+    fn compound_three_fields_no_array() {
+        let doc = json!({"a": 1, "b": "hello", "c": true});
+        let paths = [
+            FieldPath::single("a"),
+            FieldPath::single("b"),
+            FieldPath::single("c"),
+        ];
+        let entries = compute_index_entries(&doc, &paths).unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn nested_array_field_in_compound() {
+        let doc = json!({"user": {"tags": ["a", "b"]}});
+        let paths = [FieldPath::new(vec!["user".into(), "tags".into()])];
+        let entries = compute_index_entries(&doc, &paths).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn object_field_becomes_undefined() {
+        // Objects don't map to scalars
+        let doc = json!({"nested": {"a": 1}});
+        let paths = [FieldPath::single("nested")];
+        let entries = compute_index_entries(&doc, &paths).unwrap();
+        assert_eq!(entries.len(), 1);
+        // Object → Undefined via json_to_scalar
+        assert_eq!(entries[0][0], 0x00);
+    }
+
+    #[test]
+    fn validate_single_array_ok() {
+        let doc = json!({"a": 1, "b": [1, 2]});
+        let paths = [FieldPath::single("a"), FieldPath::single("b")];
+        assert!(validate_array_constraint(&doc, &paths).is_ok());
+    }
+
+    #[test]
+    fn validate_no_arrays_ok() {
+        let doc = json!({"a": 1, "b": 2});
+        let paths = [FieldPath::single("a"), FieldPath::single("b")];
+        assert!(validate_array_constraint(&doc, &paths).is_ok());
+    }
 }

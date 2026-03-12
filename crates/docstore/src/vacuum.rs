@@ -487,4 +487,148 @@ mod tests {
         assert!(primary.get_at_ts(&d1, 15).unwrap().is_none());
         assert!(primary.get_at_ts(&d2, 15).unwrap().is_none());
     }
+
+    // ─── Additional vacuum tests ───
+
+    #[tokio::test]
+    async fn drain_eligible_all() {
+        let mut vc = VacuumCoordinator::new();
+        for i in 1..=5u64 {
+            vc.push_candidate(VacuumCandidate {
+                collection_id: CollectionId(1),
+                doc_id: doc(i as u8),
+                old_ts: i,
+                superseding_ts: i + 1,
+                old_index_keys: vec![],
+            });
+        }
+        let eligible = vc.drain_eligible(u64::MAX);
+        assert_eq!(eligible.len(), 5);
+        assert_eq!(vc.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn vacuum_coordinator_default() {
+        let vc = VacuumCoordinator::default();
+        assert_eq!(vc.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn vacuum_external_body() {
+        // Verify that external (heap-stored) bodies are freed during vacuum
+        let engine = Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).unwrap());
+        let primary_btree = engine.create_btree().unwrap();
+        let primary = Arc::new(PrimaryIndex::new(primary_btree, engine.clone(), 10)); // low threshold
+
+        let d = doc(1);
+        let big = vec![0xAB; 100]; // > 10 bytes → external
+        primary.insert_version(&d, 1, Some(&big)).unwrap();
+        primary.insert_version(&d, 5, Some(&big)).unwrap();
+
+        let mut primaries = HashMap::new();
+        primaries.insert(CollectionId(1), primary.clone());
+        let secondaries = HashMap::new();
+
+        let vc = VacuumCoordinator::new();
+        let candidates = vec![VacuumCandidate {
+            collection_id: CollectionId(1),
+            doc_id: d,
+            old_ts: 1,
+            superseding_ts: 5,
+            old_index_keys: vec![],
+        }];
+        let removed = vc.execute(&candidates, &primaries, &secondaries).unwrap();
+        assert_eq!(removed, 1);
+
+        // New version still accessible
+        assert_eq!(primary.get_at_ts(&d, 10).unwrap().unwrap(), big);
+    }
+
+    #[tokio::test]
+    async fn rollback_missing_collection() {
+        // Rollback with a collection that doesn't exist in the map — should be no-op
+        let (_engine, primaries, secondaries) = setup();
+        RollbackVacuum::rollback_commit(
+            10,
+            &[(CollectionId(999), doc(1))], // non-existent collection
+            &[],
+            &primaries,
+            &secondaries,
+        ).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollback_missing_index() {
+        // Rollback with an index that doesn't exist — should be no-op
+        let (_engine, primaries, secondaries) = setup();
+        RollbackVacuum::rollback_commit(
+            10,
+            &[],
+            &[(IndexId(999), Some(vec![0x01, 0x02]))],
+            &primaries,
+            &secondaries,
+        ).unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollback_none_index_delta() {
+        // Index delta with None key — should skip
+        let (_engine, primaries, secondaries) = setup();
+        RollbackVacuum::rollback_commit(
+            10,
+            &[],
+            &[(IndexId(1), None)],
+            &primaries,
+            &secondaries,
+        ).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_vacuum_nonexistent() {
+        // Replay vacuum for a candidate that doesn't exist — should be no-op
+        let mut vc = VacuumCoordinator::new();
+        vc.push_candidate(VacuumCandidate {
+            collection_id: CollectionId(1),
+            doc_id: doc(1),
+            old_ts: 1,
+            superseding_ts: 5,
+            old_index_keys: vec![],
+        });
+        // Remove a candidate that doesn't match
+        vc.replay_vacuum(CollectionId(1), &doc(99), 1);
+        assert_eq!(vc.pending_count(), 1); // unchanged
+    }
+
+    #[tokio::test]
+    async fn vacuum_tombstone_entry() {
+        // Vacuum a tombstone primary entry (no heap body to free)
+        let (_engine, primaries, secondaries) = setup();
+        let primary = primaries.get(&CollectionId(1)).unwrap();
+        let d = doc(1);
+        primary.insert_version(&d, 1, Some(b"body")).unwrap();
+        primary.insert_version(&d, 5, None).unwrap(); // tombstone
+        primary.insert_version(&d, 10, Some(b"new")).unwrap();
+
+        let vc = VacuumCoordinator::new();
+        // Vacuum the tombstone at ts=5
+        let candidates = vec![VacuumCandidate {
+            collection_id: CollectionId(1),
+            doc_id: d,
+            old_ts: 5,
+            superseding_ts: 10,
+            old_index_keys: vec![],
+        }];
+        let removed = vc.execute(&candidates, &primaries, &secondaries).unwrap();
+        assert_eq!(removed, 1);
+
+        // New version still works
+        assert_eq!(primary.get_at_ts(&d, 15).unwrap().unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn rollback_from_wal_empty() {
+        let (_engine, primaries, secondaries) = setup();
+        let count = RollbackVacuum::rollback_from_wal(10, &[], &primaries, &secondaries).unwrap();
+        assert_eq!(count, 0);
+    }
 }

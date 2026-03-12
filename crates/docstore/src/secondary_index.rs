@@ -295,4 +295,167 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 3);
     }
+
+    // ─── Backward scan ───
+
+    #[tokio::test]
+    async fn backward_scan() {
+        let (_engine, primary, sec) = setup();
+        for i in 0..3u8 {
+            let d = doc(i);
+            primary.insert_version(&d, 5, Some(b"body")).unwrap();
+            let key = make_secondary_key(&[Scalar::Int64(i as i64)], &d, 5);
+            sec.insert_entry(&key).unwrap();
+        }
+
+        let forward: Vec<_> = sec
+            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        let backward: Vec<_> = sec
+            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Backward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert_eq!(forward.len(), 3);
+        assert_eq!(backward.len(), 3);
+        // Backward reverses forward
+        for i in 0..3 {
+            assert_eq!(forward[i].0, backward[2 - i].0);
+        }
+    }
+
+    // ─── Compound key scan ───
+
+    #[tokio::test]
+    async fn compound_key_scan() {
+        let (_engine, primary, sec) = setup();
+        let d = doc(1);
+        primary.insert_version(&d, 5, Some(b"body")).unwrap();
+        let key = make_secondary_key(
+            &[Scalar::String("hello".into()), Scalar::Int64(42)],
+            &d, 5,
+        );
+        sec.insert_entry(&key).unwrap();
+
+        let prefix = encode_key_prefix(&[Scalar::String("hello".into()), Scalar::Int64(42)]);
+        let upper = successor_key(&prefix);
+        let results: Vec<_> = sec
+            .scan_at_ts(Bound::Included(&prefix), Bound::Excluded(&upper), 10, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    // ─── Same value, multiple docs ───
+
+    #[tokio::test]
+    async fn same_value_multiple_docs() {
+        let (_engine, primary, sec) = setup();
+        for i in 0..10u8 {
+            let d = doc(i);
+            primary.insert_version(&d, 5, Some(b"body")).unwrap();
+            let key = make_secondary_key(&[Scalar::String("shared".into())], &d, 5);
+            sec.insert_entry(&key).unwrap();
+        }
+
+        let prefix = encode_key_prefix(&[Scalar::String("shared".into())]);
+        let upper = successor_key(&prefix);
+        let results: Vec<_> = sec
+            .scan_at_ts(Bound::Included(&prefix), Bound::Excluded(&upper), 10, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(results.len(), 10);
+    }
+
+    // ─── All entries stale ───
+
+    #[tokio::test]
+    async fn all_entries_stale() {
+        let (_engine, primary, sec) = setup();
+        let d = doc(1);
+        // Primary has newer version
+        primary.insert_version(&d, 5, Some(b"v5")).unwrap();
+        primary.insert_version(&d, 10, Some(b"v10")).unwrap();
+
+        // Secondary only has old entry
+        let key = make_secondary_key(&[Scalar::String("old".into())], &d, 5);
+        sec.insert_entry(&key).unwrap();
+
+        // At ts=15: secondary sees ts=5 but primary latest is ts=10 → stale
+        let results: Vec<_> = sec
+            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 15, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ─── Version resolution across time ───
+
+    #[tokio::test]
+    async fn scan_at_different_timestamps() {
+        let (_engine, primary, sec) = setup();
+        let d = doc(1);
+        primary.insert_version(&d, 5, Some(b"v5")).unwrap();
+        primary.insert_version(&d, 10, Some(b"v10")).unwrap();
+
+        let key5 = make_secondary_key(&[Scalar::String("x".into())], &d, 5);
+        let key10 = make_secondary_key(&[Scalar::String("x".into())], &d, 10);
+        sec.insert_entry(&key5).unwrap();
+        sec.insert_entry(&key10).unwrap();
+
+        // At ts=7: only ts=5 visible, matches primary
+        let r: Vec<_> = sec
+            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 7, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].1, 5);
+
+        // At ts=15: ts=10 visible, matches primary
+        let r: Vec<_> = sec
+            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 15, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].1, 10);
+    }
+
+    // ─── Inclusive/Exclusive bound combinations ───
+
+    #[tokio::test]
+    async fn scan_bound_variations() {
+        let (_engine, primary, sec) = setup();
+        for i in 0..5u8 {
+            let d = doc(i);
+            primary.insert_version(&d, 1, Some(b"body")).unwrap();
+            let key = make_secondary_key(&[Scalar::Int64(i as i64)], &d, 1);
+            sec.insert_entry(&key).unwrap();
+        }
+
+        // Unbounded, Unbounded → all 5
+        let r: Vec<_> = sec
+            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(r.len(), 5);
+
+        // Exact range for value=2
+        let lower = encode_key_prefix(&[Scalar::Int64(2)]);
+        let upper = successor_key(&lower);
+        let r: Vec<_> = sec
+            .scan_at_ts(Bound::Included(&lower), Bound::Excluded(&upper), 10, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, doc(2));
+    }
+
+    // ─── Read_ts before any entry ───
+
+    #[tokio::test]
+    async fn scan_read_ts_before_entries() {
+        let (_engine, primary, sec) = setup();
+        let d = doc(1);
+        primary.insert_version(&d, 10, Some(b"body")).unwrap();
+        let key = make_secondary_key(&[Scalar::Int64(1)], &d, 10);
+        sec.insert_entry(&key).unwrap();
+
+        // read_ts=5: entry at ts=10 invisible
+        let r: Vec<_> = sec
+            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 5, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(r.is_empty());
+    }
 }

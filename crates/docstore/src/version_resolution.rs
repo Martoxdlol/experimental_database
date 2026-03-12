@@ -295,4 +295,119 @@ mod tests {
         }
         assert_eq!(r.finish(), Some((id, 50)));
     }
+
+    // ─── Boundary timestamp tests ───
+
+    #[test]
+    fn forward_read_ts_zero() {
+        let mut r = VersionResolver::new(0, ScanDirection::Forward);
+        // ts=0 is visible (ts <= read_ts)
+        assert_eq!(r.process(&doc(1), 0), Verdict::Visible);
+        // ts=1 is invisible
+        assert_eq!(r.process(&doc(2), 1), Verdict::Skip);
+    }
+
+    #[test]
+    fn forward_read_ts_max() {
+        let mut r = VersionResolver::new(u64::MAX, ScanDirection::Forward);
+        assert_eq!(r.process(&doc(1), u64::MAX), Verdict::Visible);
+        assert_eq!(r.process(&doc(2), 0), Verdict::Visible);
+    }
+
+    #[test]
+    fn backward_read_ts_zero() {
+        let mut r = VersionResolver::new(0, ScanDirection::Backward);
+        assert_eq!(r.process(&doc(1), 0), Verdict::Skip);
+        assert_eq!(r.finish(), Some((doc(1), 0)));
+    }
+
+    #[test]
+    fn backward_read_ts_max() {
+        let mut r = VersionResolver::new(u64::MAX, ScanDirection::Backward);
+        assert_eq!(r.process(&doc(1), 1), Verdict::Skip);
+        assert_eq!(r.process(&doc(1), u64::MAX), Verdict::Skip);
+        assert_eq!(r.finish(), Some((doc(1), u64::MAX)));
+    }
+
+    // ─── Multi-group backward tests ───
+
+    #[test]
+    fn backward_three_doc_groups() {
+        let mut r = VersionResolver::new(10, ScanDirection::Backward);
+
+        // Group doc(3): ts=2, ts=8
+        assert_eq!(r.process(&doc(3), 2), Verdict::Skip);
+        assert_eq!(r.process(&doc(3), 8), Verdict::Skip);
+
+        // Group doc(2): ts=1, ts=5 — emits doc(3)@8
+        assert_eq!(r.process(&doc(2), 1), Verdict::EmitPrevious(doc(3), 8));
+        assert_eq!(r.process(&doc(2), 5), Verdict::Skip);
+
+        // Group doc(1): ts=3 — emits doc(2)@5
+        assert_eq!(r.process(&doc(1), 3), Verdict::EmitPrevious(doc(2), 5));
+
+        // finish emits doc(1)@3
+        assert_eq!(r.finish(), Some((doc(1), 3)));
+    }
+
+    #[test]
+    fn backward_alternating_visible_invisible_groups() {
+        let mut r = VersionResolver::new(10, ScanDirection::Backward);
+
+        // Group doc(4): all invisible
+        assert_eq!(r.process(&doc(4), 15), Verdict::Skip);
+
+        // Group doc(3): visible
+        assert_eq!(r.process(&doc(3), 5), Verdict::Skip); // no previous visible → Skip
+
+        // Group doc(2): all invisible
+        assert_eq!(r.process(&doc(2), 20), Verdict::EmitPrevious(doc(3), 5));
+
+        // Group doc(1): visible
+        assert_eq!(r.process(&doc(1), 1), Verdict::Skip); // doc(2) had no visible
+
+        // Finish: emits doc(1)@1
+        assert_eq!(r.finish(), Some((doc(1), 1)));
+    }
+
+    #[test]
+    fn forward_single_entry_per_doc() {
+        let mut r = VersionResolver::new(10, ScanDirection::Forward);
+        assert_eq!(r.process(&doc(1), 5), Verdict::Visible);
+        assert_eq!(r.process(&doc(2), 7), Verdict::Visible);
+        assert_eq!(r.process(&doc(3), 9), Verdict::Visible);
+        assert_eq!(r.process(&doc(4), 11), Verdict::Skip);
+    }
+
+    #[test]
+    fn backward_single_entry_per_doc() {
+        let mut r = VersionResolver::new(10, ScanDirection::Backward);
+        assert_eq!(r.process(&doc(3), 9), Verdict::Skip);
+        assert_eq!(r.process(&doc(2), 7), Verdict::EmitPrevious(doc(3), 9));
+        assert_eq!(r.process(&doc(1), 5), Verdict::EmitPrevious(doc(2), 7));
+        assert_eq!(r.finish(), Some((doc(1), 5)));
+    }
+
+    #[test]
+    fn forward_ts_equals_read_ts_boundary() {
+        let mut r = VersionResolver::new(10, ScanDirection::Forward);
+        // Exactly at boundary: visible
+        assert_eq!(r.process(&doc(1), 10), Verdict::Visible);
+        // One above: invisible
+        assert_eq!(r.process(&doc(2), 11), Verdict::Skip);
+    }
+
+    #[test]
+    fn backward_keeps_latest_visible() {
+        // In backward mode (ascending ts), the resolver should keep updating
+        // best_visible_ts to the latest visible value
+        let mut r = VersionResolver::new(10, ScanDirection::Backward);
+        assert_eq!(r.process(&doc(1), 1), Verdict::Skip);
+        assert_eq!(r.process(&doc(1), 3), Verdict::Skip);
+        assert_eq!(r.process(&doc(1), 7), Verdict::Skip);
+        assert_eq!(r.process(&doc(1), 10), Verdict::Skip);
+        assert_eq!(r.process(&doc(1), 15), Verdict::Skip); // too new
+        // Best is ts=10
+        assert_eq!(r.finish(), Some((doc(1), 10)));
+    }
 }

@@ -539,4 +539,311 @@ mod tests {
         assert_eq!(v2, Scalar::String("hi".into()));
         assert_eq!(c1 + c2, combined.len());
     }
+
+    // ─── Error path tests ───
+
+    #[test]
+    fn test_decode_empty_data() {
+        assert!(decode_scalar(&[]).is_err());
+    }
+
+    #[test]
+    fn test_decode_invalid_tag() {
+        assert!(decode_scalar(&[0x07]).is_err());
+        assert!(decode_scalar(&[0xFF]).is_err());
+        assert!(decode_scalar(&[0x10]).is_err());
+    }
+
+    #[test]
+    fn test_decode_truncated_int64() {
+        // Tag + only 4 bytes instead of 8
+        assert!(decode_scalar(&[0x02, 0x00, 0x00, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn test_decode_truncated_float64() {
+        assert!(decode_scalar(&[0x03, 0x00, 0x00]).is_err());
+    }
+
+    #[test]
+    fn test_decode_truncated_boolean() {
+        assert!(decode_scalar(&[0x04]).is_err());
+    }
+
+    #[test]
+    fn test_decode_string_missing_terminator() {
+        // String tag + data but no 0x00 0x00 terminator
+        assert!(decode_scalar(&[0x05, 0x41, 0x42]).is_err());
+    }
+
+    #[test]
+    fn test_decode_string_invalid_escape() {
+        // String tag + 0x00 followed by invalid byte (not 0x00 or 0xFF)
+        assert!(decode_scalar(&[0x05, 0x00, 0x42]).is_err());
+    }
+
+    #[test]
+    fn test_decode_bytes_missing_terminator() {
+        assert!(decode_scalar(&[0x06, 0x41]).is_err());
+    }
+
+    // ─── Boundary value tests ───
+
+    #[test]
+    fn test_inv_ts_boundaries() {
+        assert_eq!(inv_ts(0), u64::MAX);
+        assert_eq!(inv_ts(u64::MAX), 0);
+        assert_eq!(inv_ts(1), u64::MAX - 1);
+    }
+
+    #[test]
+    fn test_primary_key_boundary_ts() {
+        let id = DocId([0; 16]);
+
+        // ts=0: inv_ts = u64::MAX, should roundtrip
+        let key = make_primary_key(&id, 0);
+        let (parsed_id, parsed_ts) = parse_primary_key(&key).unwrap();
+        assert_eq!(parsed_id, id);
+        assert_eq!(parsed_ts, 0);
+
+        // ts=u64::MAX: inv_ts = 0, should roundtrip
+        let key = make_primary_key(&id, u64::MAX);
+        let (parsed_id, parsed_ts) = parse_primary_key(&key).unwrap();
+        assert_eq!(parsed_id, id);
+        assert_eq!(parsed_ts, u64::MAX);
+    }
+
+    #[test]
+    fn test_parse_primary_key_too_short() {
+        assert!(parse_primary_key(&[0; 23]).is_err());
+        assert!(parse_primary_key(&[]).is_err());
+    }
+
+    #[test]
+    fn test_parse_secondary_key_suffix_too_short() {
+        assert!(parse_secondary_key_suffix(&[0; 23]).is_err());
+        assert!(parse_secondary_key_suffix(&[]).is_err());
+    }
+
+    // ─── String edge cases ───
+
+    #[test]
+    fn test_empty_string_roundtrip() {
+        let encoded = encode_scalar(&Scalar::String(String::new()));
+        let (decoded, consumed) = decode_scalar(&encoded).unwrap();
+        assert_eq!(decoded, Scalar::String(String::new()));
+        // Tag + terminator 0x00 0x00
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn test_empty_bytes_roundtrip() {
+        let encoded = encode_scalar(&Scalar::Bytes(vec![]));
+        let (decoded, consumed) = decode_scalar(&encoded).unwrap();
+        assert_eq!(decoded, Scalar::Bytes(vec![]));
+        assert_eq!(consumed, 3);
+    }
+
+    #[test]
+    fn test_string_with_many_null_bytes() {
+        let s = "\x00\x00\x00".to_string();
+        let encoded = encode_scalar(&Scalar::String(s.clone()));
+        let (decoded, _) = decode_scalar(&encoded).unwrap();
+        assert_eq!(decoded, Scalar::String(s));
+    }
+
+    #[test]
+    fn test_bytes_with_null_bytes() {
+        let b = vec![0x00, 0x01, 0x00, 0xFF, 0x00];
+        let encoded = encode_scalar(&Scalar::Bytes(b.clone()));
+        let (decoded, _) = decode_scalar(&encoded).unwrap();
+        assert_eq!(decoded, Scalar::Bytes(b));
+    }
+
+    #[test]
+    fn test_long_string_roundtrip() {
+        let s: String = "x".repeat(10_000);
+        let encoded = encode_scalar(&Scalar::String(s.clone()));
+        let (decoded, _) = decode_scalar(&encoded).unwrap();
+        assert_eq!(decoded, Scalar::String(s));
+    }
+
+    // ─── Float64 edge cases ───
+
+    #[test]
+    fn test_float64_negative_zero_roundtrip() {
+        let encoded = encode_scalar(&Scalar::Float64(-0.0));
+        let (decoded, _) = decode_scalar(&encoded).unwrap();
+        if let Scalar::Float64(f) = decoded {
+            assert!(f == 0.0);
+        } else {
+            panic!("expected Float64");
+        }
+    }
+
+    #[test]
+    fn test_float64_neg_zero_before_pos_zero() {
+        let neg = encode_scalar(&Scalar::Float64(-0.0));
+        let pos = encode_scalar(&Scalar::Float64(0.0));
+        // -0.0 should sort before +0.0 (different bit patterns)
+        assert!(neg < pos);
+    }
+
+    #[test]
+    fn test_float64_subnormal() {
+        let tiny = f64::from_bits(1); // smallest positive subnormal
+        let encoded = encode_scalar(&Scalar::Float64(tiny));
+        let (decoded, _) = decode_scalar(&encoded).unwrap();
+        assert_eq!(decoded, Scalar::Float64(tiny));
+    }
+
+    #[test]
+    fn test_float64_extensive_ordering() {
+        let values = [
+            f64::NEG_INFINITY,
+            f64::MIN,
+            -1e100,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            -0.0,
+            0.0,
+            f64::MIN_POSITIVE,
+            1.0,
+            1e100,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        let encoded: Vec<_> = values.iter().map(|v| encode_scalar(&Scalar::Float64(*v))).collect();
+        for i in 0..encoded.len() - 1 {
+            assert!(encoded[i] < encoded[i + 1], "index {} ({}) should sort before {} ({})", i, values[i], i + 1, values[i + 1]);
+        }
+    }
+
+    // ─── successor_key edge cases ───
+
+    #[test]
+    fn test_successor_key_empty() {
+        let result = successor_key(&[]);
+        assert_eq!(result, vec![0x00]);
+    }
+
+    #[test]
+    fn test_successor_key_middle_overflow() {
+        // [0x01, 0xFF] -> increment 0xFF overflows, truncate, increment 0x01 -> [0x02]
+        let result = successor_key(&[0x01, 0xFF]);
+        assert_eq!(result, vec![0x02]);
+    }
+
+    #[test]
+    fn test_successor_key_preserves_ordering() {
+        let keys: Vec<Vec<u8>> = vec![
+            vec![0x00],
+            vec![0x01],
+            vec![0x01, 0x00],
+            vec![0x01, 0xFF],
+            vec![0xFF],
+        ];
+        for key in &keys {
+            let succ = successor_key(key);
+            assert!(succ > *key, "successor of {:?} should be greater", key);
+        }
+    }
+
+    // ─── Compound key sequential decode ───
+
+    #[test]
+    fn test_decode_three_scalars_sequentially() {
+        let s1 = Scalar::Int64(-42);
+        let s2 = Scalar::String("hello".into());
+        let s3 = Scalar::Boolean(true);
+        let mut buf = encode_scalar(&s1);
+        buf.extend_from_slice(&encode_scalar(&s2));
+        buf.extend_from_slice(&encode_scalar(&s3));
+
+        let (v1, c1) = decode_scalar(&buf).unwrap();
+        assert_eq!(v1, s1);
+        let (v2, c2) = decode_scalar(&buf[c1..]).unwrap();
+        assert_eq!(v2, s2);
+        let (v3, c3) = decode_scalar(&buf[c1 + c2..]).unwrap();
+        assert_eq!(v3, s3);
+        assert_eq!(c1 + c2 + c3, buf.len());
+    }
+
+    // ─── Id encoding preserves ULID order ───
+
+    #[test]
+    fn test_id_ordering_matches_bytes() {
+        let id_low = DocId([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        let id_high = DocId([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        let enc_low = encode_scalar(&Scalar::Id(id_low));
+        let enc_high = encode_scalar(&Scalar::Id(id_high));
+        assert!(enc_low < enc_high);
+    }
+
+    // ─── All type roundtrips in one test ───
+
+    #[test]
+    fn test_all_scalar_types_roundtrip() {
+        let values = vec![
+            Scalar::Undefined,
+            Scalar::Null,
+            Scalar::Int64(i64::MIN),
+            Scalar::Int64(-1),
+            Scalar::Int64(0),
+            Scalar::Int64(1),
+            Scalar::Int64(i64::MAX),
+            Scalar::Float64(f64::NEG_INFINITY),
+            Scalar::Float64(-1.0),
+            Scalar::Float64(0.0),
+            Scalar::Float64(1.0),
+            Scalar::Float64(f64::INFINITY),
+            Scalar::Boolean(false),
+            Scalar::Boolean(true),
+            Scalar::String(String::new()),
+            Scalar::String("hello world".into()),
+            Scalar::String("with\x00null".into()),
+            Scalar::Bytes(vec![]),
+            Scalar::Bytes(vec![0x00, 0xFF, 0x42]),
+        ];
+
+        for val in &values {
+            let encoded = encode_scalar(val);
+            let (decoded, consumed) = decode_scalar(&encoded).unwrap();
+            assert_eq!(consumed, encoded.len(), "consumed should match encoded length for {:?}", val);
+            match (val, &decoded) {
+                (Scalar::Id(_), Scalar::String(_)) => {} // Id decodes as String, expected
+                _ => assert_eq!(*val, decoded, "roundtrip failed for {:?}", val),
+            }
+        }
+    }
+
+    // ─── Primary key: same doc, ts ordering is descending within group ───
+
+    #[test]
+    fn test_primary_key_ts_ordering_comprehensive() {
+        let id = DocId([1; 16]);
+        let timestamps = [0, 1, 100, 1000, u64::MAX / 2, u64::MAX];
+        let keys: Vec<_> = timestamps.iter().map(|&ts| make_primary_key(&id, ts)).collect();
+        // Newer ts has smaller inv_ts, so sorts first (before older entries)
+        for i in 0..keys.len() - 1 {
+            assert!(keys[i] > keys[i + 1],
+                "ts={} (inv_ts={}) should sort after ts={} (inv_ts={})",
+                timestamps[i], inv_ts(timestamps[i]),
+                timestamps[i + 1], inv_ts(timestamps[i + 1]));
+        }
+    }
+
+    // ─── Secondary key: value ordering preserved ───
+
+    #[test]
+    fn test_secondary_key_value_ordering() {
+        let id = DocId([0; 16]);
+        let ts = 1;
+        let k1 = make_secondary_key(&[Scalar::Int64(1)], &id, ts);
+        let k2 = make_secondary_key(&[Scalar::Int64(2)], &id, ts);
+        let k3 = make_secondary_key(&[Scalar::String("a".into())], &id, ts);
+        assert!(k1 < k2, "Int(1) < Int(2) in secondary key");
+        assert!(k2 < k3, "Int(2) < String('a') in secondary key (cross-type)");
+    }
 }

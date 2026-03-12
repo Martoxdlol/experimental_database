@@ -505,4 +505,224 @@ mod tests {
             assert_eq!(body, i.to_le_bytes());
         }
     }
+
+    // ─── Backward scan tests ───
+
+    #[tokio::test]
+    async fn backward_scan_basic() {
+        let (_engine, pi) = setup();
+        for i in 0..3u8 {
+            let mut id = [0u8; 16];
+            id[15] = i;
+            pi.insert_version(&DocId(id), 1, Some(&[i])).unwrap();
+        }
+        let results: Vec<_> = pi.scan_at_ts(10, ScanDirection::Backward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(results.len(), 3);
+        // Backward: highest doc_id first
+        assert_eq!(results[0].0 .0[15], 2);
+        assert_eq!(results[2].0 .0[15], 0);
+    }
+
+    #[tokio::test]
+    async fn backward_scan_with_versions() {
+        let (_engine, pi) = setup();
+        let doc_id = DocId([1; 16]);
+        pi.insert_version(&doc_id, 1, Some(b"v1")).unwrap();
+        pi.insert_version(&doc_id, 5, Some(b"v5")).unwrap();
+        pi.insert_version(&doc_id, 10, Some(b"v10")).unwrap();
+
+        // At ts=7: should see v5
+        let results: Vec<_> = pi.scan_at_ts(7, ScanDirection::Backward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1, 5);
+        assert_eq!(results[0].2, b"v5");
+    }
+
+    #[tokio::test]
+    async fn backward_scan_skips_tombstones() {
+        let (_engine, pi) = setup();
+        let id = DocId([1; 16]);
+        pi.insert_version(&id, 1, Some(b"hello")).unwrap();
+        pi.insert_version(&id, 5, None).unwrap();
+
+        let results: Vec<_> = pi.scan_at_ts(10, ScanDirection::Backward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert!(results.is_empty());
+    }
+
+    // ─── get_at_ts boundary tests ───
+
+    #[tokio::test]
+    async fn get_at_ts_zero() {
+        let (_engine, pi) = setup();
+        let doc_id = DocId([1; 16]);
+        pi.insert_version(&doc_id, 0, Some(b"at_zero")).unwrap();
+        assert_eq!(pi.get_at_ts(&doc_id, 0).unwrap().unwrap(), b"at_zero");
+    }
+
+    #[tokio::test]
+    async fn get_at_ts_max() {
+        let (_engine, pi) = setup();
+        let doc_id = DocId([1; 16]);
+        pi.insert_version(&doc_id, 5, Some(b"data")).unwrap();
+        assert_eq!(pi.get_at_ts(&doc_id, u64::MAX).unwrap().unwrap(), b"data");
+    }
+
+    // ─── Multiple tombstones ───
+
+    #[tokio::test]
+    async fn multiple_tombstones() {
+        let (_engine, pi) = setup();
+        let id = DocId([1; 16]);
+        pi.insert_version(&id, 1, Some(b"v1")).unwrap();
+        pi.insert_version(&id, 3, None).unwrap();
+        pi.insert_version(&id, 5, Some(b"v5")).unwrap();
+        pi.insert_version(&id, 7, None).unwrap();
+        pi.insert_version(&id, 9, Some(b"v9")).unwrap();
+
+        assert_eq!(pi.get_at_ts(&id, 2).unwrap().unwrap(), b"v1");
+        assert!(pi.get_at_ts(&id, 4).unwrap().is_none());
+        assert_eq!(pi.get_at_ts(&id, 6).unwrap().unwrap(), b"v5");
+        assert!(pi.get_at_ts(&id, 8).unwrap().is_none());
+        assert_eq!(pi.get_at_ts(&id, 10).unwrap().unwrap(), b"v9");
+    }
+
+    // ─── Scan with various read_ts ───
+
+    #[tokio::test]
+    async fn scan_time_travel() {
+        let (_engine, pi) = setup();
+
+        // doc A: created at ts=1
+        let doc_a = DocId([0; 16]);
+        pi.insert_version(&doc_a, 1, Some(b"a")).unwrap();
+
+        // doc B: created at ts=5
+        let mut id_b = [0u8; 16];
+        id_b[15] = 1;
+        let doc_b = DocId(id_b);
+        pi.insert_version(&doc_b, 5, Some(b"b")).unwrap();
+
+        // ts=0: nothing
+        let r: Vec<_> = pi.scan_at_ts(0, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(r.len(), 0);
+
+        // ts=3: only A
+        let r: Vec<_> = pi.scan_at_ts(3, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(r.len(), 1);
+
+        // ts=10: both
+        let r: Vec<_> = pi.scan_at_ts(10, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(r.len(), 2);
+    }
+
+    // ─── External storage in scan ───
+
+    #[tokio::test]
+    async fn external_storage_in_scan() {
+        let engine = Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).unwrap());
+        let btree = engine.create_btree().unwrap();
+        let pi = PrimaryIndex::new(btree, engine.clone(), 10); // low threshold
+
+        let big = vec![0xCD; 200];
+        for i in 0..3u8 {
+            let mut id = [0u8; 16];
+            id[15] = i;
+            pi.insert_version(&DocId(id), 1, Some(&big)).unwrap();
+        }
+
+        let results: Vec<_> = pi.scan_at_ts(10, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(results.len(), 3);
+        for r in &results {
+            assert_eq!(r.2, big);
+        }
+    }
+
+    // ─── CellFlags: reserved bits preserved ───
+
+    #[tokio::test]
+    async fn cell_flags_reserved_bits() {
+        // Higher bits don't affect tombstone/external
+        let f = CellFlags::from_byte(0b11111100);
+        assert!(!f.tombstone);
+        assert!(!f.external);
+
+        let f = CellFlags::from_byte(0b11111111);
+        assert!(f.tombstone);
+        assert!(f.external);
+    }
+
+    // ─── get_version_ts boundary ───
+
+    #[tokio::test]
+    async fn get_version_ts_before_any_version() {
+        let (_engine, pi) = setup();
+        let id = DocId([1; 16]);
+        pi.insert_version(&id, 5, Some(b"data")).unwrap();
+        assert!(pi.get_version_ts(&id, 3).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_version_ts_exact_match() {
+        let (_engine, pi) = setup();
+        let id = DocId([1; 16]);
+        pi.insert_version(&id, 5, Some(b"data")).unwrap();
+        assert_eq!(pi.get_version_ts(&id, 5).unwrap(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn get_version_ts_multiple_versions() {
+        let (_engine, pi) = setup();
+        let id = DocId([1; 16]);
+        pi.insert_version(&id, 1, Some(b"v1")).unwrap();
+        pi.insert_version(&id, 5, Some(b"v5")).unwrap();
+        pi.insert_version(&id, 10, Some(b"v10")).unwrap();
+
+        assert_eq!(pi.get_version_ts(&id, 3).unwrap(), Some(1));
+        assert_eq!(pi.get_version_ts(&id, 7).unwrap(), Some(5));
+        assert_eq!(pi.get_version_ts(&id, 10).unwrap(), Some(10));
+        assert_eq!(pi.get_version_ts(&id, 100).unwrap(), Some(10));
+    }
+
+    // ─── Empty body (zero-length document) ───
+
+    #[tokio::test]
+    async fn empty_body_insert_get() {
+        let (_engine, pi) = setup();
+        let id = DocId([1; 16]);
+        pi.insert_version(&id, 1, Some(b"")).unwrap();
+        let body = pi.get_at_ts(&id, 5).unwrap().unwrap();
+        assert!(body.is_empty());
+    }
+
+    // ─── Scan ordering: doc_ids are sorted ───
+
+    #[tokio::test]
+    async fn scan_doc_ordering() {
+        let (_engine, pi) = setup();
+        let ids: Vec<DocId> = (0..20u8).map(|i| {
+            let mut id = [0u8; 16];
+            id[15] = i;
+            DocId(id)
+        }).collect();
+
+        // Insert in reverse order
+        for id in ids.iter().rev() {
+            pi.insert_version(id, 1, Some(&[id.0[15]])).unwrap();
+        }
+
+        let results: Vec<_> = pi.scan_at_ts(10, ScanDirection::Forward)
+            .collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(results.len(), 20);
+        // Should come out in sorted order regardless of insert order
+        for (i, (doc_id, _, _)) in results.iter().enumerate() {
+            assert_eq!(doc_id.0[15], i as u8);
+        }
+    }
 }

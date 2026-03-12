@@ -1356,6 +1356,7 @@ dependencies = [
  "exdb-core",
  "exdb-docstore",
  "exdb-storage",
+ "serde_json",
 ]
 
 [[package]]

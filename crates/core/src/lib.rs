@@ -6,4 +6,5 @@
 pub mod types;
 pub mod field_path;
 pub mod encoding;
+pub mod filter;
 pub mod ulid;

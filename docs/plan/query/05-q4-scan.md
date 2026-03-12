@@ -2,14 +2,14 @@
 
 ## Purpose
 
-Executes a `QueryPlan` by driving Layer 3 iterators through the three-stage pipeline: Source → PostFilter → Terminal. Returns a lazy iterator over matching documents. Computes read set intervals from plan bounds.
+Executes an `AccessMethod` by driving Layer 3 iterators through the three-stage pipeline: Source → PostFilter → Terminal. Returns a lazy iterator over matching documents. Computes read set intervals from access method bounds.
 
 Corresponds to DESIGN.md sections 4.1, 4.2, 4.5.
 
 ## Dependencies
 
 - **Q1 (`query/post_filter.rs`)**: `filter_matches`
-- **Q3 (`query/planner.rs`)**: `QueryPlan`
+- **Q3 (`query/access.rs`)**: `AccessMethod`
 - **L3 (`docstore/primary_index.rs`)**: `PrimaryIndex`, `PrimaryScanner`
 - **L3 (`docstore/secondary_index.rs`)**: `SecondaryIndex`, `SecondaryScanner`
 - **L1 (`core/encoding.rs`)**: `decode_document`
@@ -22,7 +22,7 @@ Corresponds to DESIGN.md sections 4.1, 4.2, 4.5.
 use exdb_core::types::{CollectionId, DocId, IndexId, Ts};
 use exdb_core::filter::Filter;
 use exdb_docstore::{PrimaryIndex, SecondaryIndex};
-use crate::planner::QueryPlan;
+use crate::access::AccessMethod;
 use crate::post_filter::filter_matches;
 use std::collections::HashMap;
 use std::ops::Bound;
@@ -58,7 +58,7 @@ pub struct ScanStats {
 /// Returns a QueryScanner that lazily produces documents through the
 /// Source → PostFilter → Terminal pipeline.
 pub fn execute_scan(
-    plan: &QueryPlan,
+    plan: &AccessMethod,
     primary_index: &PrimaryIndex,
     secondary_indexes: &HashMap<IndexId, SecondaryIndex>,
     read_ts: Ts,
@@ -89,20 +89,20 @@ Constructs a `QueryScanner` based on the plan variant:
 
 ```rust
 pub fn execute_scan(
-    plan: &QueryPlan,
+    plan: &AccessMethod,
     primary_index: &PrimaryIndex,
     secondary_indexes: &HashMap<IndexId, SecondaryIndex>,
     read_ts: Ts,
 ) -> std::io::Result<QueryScanner> {
     match plan {
-        QueryPlan::PrimaryGet { collection_id, doc_id } => {
+        AccessMethod::PrimaryGet { collection_id, doc_id } => {
             // Point lookup — not a scan, but we wrap it as a single-element iterator.
             let body = primary_index.get_at_ts(doc_id, read_ts)?;
             let ts = primary_index.get_version_ts(doc_id, read_ts)?;
             // ... construct single-row or empty scanner
         }
 
-        QueryPlan::IndexScan {
+        AccessMethod::IndexScan {
             collection_id, index_id, lower, upper,
             direction, post_filter, limit,
         } => {
@@ -119,7 +119,7 @@ pub fn execute_scan(
             // Wrap in QueryScanner with post_filter + limit + primary fetch
         }
 
-        QueryPlan::TableScan {
+        AccessMethod::TableScan {
             collection_id, index_id, direction,
             post_filter, limit,
         } => {
@@ -191,9 +191,9 @@ struct QueryScanner {
 The read interval is computed from the plan bounds when the scanner is constructed:
 
 ```rust
-fn compute_read_interval(plan: &QueryPlan) -> ReadIntervalInfo {
+fn compute_read_interval(plan: &AccessMethod) -> ReadIntervalInfo {
     match plan {
-        QueryPlan::PrimaryGet { collection_id, doc_id } => {
+        AccessMethod::PrimaryGet { collection_id, doc_id } => {
             // Point interval: [doc_id || 0x00..00, successor(doc_id) || 0x00..00)
             // Per DESIGN.md section 5.6.2
             let mut lower = doc_id.as_bytes().to_vec();
@@ -210,7 +210,7 @@ fn compute_read_interval(plan: &QueryPlan) -> ReadIntervalInfo {
             }
         }
 
-        QueryPlan::IndexScan { collection_id, index_id, lower, upper, .. } => {
+        AccessMethod::IndexScan { collection_id, index_id, lower, upper, .. } => {
             ReadIntervalInfo {
                 collection_id: *collection_id,
                 index_id: *index_id,
@@ -229,7 +229,7 @@ fn compute_read_interval(plan: &QueryPlan) -> ReadIntervalInfo {
             }
         }
 
-        QueryPlan::TableScan { collection_id, index_id, .. } => {
+        AccessMethod::TableScan { collection_id, index_id, .. } => {
             // Full interval: [MIN, Unbounded) per DESIGN.md section 5.6.2
             ReadIntervalInfo {
                 collection_id: *collection_id,

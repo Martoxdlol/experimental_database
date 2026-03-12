@@ -131,7 +131,7 @@ pub enum RangeError {
 }
 ```
 
-### Q3: `planner.rs` — Query Planning
+### Q3: `access.rs` — Access Method Resolution
 
 **WHY HERE:** Selects the access method (primary get, index scan, table scan) based on the query parameters. Requires knowledge of indexes and their states — domain-aware decision making.
 
@@ -142,17 +142,17 @@ use exdb_core::filter::{Filter, RangeExpr};
 use exdb_storage::btree::ScanDirection;
 use std::ops::Bound;
 
-/// Resolved index metadata needed by the planner.
+/// Resolved index metadata needed by the access resolver (L6 catalog cache).
 /// Provided by the catalog cache in L6. L4 does not depend on L6 —
-/// the caller constructs this from catalog data before calling plan_query.
+/// the caller constructs this from catalog data before calling resolve_access().
 pub struct IndexInfo {
     pub index_id: IndexId,
     pub field_paths: Vec<FieldPath>,
     pub ready: bool,
 }
 
-/// Query plan produced by the planner (DESIGN.md section 4.5).
-pub enum QueryPlan {
+/// Resolved access method (DESIGN.md section 4.5).
+pub enum AccessMethod {
     /// Point lookup by document ID (DESIGN.md section 4.2.1).
     PrimaryGet {
         collection_id: CollectionId,
@@ -181,16 +181,16 @@ pub enum QueryPlan {
 
 /// Plan a query. The caller (L6) resolves collection name → CollectionId
 /// and index name → IndexInfo before calling this.
-pub fn plan_query(
+pub fn resolve_access(
     collection_id: CollectionId,
     index: &IndexInfo,
     range: &[RangeExpr],
     filter: Option<Filter>,
     direction: ScanDirection,
     limit: Option<usize>,
-) -> Result<QueryPlan, PlanError>;
+) -> Result<AccessMethod, AccessError>;
 
-pub enum PlanError {
+pub enum AccessError {
     IndexNotReady,
     Range(RangeError),
 }
@@ -218,7 +218,7 @@ use std::ops::Bound;
 /// The read set interval is computed from the plan bounds (not from results)
 /// and is available immediately via read_interval().
 pub fn execute_scan(
-    plan: &QueryPlan,
+    plan: &AccessMethod,
     primary_index: &PrimaryIndex,
     secondary_indexes: &HashMap<IndexId, SecondaryIndex>,
     read_ts: Ts,
@@ -311,11 +311,11 @@ where
 
 | Interface | Used By | Purpose |
 |-----------|---------|---------|
-| `plan_query` | L6 (transaction query method) | Query planning |
+| `resolve_access` | L6 (transaction query method) | Query planning |
 | `execute_scan` | L6 (transaction query method) | Scan execution (returns iterator) |
 | `merge_with_writes` | L6 (read-your-writes in mutation txns) | Write set overlay |
 | `filter_matches` | L4 internal (post-filter), L6 (subscription eval) | Filter evaluation |
 | `compare_scalars` | L4 internal, L6 | Scalar comparison |
-| `encode_range` | L4 internal (planner), L6 (read set construction) | Byte interval generation |
-| `validate_range` | L4 internal (planner) | Range expression validation |
+| `encode_range` | L4 internal (access resolver), L6 (read set construction) | Byte interval generation |
+| `validate_range` | L4 internal (access resolver) | Range expression validation |
 | `ReadIntervalInfo` | L5/L6 (read set recording) | OCC conflict surface |

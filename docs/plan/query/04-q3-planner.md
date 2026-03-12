@@ -1,21 +1,21 @@
-# Q3: Planner
+# Q3: Access Method Resolution
 
 ## Purpose
 
-Selects the access method (primary get, index scan, table scan) and produces a `QueryPlan` struct consumed by the scan executor (Q4). The planner validates that the target index is ready, encodes range expressions into byte intervals, and attaches the post-filter and limit.
+Selects the access method (primary get, index scan, table scan) and produces an `AccessMethod` struct consumed by the scan executor (Q4). The resolver validates that the target index is ready, encodes range expressions into byte intervals, and attaches the post-filter and limit.
 
 Corresponds to DESIGN.md section 4.5 steps 1-3.
 
 ## Dependencies
 
-- **Q1 (`query/post_filter.rs`)**: `Filter` (passed through to plan)
+- **Q1 (`query/post_filter.rs`)**: `Filter` (passed through to access method)
 - **Q2 (`query/range_encoder.rs`)**: `encode_range`, `validate_range`, `RangeError`
 - **Q0 (`core/filter.rs`)**: `Filter`, `RangeExpr`
 - **L1 (`core/types.rs`)**: `CollectionId`, `IndexId`, `DocId`
 - **L1 (`core/field_path.rs`)**: `FieldPath`
 - **L2 (`storage/btree.rs`)**: `ScanDirection`
 
-No L3, L5, or L6 dependency. The planner does NOT access indexes or the catalog directly — it receives resolved metadata from the caller (L6).
+No L3, L5, or L6 dependency. The resolver does NOT access indexes or the catalog directly — it receives resolved metadata from the caller (L6).
 
 ## Rust Types
 
@@ -36,9 +36,9 @@ pub struct IndexInfo {
     pub ready: bool, // false if index is still Building
 }
 
-/// Query plan produced by the planner.
+/// Resolved access method for query execution.
 #[derive(Debug)]
-pub enum QueryPlan {
+pub enum AccessMethod {
     /// Point lookup by document ID (DESIGN.md section 4.2.1).
     PrimaryGet {
         collection_id: CollectionId,
@@ -67,60 +67,60 @@ pub enum QueryPlan {
     },
 }
 
-/// Errors from query planning.
+/// Errors from access method resolution.
 #[derive(Debug)]
-pub enum PlanError {
+pub enum AccessError {
     IndexNotReady,
     Range(RangeError),
 }
 
-/// Plan a query (DESIGN.md section 4.5).
+/// Resolve the access method for a query (DESIGN.md section 4.5).
 ///
 /// The caller (L6) resolves:
 /// - collection name → collection_id
 /// - index name → IndexInfo (from catalog cache)
 ///
-/// The planner:
+/// The resolver:
 /// 1. Checks index readiness.
 /// 2. Validates and encodes range expressions.
 /// 3. Determines if this is a table scan (empty range) or index scan.
-/// 4. Returns the QueryPlan.
-pub fn plan_query(
+/// 4. Returns the AccessMethod.
+pub fn resolve_access(
     collection_id: CollectionId,
     index: &IndexInfo,
     range: &[RangeExpr],
     filter: Option<Filter>,
     direction: ScanDirection,
     limit: Option<usize>,
-) -> Result<QueryPlan, PlanError>;
+) -> Result<AccessMethod, AccessError>;
 ```
 
 ## Implementation Details
 
-### plan_query()
+### resolve_access()
 
 ```rust
-pub fn plan_query(
+pub fn resolve_access(
     collection_id: CollectionId,
     index: &IndexInfo,
     range: &[RangeExpr],
     filter: Option<Filter>,
     direction: ScanDirection,
     limit: Option<usize>,
-) -> Result<QueryPlan, PlanError> {
+) -> Result<AccessMethod, AccessError> {
     // 1. Check index readiness
     if !index.ready {
-        return Err(PlanError::IndexNotReady);
+        return Err(AccessError::IndexNotReady);
     }
 
     // 2. Encode range expressions
     let (lower, upper) = encode_range(&index.field_paths, range)
-        .map_err(PlanError::Range)?;
+        .map_err(AccessError::Range)?;
 
-    // 3. Determine plan type
+    // 3. Determine access method
     if matches!((&lower, &upper), (Bound::Unbounded, Bound::Unbounded)) && range.is_empty() {
         // Empty range → table scan
-        Ok(QueryPlan::TableScan {
+        Ok(AccessMethod::TableScan {
             collection_id,
             index_id: index.index_id,
             direction,
@@ -128,7 +128,7 @@ pub fn plan_query(
             limit,
         })
     } else {
-        Ok(QueryPlan::IndexScan {
+        Ok(AccessMethod::IndexScan {
             collection_id,
             index_id: index.index_id,
             lower,
@@ -141,9 +141,9 @@ pub fn plan_query(
 }
 ```
 
-### PrimaryGet planning
+### PrimaryGet resolution
 
-`PrimaryGet` is not produced by `plan_query`. It is constructed directly by L6 when the user calls `tx.get(collection, doc_id)`. L6 builds the `PrimaryGet` variant and passes it to `execute_scan` (Q4), which handles it as a single-element iterator. The query planner handles only `query` operations — `get` bypasses it.
+`PrimaryGet` is not produced by `resolve_access`. It is constructed directly by L6 when the user calls `tx.get(collection, doc_id)`. L6 builds the `PrimaryGet` variant and passes it to `execute_scan` (Q4), which handles it as a single-element iterator. The access resolver handles only `query` operations — `get` bypasses it.
 
 ### Why TableScan is separate from IndexScan
 
@@ -154,7 +154,7 @@ Although `TableScan` is semantically an `IndexScan` with unbounded range, keepin
 
 ### Range vs post-filter split is done by the caller
 
-Per DESIGN.md section 7.7, the API keeps `range` and `filter` as separate fields in the query message. The **user** (or L8 wire protocol parser) decides which predicates go into range expressions and which go into the post-filter. L4 does NOT auto-split — it receives pre-split `range: &[RangeExpr]` and `filter: Option<Filter>` and validates the range expressions. If the range is invalid, it returns `PlanError::Range(...)` and the caller can report it to the user.
+Per DESIGN.md section 7.7, the API keeps `range` and `filter` as separate fields in the query message. The **user** (or L8 wire protocol parser) decides which predicates go into range expressions and which go into the post-filter. L4 does NOT auto-split — it receives pre-split `range: &[RangeExpr]` and `filter: Option<Filter>` and validates the range expressions. If the range is invalid, it returns `AccessError::Range(...)` and the caller can report it to the user.
 
 This means for a query like "A between 1 and 10 AND B == 5" on index [A, B, C]:
 - The user sends: `range: [gte(A, 1), lte(A, 10)]`, `filter: eq(B, 5)`
@@ -173,19 +173,19 @@ A table scan uses the `_created_at` index. A query on the `_id` index with `eq(_
 
 | Error | Cause | Handling |
 |-------|-------|----------|
-| IndexNotReady | Index is in Building state (section 3.7) | Return PlanError::IndexNotReady |
-| Range validation failure | Invalid range expressions | Return PlanError::Range(RangeError) |
+| IndexNotReady | Index is in Building state (section 3.7) | Return AccessError::IndexNotReady |
+| Range validation failure | Invalid range expressions | Return AccessError::Range(RangeError) |
 
 ## Tests
 
-1. **Index scan basic**: plan with `[eq(A, 1)]`, verify IndexScan with correct bounds.
-2. **Index scan with filter**: plan with range + filter, verify post_filter is attached.
-3. **Index scan with limit**: plan with limit=10, verify limit is attached.
-4. **Table scan**: plan with empty range, verify TableScan variant.
+1. **Index scan basic**: resolve with `[eq(A, 1)]`, verify IndexScan with correct bounds.
+2. **Index scan with filter**: resolve with range + filter, verify post_filter is attached.
+3. **Index scan with limit**: resolve with limit=10, verify limit is attached.
+4. **Table scan**: resolve with empty range, verify TableScan variant.
 5. **Table scan with filter**: empty range + filter, verify TableScan with post_filter.
 6. **Table scan with limit**: empty range + limit, verify TableScan with limit.
-7. **Direction**: plan with Forward and Backward, verify direction propagated.
-8. **Index not ready**: plan with ready=false, verify PlanError::IndexNotReady.
-9. **Invalid range**: plan with out-of-order fields, verify PlanError::Range.
+7. **Direction**: resolve with Forward and Backward, verify direction propagated.
+8. **Index not ready**: resolve with ready=false, verify AccessError::IndexNotReady.
+9. **Invalid range**: resolve with out-of-order fields, verify AccessError::Range.
 10. **Range with both bounds**: `[gte(A, 5), lt(A, 10)]`, verify IndexScan with correct lower/upper.
 11. **Compound range**: `[eq(A, 1), gt(B, "m")]` on `[A, B]`, verify bounds.

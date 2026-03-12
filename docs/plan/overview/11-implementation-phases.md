@@ -99,7 +99,7 @@ Bottom-up build order. Each phase produces a testable deliverable.
 ## Phase 6: Query Engine (Layer 4)
 
 **Deliverables:**
-- `query/planner.rs` — Query plan selection
+- `query/access.rs` — Access method resolution
 - `query/range_encoder.rs` — Range expressions to byte intervals
 - `query/scan.rs` — Scan execution pipeline
 - `query/post_filter.rs` — Filter evaluation

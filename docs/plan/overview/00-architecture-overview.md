@@ -125,7 +125,7 @@ This enables `Database::open_in_memory()` at L6 for testing, temporary data, and
 | L1 | `core/` | `types.rs`, `encoding.rs`, `ulid.rs`, `filter.rs`, `field_path.rs` |
 | L2 | `storage/` | `engine.rs`, `page.rs`, `buffer_pool.rs`, `btree.rs`, `wal.rs`, `heap.rs`, `free_list.rs`, `dwb.rs`, `checkpoint.rs`, `recovery.rs`, `vacuum.rs`, `catalog_btree.rs` |
 | L3 | `docstore/` | `primary_index.rs`, `secondary_index.rs`, `key_encoding.rs`, `version_resolution.rs`, `array_indexing.rs`, `index_builder.rs` |
-| L4 | `query/` | `planner.rs`, `range_encoder.rs`, `scan.rs`, `post_filter.rs`, `merge.rs` |
+| L4 | `query/` | `access.rs`, `range_encoder.rs`, `scan.rs`, `post_filter.rs`, `merge.rs` |
 | L5 | `tx/` | `timestamp.rs`, `read_set.rs`, `write_set.rs`, `commit_log.rs`, `occ.rs`, `subscriptions.rs`, `commit.rs` |
 | L6 | `database/` | `database.rs`, `catalog_cache.rs`, `system_database.rs`, `config.rs`, `replication_hook.rs` |
 | L7 | `replication/` | `primary_server.rs`, `replica_client.rs`, `promotion.rs`, `snapshot.rs`, `recovery_tiers.rs` |

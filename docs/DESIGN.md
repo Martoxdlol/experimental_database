@@ -1918,6 +1918,8 @@ The read set is a collection of byte-range intervals, grouped by `(collection, i
 
 **Invariant**: intervals within the same `(collection, index)` group are sorted by `lower` bound. Overlapping or adjacent intervals are merged. This keeps the interval count bounded and makes conflict checking efficient. When two overlapping intervals are merged, the merged interval takes `query_id = min(both)` and merges any `limit_boundary` conservatively (see section 5.6.3).
 
+**Catalog pseudo-collections**: catalog operations (DDL) are modeled as regular intervals on reserved pseudo-collections, so that OCC validation and subscription invalidation use a single code path for both data and catalog conflicts. See section 5.6.7 for details.
+
 #### 5.6.2 How Queries Produce Intervals
 
 Each query type records a specific interval pattern:
@@ -2016,6 +2018,34 @@ Transactions that remain open too long prevent vacuuming (section 2.11) and caus
 
 When a timeout fires, the server aborts the transaction (equivalent to `rollback`) and sends an `error` response with code `tx_timeout` for the next message that references the expired `tx`. Subscription chain transactions (section 5.9) reset the `tx_max_lifetime` on each chain link — only the current link's lifetime is limited, not the total chain duration.
 
+#### 5.6.7 Unified Catalog Conflict Detection
+
+Catalog operations (DDL — create/drop collection/index) participate in OCC validation and subscription invalidation through the **same interval-based mechanism** as data operations. Instead of a separate `catalog_conflicts()` function or `CatalogRead` type, catalog reads and writes are modeled as regular intervals on **reserved pseudo-collections**:
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `CATALOG_COLLECTIONS` | `CollectionId(0)` | Pseudo-collection for collection metadata |
+| `CATALOG_INDEXES` | `CollectionId(1)` | Pseudo-collection for index metadata |
+| `CATALOG_COLLECTIONS_NAME_IDX` | `IndexId(1)` | Name lookup index on `_collections` |
+| `CATALOG_INDEXES_NAME_IDX` | `IndexId(2)` | `(collection_id, name)` lookup index on `_indexes` |
+
+**Catalog reads** produce intervals on these pseudo-collections, just like data reads produce intervals on user collections:
+
+- **Resolve collection by name** (e.g., `tx.collection("users")`): records a point interval on `(CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX)` covering the encoded name key.
+- **List all collections**: records a full-range interval on `(CATALOG_COLLECTIONS, PRIMARY)`.
+- **Resolve index by name**: records a point interval on `(CATALOG_INDEXES, CATALOG_INDEXES_NAME_IDX)` covering the encoded `(collection_id, name)` key.
+- **List indexes for a collection**: records a prefix-range interval on `(CATALOG_INDEXES, CATALOG_INDEXES_NAME_IDX)` covering the `collection_id` prefix.
+
+**Catalog writes** (DDL) produce `IndexDelta` entries on the same pseudo-collections:
+
+- **Create collection "users"**: produces an `IndexDelta` on `(CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX)` with `old_key = None`, `new_key = encode("users")`.
+- **Drop collection**: produces the inverse delta (`old_key = encode(name)`, `new_key = None`).
+- **Create/drop index**: analogous deltas on `CATALOG_INDEXES`.
+
+These deltas flow into the commit log's `index_writes` alongside data deltas. OCC validation (section 5.7) and subscription invalidation (section 5.9) use the same `contains_key` overlap check for both — no special-casing is needed.
+
+**Why this design**: a separate catalog conflict detection path would duplicate the interval overlap logic, require a separate `CatalogRead` enum with pattern-matching in OCC and subscriptions, and add a `catalog_mutations` field to `CommitLogEntry`. The unified approach eliminates ~100 lines of special-casing while maintaining identical correctness properties. L6 provides a thin wrapper API that translates DDL operations into intervals and deltas on the reserved pseudo-collections.
+
 ### 5.7 OCC Validation (Conflict Detection)
 
 At commit time, the read set is validated against all transactions that committed in the interval `(begin_ts, commit_ts)`.
@@ -2071,6 +2101,8 @@ This is a byte comparison on encoded keys (memcmp). Since intervals within a gro
 - **`new_key` overlap**: a document has _entered_ the scan range (phantom). The transaction didn't see it, but if re-executed, the query would return a different result set.
 
 Checking both keys is essential. A document updated from `status="active"` to `status="archived"` produces `old_key` in the `active` range and `new_key` in the `archived` range. Both a reader of "active" documents and a reader of "archived" documents are affected.
+
+**Catalog conflicts**: catalog DDL operations (create/drop collection/index) are handled by the same validation algorithm. Catalog writes appear as `IndexKeyWrite` entries on reserved pseudo-collections (`CATALOG_COLLECTIONS`, `CATALOG_INDEXES` — see section 5.6.7), and catalog reads appear as `ReadInterval`s on the same pseudo-collections. No separate conflict detection path is needed.
 
 **Total validation cost**: O(W × log I) where W is the total number of index key writes across concurrent commits and I is the maximum number of intervals per group. In practice, both are small — a typical transaction has a few dozen intervals and concurrent commits touch a few dozen keys.
 
@@ -2169,7 +2201,7 @@ The client receives this in the `InvalidationEvent` and can:
 
 **Edge case — merged intervals:** If Q1 and Q3 were merged into one interval with `query_id = min(1, 3) = 1`, and only Q3 is invalidated (`affected = [3]`), then `split_before(3)` includes the merged interval (since its `query_id = 1 < 3`). This is conservative — the carried interval covers more than strictly needed, but correctness is preserved.
 
-**Edge case — catalog conflicts:** Catalog reads have no individual query_id. A catalog conflict (e.g., collection dropped) maps to `query_id = 0`, so `first_query_id = 0` and `split_before(0)` returns an empty read set. The entire transaction must be re-executed.
+**Edge case — catalog conflicts:** Catalog reads are modeled as regular intervals on reserved pseudo-collections (section 5.6.7) and carry normal `query_id`s. A catalog conflict (e.g., collection dropped) is detected via the same `contains_key` overlap check as data conflicts. If the catalog read was the first query in the transaction (`query_id = 0`), then `first_query_id = 0` and `split_before(0)` returns an empty carried read set — the entire transaction must be re-executed. If the catalog read has a higher `query_id`, earlier unaffected queries can be carried forward as usual.
 
 **Subscription update on chain commit**: when a chain transaction commits, its read set (carried intervals + newly produced intervals from re-executed queries) replaces the subscription's previous read set in the registry. Old intervals are removed, new intervals are inserted.
 

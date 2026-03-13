@@ -1898,19 +1898,25 @@ ReadSet {
 }
 
 ReadInterval {
-    query_id:  u32                  // which query produced this interval (see 4.6)
-    lower:     EncodedKey           // inclusive lower bound (byte string)
-    upper:     Bound<EncodedKey>    // Excluded(key) or Unbounded
+    query_id:       u32                  // which query produced this interval (see 4.6)
+    lower:          Bound<EncodedKey>    // Included or Unbounded (Excluded never produced in practice)
+    upper:          Bound<EncodedKey>    // Excluded(key) or Unbounded
+    limit_boundary: Option<LimitBoundary>  // None = scan exhausted range; see 5.6.3
 }
 
+LimitBoundary:
+    Upper(EncodedKey)    // ASC scan: effective upper = Excluded(successor(K))
+    Lower(EncodedKey)    // DESC scan: effective lower = Included(K)
+
 Bound<T>:
+    Included(T)
     Excluded(T)
     Unbounded
 ```
 
 The read set is a collection of byte-range intervals, grouped by `(collection, index)`. Each interval represents a contiguous range of encoded index keys that was scanned during query execution. The `query_id` links the interval back to the specific query operation for subscription notifications.
 
-**Invariant**: intervals within the same `(collection, index)` group are sorted by `lower` bound. Overlapping or adjacent intervals are merged. This keeps the interval count bounded and makes conflict checking efficient.
+**Invariant**: intervals within the same `(collection, index)` group are sorted by `lower` bound. Overlapping or adjacent intervals are merged. This keeps the interval count bounded and makes conflict checking efficient. When two overlapping intervals are merged, the merged interval takes `query_id = min(both)` and merges any `limit_boundary` conservatively (see section 5.6.3).
 
 #### 5.6.2 How Queries Produce Intervals
 
@@ -1976,6 +1982,8 @@ When a query has a `limit`, the scanned interval may be tighter than the range e
   - A new document **before** `doc_id_10` DOES conflict — it could displace a result.
 
 This tightening is critical for high-throughput workloads: a paginated query reading the first 50 results of a large range only conflicts with writes to the first 50 entries' key range, not the entire range.
+
+**Effective interval**: the combination of original `[lower, upper)` bounds plus any limit tightening is called the *effective interval*. It is the actual conflict surface — both OCC validation (section 5.7) and subscription invalidation (section 5.9) check whether a written key falls within the effective interval, not just the original bounds. A write beyond the limit cutoff does not conflict.
 
 #### 5.6.4 Post-Filters and Read Set Precision
 
@@ -2043,10 +2051,16 @@ For each `(collection_id, index_id)` group in the read set:
    - If `new_key` is `Some(k)` and `k` falls within any `ReadInterval` in this group → **conflict** (phantom). A document has entered the scan range via insert or update.
 3. If no key overlaps are found across all groups → validation passes.
 
-**Key overlap check**: a key `k` falls within `ReadInterval { lower, upper }` if:
+**Key overlap check**: a key `k` falls within a `ReadInterval` if it falls within the **effective interval** — the original `[lower, upper)` further tightened by any limit boundary (section 5.6.3). The check is:
 
 ```
+// 1. Within original bounds
 k >= lower AND (upper == Unbounded OR k < excluded_upper)
+// 2. Within limit tightening (if present)
+AND MATCH limit_boundary:
+  None       => true                  // no tightening
+  Upper(K)   => k <= K               // ASC: effective upper = Excluded(successor(K))
+  Lower(K)   => k >= K               // DESC: effective lower = Included(K)
 ```
 
 This is a byte comparison on encoded keys (memcmp). Since intervals within a group are sorted and non-overlapping, the check uses binary search — O(log I) per key, where I is the number of intervals in the group.
@@ -2078,7 +2092,7 @@ Checking both keys is essential. A document updated from `status="active"` to `s
 
 Subscriptions operate at the **transaction level**: a subscription watches the entire read set of a committed transaction, not an individual query. Three subscription modes are available (see section 5.1 `SubscriptionMode`).
 
-**Registration**: when a transaction with `subscription != None` commits, its full read set (the `BTreeMap<(CollectionId, IndexId), Vec<ReadInterval>>` from section 5.6) is stored in the subscription registry.
+**Registration**: when a transaction with `subscription != None` commits, its full read set (the `BTreeMap<(CollectionId, IndexId), Vec<ReadInterval>>` from section 5.6) is stored in the subscription registry. Before registering, the commit coordinator applies the transaction's own index write deltas to the read set. This clears any `limit_boundary` on intervals whose boundary document was written by the transaction itself — restoring full original-bounds coverage for those intervals. This step is necessary because OCC validation only checks *concurrent* commits in `(begin_ts, commit_ts)`, so the transaction's own writes are never in the commit log range and their effect on boundary docs must be handled separately.
 
 **Invalidation**: on every new commit, check all active subscriptions against the committed index key writes using the same overlap algorithm as OCC validation (section 5.7). For each affected subscription, collect the `query_id`s of overlapping intervals.
 
@@ -2100,9 +2114,7 @@ SubscriptionRegistry {
 
 SubscriptionInterval {
     subscription_id: SubscriptionId
-    query_id:        QueryId
-    lower:           EncodedKey
-    upper:           Bound<EncodedKey>
+    interval:        ReadInterval     // includes limit_boundary for effective-interval checks
 }
 
 SubscriptionMeta {
@@ -2120,7 +2132,7 @@ The registry uses the same `(collection, index)` grouping as the read set and co
 
 1. For each `(collection_id, index_id)` group in the commit's index writes:
    a. Look up `SubscriptionInterval` entries for the same `(collection, index)`.
-   b. For each `IndexKeyWrite`: check if `old_key` or `new_key` falls within any subscription interval (same overlap check as OCC — binary search on sorted intervals).
+   b. For each `IndexKeyWrite`: check if `old_key` or `new_key` falls within any subscription interval using the **effective interval** check (same `contains_key` logic as OCC — binary search on sorted intervals, respecting limit boundaries).
    c. Collect affected `(subscription_id, query_id)` pairs.
 2. Group by `subscription_id`. Within each group, deduplicate and sort `query_id`s in ascending order.
 3. For each affected subscription: fire **one** notification containing **all** invalidated `query_id`s (ascending). A single commit that overlaps N queries in the same subscription produces exactly one notification with N query IDs — never N separate notifications.

@@ -61,11 +61,52 @@ impl TsAllocator {
 ```rust
 pub type QueryId = u32;
 
-/// A single read interval on an index
+/// Indicates which side of the interval was tightened by a LIMIT clause.
+///
+/// Stored on the interval so that `apply_delta` can clear it when the
+/// boundary document is moved by a write, restoring full original-bounds coverage.
+pub enum LimitBoundary {
+    /// ASC scan stopped after returning the doc with sort key K.
+    /// Effective upper = Excluded(successor(K)).
+    /// Cleared when K's doc is deleted or its key moves outside the interval.
+    Upper(Vec<u8>),
+
+    /// DESC scan stopped after returning the doc with sort key K.
+    /// Effective lower = Included(K).
+    /// Cleared when K's doc is deleted or its key moves outside the interval.
+    Lower(Vec<u8>),
+}
+
+/// A single read interval on an index.
 pub struct ReadInterval {
     pub query_id: QueryId,
-    pub lower: Vec<u8>,           // inclusive lower bound (encoded key)
-    pub upper: Bound<Vec<u8>>,    // Excluded(key) or Unbounded
+    /// Original range lower bound (before any LIMIT tightening).
+    /// Always Included or Unbounded in practice — encode_range never produces
+    /// Excluded for lower, but Bound<Vec<u8>> is used for generality.
+    pub lower: Bound<Vec<u8>>,
+    /// Original range upper bound (before any LIMIT tightening).
+    pub upper: Bound<Vec<u8>>,
+    /// LIMIT tightening. None = scan exhausted the range (full original coverage).
+    pub limit_boundary: Option<LimitBoundary>,
+}
+
+impl ReadInterval {
+    /// Check if `key` falls within the **effective** interval:
+    ///   (1) within original bounds: key >= lower && (upper == Unbounded || key < excluded_upper)
+    ///   (2) within limit tightening (if any):
+    ///       Upper(K) => key <= K        (ASC: effective upper = Excluded(successor(K)))
+    ///       Lower(K) => key >= K        (DESC: effective lower = Included(K))
+    pub fn contains_key(&self, key: &[u8]) -> bool;
+
+    /// Process a write delta. If `old_key` falls within the effective interval and
+    /// `new_key` is None or outside the effective interval, clears `limit_boundary`
+    /// to restore full original-bounds coverage.
+    ///
+    /// Called on each interval before subscription registration (commit step 10) to
+    /// account for the transaction's own writes potentially moving the boundary doc.
+    /// Conservative: clearing the boundary only widens the interval, never misses
+    /// a future conflict.
+    pub fn apply_delta(&mut self, old_key: Option<&[u8]>, new_key: Option<&[u8]>);
 }
 
 /// All intervals for a transaction, grouped by (collection, index)
@@ -106,7 +147,11 @@ impl ReadSet {
     pub fn peek_next_query_id(&self) -> QueryId;
     /// Explicitly set the counter (used by begin_chain_continuation in L6).
     pub fn set_next_query_id(&mut self, id: QueryId);
-    pub fn merge_overlapping(&mut self);  // merge adjacent/overlapping intervals
+    /// Merge adjacent/overlapping intervals within each (collection, index) group.
+    /// Merged interval: lower = min(both lowers), upper = max(both uppers),
+    /// query_id = min(both), limit_boundary = most extreme (max Upper / min Lower);
+    /// if either has None (full coverage), merged result is None.
+    pub fn merge_overlapping(&mut self);
     pub fn interval_count(&self) -> usize;
 
     /// Extract intervals with query_id < threshold into a new ReadSet.
@@ -115,12 +160,21 @@ impl ReadSet {
 
     /// Merge another ReadSet into this one (carried + new intervals).
     pub fn merge_from(&mut self, other: &ReadSet);
+
+    /// Apply a batch of index write deltas to all matching intervals.
+    /// Calls `ReadInterval::apply_delta` on every interval whose (collection, index)
+    /// matches a delta entry. Used at subscription registration time (commit step 10)
+    /// to clear stale `limit_boundary` values before the read set is handed to the
+    /// subscription registry.
+    pub fn extend_for_deltas(&mut self, deltas: &[IndexDelta]);
 }
 ```
 
 **Carry-forward:** When a subscription chain fires at `query_id = Q_min`, `split_before(Q_min)` extracts unaffected intervals. These are provably unchanged (no concurrent commit touched them), so carrying them to the new transaction is equivalent to re-executing the same queries. Catalog reads are also carried when `Q_min > 0`; when `Q_min = 0` (catalog conflict), the entire read set is empty — the new transaction must re-read catalog state from scratch.
 
 **Interval merging:** When intervals overlap, the merged interval takes `query_id = min(both)`. This is conservative — a wider carried interval may cause more future conflicts, but never fewer.
+
+**`limit_boundary` and merging:** When two intervals with `LimitBoundary` are merged, take the more extreme boundary (max `Upper` for ASC, min `Lower` for DESC). If one has `None` (full coverage), the merged result is `None`. This is conservative — the wider interval is always correct.
 
 ### `write_set.rs` — Write Set (Buffered Mutations) + IndexResolver Trait
 
@@ -258,6 +312,10 @@ impl CommitLog {
 /// Validate read set against commit log.
 /// Checks both index interval overlaps and catalog read/write conflicts.
 /// Returns Ok(()) if no conflicts, Err(ConflictError) if conflicts found.
+///
+/// Interval overlap is checked via `ReadInterval::contains_key` — this respects
+/// the effective interval (original bounds + any LimitBoundary tightening) so that
+/// writes beyond the LIMIT cutoff do not cause spurious conflicts.
 pub fn validate(
     read_set: &ReadSet,
     commit_log: &CommitLog,
@@ -293,6 +351,33 @@ pub enum ConflictKind {
 }
 ```
 
+#### OCC correctness with LimitBoundary and own-write merging
+
+A subtle but critical property: `LimitBoundary` is computed from the **merged** result (after `merge_with_writes`), not from the raw storage scan. This means repeated queries with the same range and limit, interleaved with own writes, produce correctly distinct intervals.
+
+**Example:**
+
+```
+TX1
+  op1: read [K0, K99] limit=1 asc  →  K2          (LimitBoundary::Upper(K2))
+  op2: delete K2
+  op3: read [K0, K99] limit=1 asc  →  K4          (LimitBoundary::Upper(K4))
+    ↑ op3's merge_with_writes excludes deleted K2, so K4 is the first result
+
+TX2 (commits before TX1)
+  insert K3   (K2 < K3 < K4)
+
+TX1 commits:
+  OCC checks commit log (TX2's K3) against TX1's read set:
+    op1 interval effective upper = Excluded(successor(K2))  →  K3 > K2  →  no conflict ✓
+    op3 interval effective upper = Excluded(successor(K4))  →  K3 ≤ K4  →  CONFLICT ✗
+  TX1 aborts and retries.
+```
+
+This is correct: TX1's op3 would have returned K3 (not K4) had it run after TX2, so the abort is required. The correctness follows from `merge_with_writes` building a fresh `MergeView` on each `query()` call — after op2 deletes K2, op3's scan naturally skips K2 and returns K4, widening its `LimitBoundary` to cover K3.
+
+**What OCC does NOT do:** call `extend_for_deltas` before validation. That would clear op1's `Upper(K2)` (since op2 deleted K2), causing a false positive conflict on K3. `extend_for_deltas` is only called at step 10a (before subscription registration) to handle the case where the boundary doc was deleted by own writes and the subscription must watch the full original range.
+
 ### `subscriptions.rs` — Subscription Registry (Notify / Watch / Subscribe)
 
 **WHY HERE:** Manages persistent read set watches for reactive invalidation on commit. Indexes intervals by (collection, index) for fast overlap checks. Supports three modes with different lifecycles.
@@ -300,11 +385,12 @@ pub enum ConflictKind {
 ```rust
 pub type SubscriptionId = u64;
 
+/// An interval stored in the subscription registry index.
+/// Embeds ReadInterval (including limit_boundary) so that invalidation checks
+/// use `contains_key` and respect LIMIT tightening, matching OCC semantics.
 pub struct SubscriptionInterval {
     pub subscription_id: SubscriptionId,
-    pub query_id: QueryId,
-    pub lower: Vec<u8>,
-    pub upper: Bound<Vec<u8>>,
+    pub interval: ReadInterval,
 }
 
 pub struct SubscriptionRegistry {
@@ -351,6 +437,8 @@ impl SubscriptionRegistry {
     pub fn new() -> Self;
 
     /// Register a read set as a subscription.
+    /// `read_set` must already have had `extend_for_deltas` applied (commit step 10a)
+    /// so that any stale `limit_boundary` from the tx's own writes is cleared.
     /// `event_tx`: sender for pushing InvalidationEvents to the client.
     /// L6 wraps the receiver in a SubscriptionHandle.
     pub fn register(&mut self, mode: SubscriptionMode, session_id: u64,
@@ -361,8 +449,9 @@ impl SubscriptionRegistry {
     pub fn remove(&mut self, id: SubscriptionId);
 
     /// Check all subscriptions against a new commit's writes.
-    /// For Subscribe mode: computes ChainContinuation with carried read set.
-    /// For Notify mode: marks subscription for removal.
+    /// Uses `ReadInterval::contains_key` for overlap, respecting effective intervals
+    /// (original bounds + LimitBoundary). For Subscribe mode: computes
+    /// ChainContinuation with carried read set. For Notify mode: marks for removal.
     pub fn check_invalidation(
         &mut self,
         commit_ts: Ts,
@@ -483,7 +572,14 @@ impl CommitCoordinator {
     //      ON FAILURE: rollback data + catalog + commit log; respond QuorumLost
     //   8. WAL_RECORD_VISIBLE_TS (0x09) + fsync
     //   9. Advance visible_ts = commit_ts
-    //  10. Create mpsc channel, register subscription (event_tx → registry, event_rx → result)
+    //  10. If subscription requested:
+    //      a. Call read_set.extend_for_deltas(&index_deltas) — clears stale
+    //         limit_boundary on any interval whose boundary doc was written by
+    //         THIS transaction (the OCC read set and subscription read set differ
+    //         because the tx's own writes are not in the commit log range checked
+    //         by OCC, but they can still move boundary docs).
+    //      b. Create mpsc channel, register adjusted read_set as subscription
+    //         (event_tx → registry, event_rx → result).
     //  11. FIRE-AND-FORGET: push step-6b events via try_send on each sub's event_tx
 }
 
@@ -544,7 +640,7 @@ Vacuum must use `min(oldest_active_read_ts, visible_ts)` as its safe threshold -
 |-----------|---------|---------|
 | `SubscriptionMode` | L6 (TransactionOptions) | Transaction subscription mode |
 | `TsAllocator` | L5 internal, L6 (Database) | Timestamp management |
-| `ReadSet`, `ReadInterval`, `CatalogRead` | L4 (produces), L5 (validates), L6 (DDL), L7 (replication) | Conflict surface + carry-forward |
+| `LimitBoundary`, `ReadInterval`, `ReadSet`, `CatalogRead` | L4 (produces ReadIntervalInfo), L5 (validates), L6 (builds ReadInterval + LimitBoundary, DDL), L7 (replication) | Conflict surface + carry-forward |
 | `WriteSet`, `MutationEntry`, `CatalogMutation` | L4 (read-your-writes), L5 (commit), L6 (DDL) | Buffered mutations (data + catalog) |
 | `CommitHandle::commit` | L6 (Database) | Submit commit request |
 | `CommitResult`, `ConflictRetry` | L6 (transaction API), L8 (session response) | Success/conflict/retry reporting |

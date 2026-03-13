@@ -183,10 +183,13 @@ impl<'db> Transaction<'db> {
     // --- Lifecycle ---
 
     /// Commit the transaction.
-    /// - Readonly + subscription: registers read set, no OCC.
+    /// - Readonly + subscription: registers read set, no OCC. No index deltas →
+    ///   extend_for_deltas is a no-op inside CommitCoordinator step 10.
     ///   Returns SubscriptionHandle in CommitResult.
     /// - Readonly + None: no-op (read set discarded).
     /// - Read-write: OCC validate + WAL + materialize + register subscription.
+    ///   CommitCoordinator step 10 calls extend_for_deltas with this tx's
+    ///   index_deltas before registering the subscription (if any).
     pub async fn commit(self) -> CommitResult;
 
     /// Explicit rollback. Discards all buffered mutations and read set.
@@ -216,6 +219,58 @@ impl Drop for Transaction<'_> {
     }
 }
 ```
+
+### Read Operation Internals: QueryId, ReadInterval, and LimitBoundary
+
+L6 is responsible for assembling `ReadInterval` entries and recording them in the transaction's `ReadSet`. This happens inside `get()` and `query()`. L4 (`execute_scan`) produces `ReadIntervalInfo` (original bounds, no query_id, no `LimitBoundary`); L6 wraps it.
+
+**`get(collection, doc_id)` execution:**
+
+1. Resolve collection name → `CollectionId` + record `CatalogRead::CollectionByName` in read set.
+2. Check `write_set` for a pending mutation on this `doc_id`. If found, return it directly (read-your-own-writes). **Do NOT advance `query_id` or record a read interval** — the write set mutation subsumes any read on this doc for OCC purposes, and concurrent writes to this doc are covered by the doc's index deltas at commit.
+   > Note: this means `get()` on a self-written doc does NOT contribute a subscription interval for that doc. If the subscription should fire on future writes to this doc, an explicit `query()` that reaches the index (not the write-set shortcut) is needed.
+3. Assign `query_id = read_set.next_query_id()`.
+4. Call `execute_scan(AccessMethod::PrimaryGet { collection_id, doc_id }, ...)`.
+5. Consume the stream (0 or 1 result).
+6. Build `ReadInterval`:
+   - `query_id` = from step 3
+   - `lower` = `Bound::Included(read_interval_info.lower)`
+   - `upper` = `read_interval_info.upper`
+   - `limit_boundary` = `None` (point lookup, no limit)
+7. Record via `read_set.add_interval(collection_id, PRIMARY_INDEX_SENTINEL, interval)`.
+8. Return the document (or None).
+
+**`query(collection, index, range, filter, order, limit)` execution:**
+
+1. Resolve collection name → `CollectionId` + record `CatalogRead::CollectionByName`.
+2. Resolve index name → `IndexMeta` + record `CatalogRead::IndexByName`.
+3. Validate and encode range → `AccessMethod::IndexScan` or `AccessMethod::TableScan` via L4 `resolve_access` + `encode_range`.
+4. Assign `query_id = read_set.next_query_id()`.
+5. Call `execute_scan(method, ...)` → `(stream, read_interval_info)`.
+6. Build a `MergeView` from `write_set` mutations for this collection (decompose pending inserts/deletes/replaces for read-your-own-writes).
+7. Call `merge_with_writes(stream, merge_view, limit)` → merged, ordered, limit-capped result stream.
+8. Drain the merged stream, collecting `Vec<ScanRow>` and tracking the last returned row.
+9. Check read set size limits (`TransactionConfig`: `max_intervals`, `max_scanned_bytes`, `max_scanned_docs`). If any limit exceeded → abort transaction with `read_limit_exceeded`.
+   > **Note:** `ScanStats` are tracked inside L4's stream but not currently accessible after type erasure (`QueryScanStream = Pin<Box<dyn Stream>>`). Until that is resolved (e.g., by returning `ScanStats` alongside the stream from `execute_scan`), L6 can count returned documents itself for `max_scanned_docs`. `max_scanned_bytes` requires L4 to expose the stat. `max_intervals` is checked against `read_set.interval_count()` after recording the interval.
+10. Compute `LimitBoundary` (if applicable):
+    - If `limit` is `Some(N)` AND exactly `N` rows were returned:
+      - `direction == Asc` → `LimitBoundary::Upper(encode_sort_key(last_row, index_meta))`
+      - `direction == Desc` → `LimitBoundary::Lower(encode_sort_key(last_row, index_meta))`
+    - Otherwise: `None`.
+    - `encode_sort_key` reconstructs the secondary key bytes from `last_row.doc_id`, `last_row.version_ts`, and the indexed field value extracted from `last_row.doc` using `index_meta.field_paths`.
+11. Build `ReadInterval`:
+    - `query_id` = from step 4
+    - `lower` = `Bound::Included(read_interval_info.lower)`
+    - `upper` = `read_interval_info.upper`
+    - `limit_boundary` = from step 10
+12. Record via `read_set.add_interval(collection_id, index_id, interval)`.
+13. Return `Vec<Document>`.
+
+**Notes:**
+- Steps 2–5 for `get()` are async (primary index I/O); `query()` is also async for the same reason. The `Transaction` methods are therefore `async fn` in the actual implementation even if the plan shows them as `fn` for brevity.
+- For `TableScan` (`index = "_created_at"`), `encode_sort_key` produces the `_created_at` secondary key: `type_tag[1] || encoded_timestamp[var] || doc_id[16] || inv_ts[8]`.
+- `merge_with_writes` (L4 Q5) fully materializes the result — the `limit` passed to it is the same `limit` from the query, so the stream stops after N rows.
+- **LimitBoundary reflects write_set state at query time.** Each call to `query()` builds a fresh `MergeView` from the current write_set. If the write_set has changed between two calls to `query()` with the same range (e.g., op1 reads [K0,K99] limit=1 → K2; op2 deletes K2; op3 reads [K0,K99] limit=1 → K4), op3's `merge_with_writes` excludes the deleted K2, so op3's result is K4 and its `LimitBoundary` is `Upper(K4)` — distinct from op1's `Upper(K2)`. This is what makes OCC correct for op3: if a concurrent tx inserts K3 (K2 < K3 < K4), op1's interval does not conflict (K3 > K2) but op3's interval does (K3 ≤ K4), correctly causing TX1 to abort and retry.
 
 ### SubscriptionHandle
 

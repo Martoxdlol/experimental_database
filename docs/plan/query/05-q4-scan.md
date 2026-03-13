@@ -252,7 +252,11 @@ The stream tracks `scanned_docs` and `scanned_bytes` via `ScanStats`. However, L
 
 ### Limit-aware interval tightening
 
-Per DESIGN.md section 5.6.3, when a query returns exactly `limit` results, the interval tightens to the last returned key. This is NOT done inside the stream — it is done by L6 after the stream is consumed, because it requires knowing the last returned document's index key encoding.
+Per DESIGN.md section 5.6.3, when a query returns exactly `limit` results, the interval tightens to the last returned key (stored as `LimitBoundary` in L5's `ReadInterval`). The tightening is NOT done inside the stream — it is done by L6 after the stream is consumed.
+
+For L6 to populate `LimitBoundary`, it needs the **last returned document's encoded sort key** as raw bytes. Currently `ScanRow` only exposes `doc_id` and `version_ts`. For a `PrimaryGet`, L6 can reconstruct the primary key (`doc_id || inv_ts`) from those fields. For `IndexScan` / `TableScan`, the encoded secondary key requires the indexed field value from the document body — L6 can re-encode it from `ScanRow.doc` using the index's field paths, but this requires duplicating encoding logic.
+
+**Pending improvement**: a future `BoundedScan` wrapper around `QueryScanStream` would track and expose the last raw sort key, eliminating the need for L6 to re-encode it. For now, L6 is responsible for encoding the last sort key from the returned document.
 
 ### Performance: avoiding unnecessary primary fetches
 

@@ -186,6 +186,13 @@ impl SubscriptionRegistry {
     /// Called on client disconnect.
     pub fn remove_session(&mut self, session_id: u64);
 
+    /// Push invalidation events to subscriber channels.
+    /// Called by CommitCoordinator (T7 step 11) after check_invalidation.
+    /// For each event, looks up the subscription's event_tx and calls try_send.
+    /// Uses try_send to avoid blocking the commit loop.
+    /// Events for unknown or already-removed subscriptions are silently dropped.
+    pub fn push_events(&self, events: Vec<InvalidationEvent>);
+
     /// Number of active subscriptions.
     pub fn len(&self) -> usize;
 }
@@ -287,7 +294,7 @@ When Subscribe mode fires with `affected_query_ids = [Q_min, ...]`:
 
 **Edge case — merged intervals:** If Q1 and Q3 were merged into a single interval with `query_id = min(1, 3) = 1`, and Q3 is invalidated (`affected = [3]`), then `split_before(3)` includes the merged interval (since its `query_id = 1 < 3`). This is conservative: the carried interval is wider than strictly needed for Q1, but it's correct — it can only cause more future conflicts, never fewer.
 
-**Edge case — catalog reads:** Catalog reads have no query_id. They're always carried forward in full via `split_before`. A catalog conflict (e.g., collection dropped) affects `query_id = 0`, which means `first_query_id = 0` and `split_before(0)` returns an empty read set. The entire transaction must be re-executed. This is correct: if the catalog changed, all queries might return different results.
+**Edge case — catalog reads:** Catalog reads have no individual query_id. `split_before` carries them forward only when `threshold > 0`. A catalog conflict (e.g., collection dropped) affects `query_id = 0`, which means `first_query_id = 0` and `split_before(0)` returns an empty read set (no intervals, no catalog reads). The entire transaction must be re-executed from scratch, including catalog lookups. This is correct: the schema may have changed, so no prior observation can be trusted.
 
 ## Watch Mode Details
 
@@ -445,4 +452,20 @@ t6_check_invalidation_catalog_mutations
     Register subscription with CatalogRead::CollectionByName("users").
     Commit includes CatalogMutation::DropCollection { name: "users" }.
     Returns event.
+
+t6_push_events
+    Register Watch subscription with event channel.
+    Build an InvalidationEvent for that subscription_id.
+    Call push_events(vec![event]).
+    event_rx.try_recv() returns Ok(event).
+
+t6_push_events_unknown_subscription
+    Call push_events with event referencing a non-existent subscription_id.
+    No panic. Returns normally (silently dropped).
+
+t6_push_events_channel_full
+    Register subscription with channel capacity 1.
+    Fill channel with one event via push_events.
+    Call push_events with a second event.
+    No block, no panic (try_send drops when full).
 ```

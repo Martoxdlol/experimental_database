@@ -57,7 +57,6 @@ impl ReplicationHook for NoReplication {
 ///
 /// The commit coordinator calls these during materialization (step 4a)
 /// and rollback (step 7f).
-#[async_trait]
 pub trait CatalogMutator: Send + Sync {
     /// Apply a catalog mutation (create/drop collection/index).
     /// Updates both the catalog B-tree and in-memory CatalogCache.
@@ -73,18 +72,18 @@ pub trait CatalogMutator: Send + Sync {
 
 ```rust
 use tokio::sync::{mpsc, oneshot, RwLock};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use exdb_core::types::{CollectionId, Ts};
+use exdb_core::types::{CollectionId, IndexId, DocId, Ts};
 use exdb_storage::StorageEngine;
 use exdb_docstore::{PrimaryIndex, SecondaryIndex};
 
 use super::timestamp::TsAllocator;
 use super::read_set::ReadSet;
-use super::write_set::{WriteSet, CatalogMutation, IndexDelta, IndexResolver};
-use super::commit_log::CommitLog;
+use super::write_set::{WriteSet, CatalogMutation, IndexDelta, IndexResolver, MutationOp};
+use super::commit_log::{CommitLog, CommitLogEntry, IndexKeyWrite};
 use super::occ;
 use super::subscriptions::{
     SubscriptionRegistry, SubscriptionMode, SubscriptionId,
@@ -146,10 +145,12 @@ pub struct ConflictRetry {
 /// The commit coordinator — runs as a dedicated tokio task.
 pub struct CommitCoordinator {
     // ─── Timestamp Management ───
-    ts_allocator: TsAllocator,
+    /// Shared with CommitHandle (both hold Arc clones created in ::new()).
+    ts_allocator: Arc<TsAllocator>,
     /// Latest timestamp safe for new readers.
-    /// Only advanced after replication confirms + WAL persists.
-    visible_ts: AtomicU64,
+    /// Shared with CommitHandle via Arc so handles can read visible_ts cheaply.
+    /// Only advanced (via store) by the coordinator after replication + WAL.
+    visible_ts: Arc<AtomicU64>,
 
     // ─── Concurrency State ───
     commit_log: CommitLog,
@@ -171,7 +172,8 @@ pub struct CommitCoordinator {
     commit_rx: mpsc::Receiver<(CommitRequest, oneshot::Sender<CommitResult>)>,
 
     // ─── Transaction ID Allocator ───
-    next_tx_id: AtomicU64,
+    /// Shared with CommitHandle via Arc. Atomically incremented by both.
+    next_tx_id: Arc<AtomicU64>,
 }
 
 /// Handle for submitting commit requests from any task.
@@ -227,8 +229,8 @@ async fn process_commit(request, response_tx):
             Err(conflict) =>
                 // For Subscribe mode: auto-start retry transaction
                 let retry = if request.subscription == Subscribe:
-                    let new_tx_id = allocate_tx_id()
-                    let new_ts = visible_ts()
+                    let new_tx_id = next_tx_id.fetch_add(1, Ordering::SeqCst) + 1
+                    let new_ts = visible_ts.load(Ordering::SeqCst)
                     Some(ConflictRetry { new_tx_id, new_ts })
                 else:
                     None
@@ -270,27 +272,37 @@ async fn process_commit(request, response_tx):
     let secondaries = secondary_indexes.read().await
     for each delta in &index_deltas:
         let secondary = &secondaries[&delta.index_id]
-        if let Some(old_key) = &delta.old_key:
-            // Build full key: old_key_prefix || doc_id || inv_ts(commit_ts)
-            // Note: old entries are NOT removed immediately — MVCC keeps them.
-            // Vacuum handles cleanup. But we DO need to insert the new version's
-            // secondary key pointing to the new primary version.
+        if let Some(_old_key) = &delta.old_key:
+            // Old secondary entries are NOT removed immediately.
+            // MVCC keeps them visible to readers at prior timestamps.
+            // Vacuum handles physical removal later.
             ()
         if let Some(new_key) = &delta.new_key:
             let full_key = make_secondary_key_from_prefix(new_key, &delta.doc_id, commit_ts)
             secondary.insert_entry(&full_key).await?
 
     // ── Step 5: LOG ──
-    let log_entry = CommitLogEntry {
+    // Extract index_writes and catalog_mutations as locals first.
+    // They are cloned into the CommitLogEntry AND retained for step 6b.
+    // (log_entry ownership moves into commit_log.append, so we can't
+    //  borrow from it afterwards.)
+    let index_writes = index_deltas_to_key_writes(&index_deltas);
+    let commit_catalog_mutations = request.write_set.catalog_mutations.clone();
+    commit_log.append(CommitLogEntry {
         commit_ts,
-        index_writes: index_deltas_to_key_writes(&index_deltas),
-        catalog_mutations: request.write_set.catalog_mutations.clone(),
-    }
-    commit_log.append(log_entry)
+        index_writes: index_writes.clone(),
+        catalog_mutations: commit_catalog_mutations.clone(),
+    })
 
     // ── Step 6: CONCURRENT START ──
     // 6a: Replication (may be no-op for NoReplication)
     // 6b: Subscription invalidation check
+    //
+    // Capture next_tx_id Arc before the join to avoid borrowing `self`
+    // inside the async closure while it is also borrowed by other expressions.
+    let next_tx_id = Arc::clone(&self.next_tx_id);
+    let allocate_tx = move || next_tx_id.fetch_add(1, Ordering::SeqCst) + 1;
+
     let (replication_result, invalidation_events) = tokio::join!(
         // 6a
         replication.replicate_and_wait(lsn, &wal_record),
@@ -299,9 +311,9 @@ async fn process_commit(request, response_tx):
             let mut subs = subscriptions.write().await;
             subs.check_invalidation(
                 commit_ts,
-                &log_entry.index_writes,
-                &log_entry.catalog_mutations,
-                || self.allocate_tx_id(),
+                &index_writes,
+                &commit_catalog_mutations,
+                allocate_tx,
             )
         }
     )
@@ -311,13 +323,21 @@ async fn process_commit(request, response_tx):
         Ok(()) => ()  // continue to success path
         Err(_) =>
             // ── FAILURE PATH: Quorum Lost ──
-            // 7f-a: Rollback data mutations (delete inserted versions)
+            // 7f-a: Rollback data mutations
             let primaries = primary_indexes.read().await
             for each (collection_id, doc_id), entry in request.write_set.mutations:
                 let primary = &primaries[&collection_id]
-                // Insert a tombstone at commit_ts to logically delete the version
-                // we just inserted. Vacuum will physically remove both.
-                primary.insert_version(&doc_id, commit_ts, None).await?
+                match entry.op:
+                    Insert | Replace =>
+                        // Insert a tombstone at commit_ts to logically cancel
+                        // the new version. Vacuum will physically remove both.
+                        primary.insert_version(&doc_id, commit_ts, None).await?
+                    Delete =>
+                        // For Delete, step 4b already inserted a tombstone at
+                        // commit_ts. Since visible_ts does NOT advance, no new
+                        // reader will see this version. Rollback vacuum will
+                        // clean it up. No further action needed here.
+                        ()
 
             // 7f-b: Rollback secondary index entries
             let secondaries = secondary_indexes.read().await
@@ -371,14 +391,10 @@ async fn process_commit(request, response_tx):
 
     // ── Step 11: PUSH INVALIDATION (fire-and-forget) ──
     // Route invalidation events from step 6b to existing subscriber sessions.
-    // Uses the event_tx stored in SubscriptionMeta (from prior registrations).
+    // Uses SubscriptionRegistry::push_events (try_send — non-blocking).
     // This does NOT block the commit response (response sent in step 10).
-    let subs = subscriptions.read().await
-    for event in invalidation_events:
-        if let Some(meta) = subs.subscriptions.get(&event.subscription_id):
-            // try_send: non-blocking. If channel full, event is dropped.
-            // Client can detect missed events via commit_ts gap.
-            let _ = meta.event_tx.try_send(event)
+    let subs = subscriptions.read().await;
+    subs.push_events(invalidation_events);
 ```
 
 ## Helper Functions
@@ -564,9 +580,11 @@ t7_commit_subscribe_chain_continuation
     InvalidationEvent has continuation with carried Q0 + first_query_id=1.
 
 t7_readonly_commit_registers_subscription
-    Call CommitHandle directly (bypass channel) with empty write set + Watch.
-    Subscription registered. No WAL record written.
-    event_rx returned to caller.
+    Simulate a read-only subscription commit (L6 path, bypasses single-writer channel):
+    Create (event_tx, event_rx) channel. Call
+      commit_handle.subscriptions().write().await.register(Watch, ..., event_tx).
+    Assert subscription is registered (len() == 1).
+    Assert no WAL record was written (WAL reader sees no new records).
 
 t7_commit_ordering
     Submit 5 commits sequentially. Verify commit_ts is strictly increasing.
@@ -578,11 +596,11 @@ t7_commit_sequential_processing
 
 t7_commit_quorum_lost_rollback
     Mock ReplicationHook that returns Err.
-    Submit commit. Verify:
+    Submit commit (one insert). Verify:
     - CommitResult::QuorumLost returned
-    - Materialized data rolled back (primary versions removed)
-    - Secondary index entries removed
-    - Commit log entry removed
+    - Primary: tombstone inserted at commit_ts (logical delete of the inserted version)
+    - Secondary: new index entry removed via remove_entry
+    - Commit log: entry at commit_ts removed (remove() returns Some)
     - visible_ts NOT advanced
 
 t7_commit_catalog_only

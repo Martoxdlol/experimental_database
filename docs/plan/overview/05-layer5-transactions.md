@@ -118,7 +118,7 @@ impl ReadSet {
 }
 ```
 
-**Carry-forward:** When a subscription chain fires at `query_id = Q_min`, `split_before(Q_min)` extracts unaffected intervals. These are provably unchanged (no concurrent commit touched them), so carrying them to the new transaction is equivalent to re-executing the same queries.
+**Carry-forward:** When a subscription chain fires at `query_id = Q_min`, `split_before(Q_min)` extracts unaffected intervals. These are provably unchanged (no concurrent commit touched them), so carrying them to the new transaction is equivalent to re-executing the same queries. Catalog reads are also carried when `Q_min > 0`; when `Q_min = 0` (catalog conflict), the entire read set is empty — the new transaction must re-read catalog state from scratch.
 
 **Interval merging:** When intervals overlap, the merged interval takes `query_id = min(both)`. This is conservative — a wider carried interval may cause more future conflicts, but never fewer.
 
@@ -376,6 +376,11 @@ impl SubscriptionRegistry {
 
     /// Remove all subscriptions for a session (on disconnect).
     pub fn remove_session(&mut self, session_id: u64);
+
+    /// Push invalidation events to subscriber channels.
+    /// Called by CommitCoordinator (T7 step 11) after check_invalidation.
+    /// Uses try_send; events for removed subscriptions are silently dropped.
+    pub fn push_events(&self, events: Vec<InvalidationEvent>);
 }
 ```
 
@@ -433,8 +438,8 @@ pub trait CatalogMutator: Send + Sync {
 }
 
 pub struct CommitCoordinator {
-    ts_allocator: TsAllocator,
-    visible_ts: AtomicU64,
+    ts_allocator: Arc<TsAllocator>,       // shared with CommitHandle
+    visible_ts: Arc<AtomicU64>,            // shared with CommitHandle
     commit_log: CommitLog,
     subscriptions: Arc<RwLock<SubscriptionRegistry>>,
     storage: Arc<StorageEngine>,
@@ -444,7 +449,7 @@ pub struct CommitCoordinator {
     catalog_mutator: Arc<dyn CatalogMutator>,
     index_resolver: Arc<dyn IndexResolver>,
     commit_rx: mpsc::Receiver<(CommitRequest, oneshot::Sender<CommitResult>)>,
-    next_tx_id: AtomicU64,
+    next_tx_id: Arc<AtomicU64>,            // shared with CommitHandle
 }
 
 impl CommitCoordinator {
@@ -459,8 +464,6 @@ impl CommitCoordinator {
         index_resolver: Arc<dyn IndexResolver>,
         channel_size: usize,
     ) -> (Self, CommitHandle);
-
-    pub fn visible_ts(&self) -> Ts;
 
     /// The single-writer commit loop
     pub async fn run(&mut self);

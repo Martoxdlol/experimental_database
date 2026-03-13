@@ -15,6 +15,7 @@ Tracks which portions of the index key space a transaction has observed, includi
 ## Data Structures
 
 ```rust
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use exdb_core::types::{CollectionId, IndexId};
 
@@ -169,13 +170,19 @@ split_before(threshold):
         kept = intervals.filter(|i| i.query_id < threshold)
         if !kept.is_empty():
             result.intervals.insert(key, kept.clone())
-    // Catalog reads with no query_id are always carried
-    // (they represent transaction-level observations)
-    result.catalog_reads = self.catalog_reads.clone()
+    // Catalog reads are carried only when threshold > 0.
+    // If threshold = 0, a catalog mutation caused the invalidation —
+    // the schema may have changed, so all catalog observations must
+    // be re-read in the new transaction. Carrying them would be wrong.
+    // If threshold > 0, no catalog conflict fired between old_ts and now
+    // (the subscription would have fired earlier), so prior catalog
+    // observations remain valid.
+    if threshold > 0:
+        result.catalog_reads = self.catalog_reads.clone()
     return result
 ```
 
-**Note on catalog reads:** Catalog reads are always carried forward in full. They don't have individual query IDs because they represent structural observations (e.g., "collection X exists") that are relevant to all queries in the transaction.
+**Note on catalog reads:** Catalog reads are carried forward when `threshold > 0`. When `threshold = 0` (a catalog mutation caused the invalidation), catalog reads are NOT carried — the schema may have changed, so the new transaction must re-read catalog state from scratch. This is consistent with `split_before(0)` returning an empty `ReadSet` (see T6's carry-forward correctness).
 
 ## Limit Checks
 
@@ -233,6 +240,10 @@ t2_merge_from
 
 t2_catalog_reads_carried
     Add catalog reads + intervals. split_before(2) carries all catalog reads.
+
+t2_catalog_reads_not_carried_at_zero
+    Add catalog reads + intervals. split_before(0) returns ReadSet with
+    no intervals AND no catalog reads (fully empty).
 
 t2_catalog_read_deduplicate_exact
     add_catalog_read(CollectionByName("users")) twice.

@@ -1452,10 +1452,16 @@ dependencies = [
 name = "exdb-tx"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "exdb-core",
  "exdb-docstore",
  "exdb-query",
  "exdb-storage",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

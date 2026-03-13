@@ -91,11 +91,11 @@ In Watch mode, the subscription's read set stays fixed after registration. The c
 |---|------|-------------------|---------|
 | T1 | `timestamp.rs` | `TsAllocator` | Monotonic timestamp allocation |
 | T2 | `read_set.rs` | `ReadSet`, `ReadInterval`, `CatalogRead` | Scanned interval tracking + carry-forward |
-| T3 | `write_set.rs` | `WriteSet`, `MutationEntry`, `CatalogMutation`, `IndexDelta` | Buffered mutations + delta computation |
+| T3 | `write_set.rs` | `WriteSet`, `MutationEntry`, `CatalogMutation`, `IndexDelta`, `IndexResolver` | Buffered mutations + delta computation + index resolver trait |
 | T4 | `commit_log.rs` | `CommitLog`, `CommitLogEntry`, `IndexKeyWrite` | Recent commit tracking for OCC |
-| T5 | `occ.rs` | `validate()`, `ConflictError` | Read set vs commit log conflict detection |
+| T5 | `occ.rs` | `validate()`, `catalog_conflicts()`, `ConflictError` | Read set vs commit log conflict detection; shared catalog conflict helper |
 | T6 | `subscriptions.rs` | `SubscriptionRegistry`, `InvalidationEvent`, `ChainContinuation` | Subscription lifecycle + invalidation |
-| T7 | `commit.rs` | `CommitCoordinator`, `CommitHandle`, `CommitRequest`, `CommitResult` | Single-writer commit protocol |
+| T7 | `commit.rs` | `CommitCoordinator`, `CommitHandle`, `CommitRequest`, `CommitResult`, `ReplicationHook`, `NoReplication`, `CatalogMutator` | Single-writer commit protocol + injected trait definitions |
 
 ## Dependency Graph (Within L5)
 
@@ -105,11 +105,19 @@ T7 (commit.rs)
  │    ├── T2 (read_set.rs)
  │    └── T4 (commit_log.rs)
  ├── T6 (subscriptions.rs)
- │    └── T2 (read_set.rs)
- ├── T3 (write_set.rs)
+ │    ├── T2 (read_set.rs)
+ │    └── T5 (occ::catalog_conflicts — shared helper)
+ ├── T3 (write_set.rs — IndexResolver trait + compute_index_deltas)
  ├── T1 (timestamp.rs)
- └── L2 (StorageEngine — WAL)
-     L3 (PrimaryIndex, SecondaryIndex — materialize)
+ ├── L2 (StorageEngine — WAL append)
+ └── L3 (PrimaryIndex::insert_version, SecondaryIndex::insert_entry/remove_entry,
+         PrimaryIndex::get_at_ts for delta computation,
+         compute_index_entries for key extraction)
+
+Injected by L6 at construction time (via trait objects):
+ ├── ReplicationHook — defined in T7, implemented by L6/L7
+ ├── CatalogMutator  — defined in T7, implemented by L6
+ └── IndexResolver   — defined in T3, implemented by L6 (via CatalogCache)
 ```
 
 ## Build Order
@@ -131,13 +139,17 @@ Strictly bottom-up, each step produces a testable unit:
 | `SubscriptionMode` | `TransactionOptions` |
 | `ReadSet`, `ReadInterval`, `CatalogRead` | Transaction read tracking |
 | `WriteSet`, `MutationEntry`, `CatalogMutation` | Transaction write buffering |
+| `IndexDelta` | Commit log entries |
+| `IndexResolver`, `IndexInfo` | L6 implements for CatalogCache |
 | `CommitHandle` | Submitting commit requests |
-| `CommitRequest`, `CommitResult` | Commit protocol |
+| `CommitRequest`, `CommitResult`, `ConflictRetry` | Commit protocol |
 | `TsAllocator` | Timestamp management |
 | `SubscriptionRegistry` | Subscription access for L7/L8 |
 | `InvalidationEvent`, `ChainContinuation` | Push notifications |
 | `ConflictError`, `ConflictKind` | Error reporting |
-| `SubscriptionId`, `QueryId` | Subscription identifiers |
+| `SubscriptionId`, `QueryId`, `TxId` | Subscription/transaction identifiers |
+| `ReplicationHook`, `NoReplication` | L6 uses `NoReplication`; L7 provides real impl |
+| `CatalogMutator` | L6 implements for CatalogCache + catalog B-tree |
 
 ## Crate Dependencies
 

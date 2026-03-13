@@ -1817,6 +1817,20 @@ Each link in the chain:
 
 Watch mode fires on every invalidation but does not auto-start transactions or carry read sets. The subscription persists with its original read set. The client receives `InvalidationEvent` with `affected_query_ids` but no `ChainContinuation`. The client decides when and how to refresh. They can explicitly call `update_read_set()` after re-querying to update the subscription's watch predicate.
 
+**Transaction lifecycle and cleanup:**
+
+- **`drop(tx)` without commit** = implicit rollback. All buffered mutations and the read set are discarded. No subscription is registered. The transaction is removed from the active transaction set.
+- **`tx.reset()`** = clears both read and write sets, resets the query_id counter to 0. The transaction keeps its `begin_ts` (same snapshot). This is equivalent to rollback + begin at the same timestamp without the overhead. Useful for retry loops within the same snapshot or discarding partial work.
+- **`tx.rollback()`** = explicit discard, equivalent to drop. Consumes self.
+
+**Subscription lifecycle and cleanup:**
+
+- On commit with `subscription != None`, the `CommitResult` includes a `SubscriptionHandle` — an opaque handle the client holds to receive invalidation events.
+- **`drop(SubscriptionHandle)`** = automatic unsubscribe. The subscription is removed from the registry. No further events are delivered. RAII cleanup.
+- **`handle.unsubscribe()`** = explicit end. Same effect as drop, but communicates intent.
+- **Session disconnect** triggers `remove_session(session_id)`, cleaning up all subscriptions for that session.
+- **Notify mode** auto-removes after firing once (the handle's event stream closes).
+
 ### 5.4 Read-Your-Own-Writes
 
 Within a read-write transaction, reads check the **write set first**, then fall through to the snapshot at `begin_ts`.

@@ -87,6 +87,11 @@ impl ReadSet {
     /// Return the current next_query_id value without advancing.
     pub fn peek_next_query_id(&self) -> QueryId;
 
+    /// Explicitly set the next_query_id counter.
+    /// Used by begin_chain_continuation (L6) after cloning a carried read set,
+    /// to resume query numbering from `first_query_id`.
+    pub fn set_next_query_id(&mut self, id: QueryId);
+
     /// Add a read interval for a (collection, index) pair.
     /// The interval is inserted in sorted position and adjacent/overlapping
     /// intervals are merged immediately.
@@ -98,6 +103,12 @@ impl ReadSet {
     );
 
     /// Add a catalog read observation.
+    /// Deduplicates: adding the same CatalogRead variant twice is a no-op.
+    /// Deduplication rules:
+    ///   - `ListCollections` and `ListIndexes(coll)` subsume more specific reads
+    ///     (if `ListCollections` is already recorded, `CollectionByName(x)` is dropped;
+    ///      if `ListIndexes(coll)` is recorded, `IndexByName(coll, y)` is dropped).
+    ///   - `CollectionByName(x)` and `IndexByName(coll, y)` deduplicate by equality.
     pub fn add_catalog_read(&mut self, read: CatalogRead);
 
     /// Merge overlapping or adjacent intervals within each group.
@@ -222,6 +233,21 @@ t2_merge_from
 
 t2_catalog_reads_carried
     Add catalog reads + intervals. split_before(2) carries all catalog reads.
+
+t2_catalog_read_deduplicate_exact
+    add_catalog_read(CollectionByName("users")) twice.
+    catalog_reads.len() == 1 (second call is a no-op).
+
+t2_catalog_read_deduplicate_subsumed_by_list
+    add_catalog_read(ListCollections).
+    add_catalog_read(CollectionByName("users")).
+    catalog_reads has only ListCollections (the specific read is subsumed).
+
+t2_catalog_read_deduplicate_index_subsumed
+    add_catalog_read(ListIndexes(coll_1)).
+    add_catalog_read(IndexByName(coll_1, "by_email")).
+    catalog_reads has only ListIndexes(coll_1).
+    add_catalog_read(IndexByName(coll_2, "by_email")) — different collection, NOT subsumed.
 
 t2_merge_query_id_min
     Two overlapping intervals with query_id 1 and 3.

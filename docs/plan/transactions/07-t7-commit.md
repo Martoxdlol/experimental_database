@@ -3,6 +3,7 @@
 **File:** `crates/tx/src/commit.rs`
 **Depends on:** T1–T6, L2 (`StorageEngine`, WAL), L3 (`PrimaryIndex`, `SecondaryIndex`)
 **Depended on by:** L6 (Database)
+**Defines traits:** `ReplicationHook` (implemented by L6), `CatalogMutator` (implemented by L6)
 
 ## Purpose
 
@@ -10,19 +11,79 @@ Orchestrates the full commit sequence: OCC validation, timestamp assignment, WAL
 
 This is the serialization point for all writes. A single tokio task runs the commit loop, processing one commit at a time. All other code paths submit requests and await results via channels.
 
+## Trait Definitions
+
+L5 defines traits for capabilities it needs from L6. This avoids a circular dependency (L6 depends on L5, L5 defines traits that L6 implements).
+
+### ReplicationHook
+
+```rust
+use exdb_storage::wal::Lsn;
+
+/// Trait for replication — defined in L5, implemented by L6 or L7.
+/// The commit coordinator calls this during commit (step 6a/7).
+/// The implementor decides how to transport the data (TCP, QUIC, etc.).
+pub trait ReplicationHook: Send + Sync {
+    /// Replicate a committed WAL record and wait for acknowledgment.
+    /// Called by CommitCoordinator after WAL fsync (step 6a).
+    /// `lsn` — the log sequence number of the committed record.
+    /// `record` — the raw WAL record bytes.
+    async fn replicate_and_wait(&self, lsn: Lsn, record: &[u8]) -> Result<()>;
+
+    /// Whether the cluster currently has quorum.
+    /// Called before accepting new commit requests.
+    fn has_quorum(&self) -> bool { true }
+
+    /// Whether the replicator is in hold state (quorum lost during commit).
+    fn is_holding(&self) -> bool { false }
+}
+
+/// No-op implementation for embedded/single-node usage.
+/// Provided by L5 as a convenience. L6 uses this by default.
+pub struct NoReplication;
+
+impl ReplicationHook for NoReplication {
+    async fn replicate_and_wait(&self, _lsn: Lsn, _record: &[u8]) -> Result<()> {
+        Ok(())
+    }
+}
+```
+
+### CatalogMutator
+
+```rust
+/// Trait for applying catalog mutations to the in-memory catalog and catalog B-tree.
+/// Defined in L5, implemented by L6 (which owns CatalogCache + catalog B-trees).
+///
+/// The commit coordinator calls these during materialization (step 4a)
+/// and rollback (step 7f).
+#[async_trait]
+pub trait CatalogMutator: Send + Sync {
+    /// Apply a catalog mutation (create/drop collection/index).
+    /// Updates both the catalog B-tree and in-memory CatalogCache.
+    async fn apply(&self, mutation: &CatalogMutation, commit_ts: Ts) -> Result<()>;
+
+    /// Rollback a catalog mutation (reverse of apply).
+    /// Used on quorum loss (step 7f) to undo materialized catalog changes.
+    async fn rollback(&self, mutation: &CatalogMutation) -> Result<()>;
+}
+```
+
 ## Data Structures
 
 ```rust
 use tokio::sync::{mpsc, oneshot, RwLock};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::collections::HashMap;
 
-use exdb_core::types::Ts;
+use exdb_core::types::{CollectionId, Ts};
 use exdb_storage::StorageEngine;
+use exdb_docstore::{PrimaryIndex, SecondaryIndex};
 
 use super::timestamp::TsAllocator;
 use super::read_set::ReadSet;
-use super::write_set::{WriteSet, CatalogMutation, IndexDelta};
+use super::write_set::{WriteSet, CatalogMutation, IndexDelta, IndexResolver};
 use super::commit_log::CommitLog;
 use super::occ;
 use super::subscriptions::{
@@ -55,6 +116,9 @@ pub enum CommitResult {
         commit_ts: Ts,
         /// Subscription ID if subscription mode is not None.
         subscription_id: Option<SubscriptionId>,
+        /// Receiver for invalidation events (present when subscription_id is Some).
+        /// L6 wraps this in a SubscriptionHandle.
+        event_rx: Option<mpsc::Receiver<InvalidationEvent>>,
     },
     /// OCC conflict detected.
     Conflict {
@@ -94,11 +158,14 @@ pub struct CommitCoordinator {
     // ─── Storage ───
     storage: Arc<StorageEngine>,
 
-    // ─── Replication (injected by L6) ───
-    /// Trait object for replication. NoReplication for embedded/single-node.
-    /// The trait is defined in L6 (database/replication_hook.rs).
-    /// L5 receives it as a dependency, does NOT define it.
+    // ─── Index Access (from L3, injected by L6) ───
+    primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
+    secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
+
+    // ─── Injected Traits (implemented by L6) ───
     replication: Box<dyn ReplicationHook>,
+    catalog_mutator: Arc<dyn CatalogMutator>,
+    index_resolver: Arc<dyn IndexResolver>,
 
     // ─── Channel ───
     commit_rx: mpsc::Receiver<(CommitRequest, oneshot::Sender<CommitResult>)>,
@@ -150,8 +217,9 @@ The coordinator processes one request at a time from `commit_rx`:
 async fn process_commit(request, response_tx):
 
     // ── Step 1: VALIDATE ──
-    // Skip OCC for read-only transactions (empty write set)
-    // that are only committing to register a subscription.
+    // Skip OCC for transactions with empty write set (no document mutations
+    // AND no catalog mutations). These are read-only transactions that are
+    // only committing to register a subscription.
     if !request.write_set.is_empty():
         let commit_ts_candidate = ts_allocator.latest() + 1  // peek, don't allocate yet
         match occ::validate(&request.read_set, &commit_log,
@@ -181,13 +249,36 @@ async fn process_commit(request, response_tx):
     // Apply catalog mutations FIRST so newly created collections
     // exist before documents are inserted.
     for each mutation in request.write_set.catalog_mutations:
-        apply_catalog_mutation(mutation, commit_ts).await?
+        catalog_mutator.apply(&mutation, commit_ts).await?
 
     // ── Step 4b: MATERIALIZE DATA ──
-    // Insert/replace/delete document versions in primary + secondary indexes
-    let index_deltas = compute_and_apply_mutations(
-        &request.write_set, commit_ts
+    // Compute index deltas, then apply mutations to primary + secondary indexes.
+    let index_deltas = write_set::compute_index_deltas(
+        &request.write_set,
+        index_resolver.as_ref(),
+        &*primary_indexes.read().await,
     ).await?
+
+    // Apply to primary indexes
+    let primaries = primary_indexes.read().await
+    for each (collection_id, doc_id), entry in request.write_set.mutations:
+        let primary = &primaries[&collection_id]
+        let body_bytes = entry.body.as_ref().map(|v| serde_json::to_vec(v)).transpose()?
+        primary.insert_version(&doc_id, commit_ts, body_bytes.as_deref()).await?
+
+    // Apply to secondary indexes
+    let secondaries = secondary_indexes.read().await
+    for each delta in &index_deltas:
+        let secondary = &secondaries[&delta.index_id]
+        if let Some(old_key) = &delta.old_key:
+            // Build full key: old_key_prefix || doc_id || inv_ts(commit_ts)
+            // Note: old entries are NOT removed immediately — MVCC keeps them.
+            // Vacuum handles cleanup. But we DO need to insert the new version's
+            // secondary key pointing to the new primary version.
+            ()
+        if let Some(new_key) = &delta.new_key:
+            let full_key = make_secondary_key_from_prefix(new_key, &delta.doc_id, commit_ts)
+            secondary.insert_entry(&full_key).await?
 
     // ── Step 5: LOG ──
     let log_entry = CommitLogEntry {
@@ -220,13 +311,32 @@ async fn process_commit(request, response_tx):
         Ok(()) => ()  // continue to success path
         Err(_) =>
             // ── FAILURE PATH: Quorum Lost ──
-            // 7f: Rollback materialized changes
-            rollback_mutations(&request.write_set, &index_deltas, commit_ts).await?
-            rollback_catalog_mutations(&request.write_set.catalog_mutations).await?
+            // 7f-a: Rollback data mutations (delete inserted versions)
+            let primaries = primary_indexes.read().await
+            for each (collection_id, doc_id), entry in request.write_set.mutations:
+                let primary = &primaries[&collection_id]
+                // Insert a tombstone at commit_ts to logically delete the version
+                // we just inserted. Vacuum will physically remove both.
+                primary.insert_version(&doc_id, commit_ts, None).await?
+
+            // 7f-b: Rollback secondary index entries
+            let secondaries = secondary_indexes.read().await
+            for each delta in &index_deltas:
+                if let Some(new_key) = &delta.new_key:
+                    let full_key = make_secondary_key_from_prefix(new_key, &delta.doc_id, commit_ts)
+                    secondaries[&delta.index_id].remove_entry(&full_key).await?
+
+            // 7f-c: Rollback catalog mutations (reverse order)
+            for mutation in request.write_set.catalog_mutations.iter().rev():
+                catalog_mutator.rollback(&mutation).await?
+
             // 8f: Remove from commit log
             commit_log.remove(commit_ts)
-            // 9f: Enter hold state (reject new commits until quorum restored)
-            // (hold state managed by replication hook)
+
+            // 9f: Discard invalidation events (they reference rolled-back state)
+            // (events were computed in step 6b but commit is being rolled back)
+            drop(invalidation_events)
+
             // 10f: Respond
             response_tx.send(CommitResult::QuorumLost)
             return
@@ -240,26 +350,74 @@ async fn process_commit(request, response_tx):
     visible_ts.store(commit_ts, Ordering::SeqCst)
 
     // ── Step 10: REGISTER SUBSCRIPTION + RESPOND ──
-    let subscription_id = if request.subscription != SubscriptionMode::None:
+    let (subscription_id, event_rx) = if request.subscription != SubscriptionMode::None:
+        // Create channel for pushing invalidation events to the client.
+        // The sender goes into the registry; the receiver goes to the client (via CommitResult).
+        let (event_tx, event_rx) = mpsc::channel(64)  // bounded, capacity configurable
         let mut subs = subscriptions.write().await;
-        Some(subs.register(
+        let id = subs.register(
             request.subscription,
             request.session_id,
             request.tx_id,
             commit_ts,  // read_ts for the subscription
             request.read_set,
-        ))
+            event_tx,
+        )
+        (Some(id), Some(event_rx))
     else:
-        None
+        (None, None)
 
-    response_tx.send(CommitResult::Success { commit_ts, subscription_id })
+    response_tx.send(CommitResult::Success { commit_ts, subscription_id, event_rx })
 
     // ── Step 11: PUSH INVALIDATION (fire-and-forget) ──
-    // Route invalidation_events to subscriber sessions.
-    // This is async and does NOT block the commit response.
+    // Route invalidation events from step 6b to existing subscriber sessions.
+    // Uses the event_tx stored in SubscriptionMeta (from prior registrations).
+    // This does NOT block the commit response (response sent in step 10).
+    let subs = subscriptions.read().await
     for event in invalidation_events:
-        push_invalidation_to_session(event)  // non-blocking send to session channel
+        if let Some(meta) = subs.subscriptions.get(&event.subscription_id):
+            // try_send: non-blocking. If channel full, event is dropped.
+            // Client can detect missed events via commit_ts gap.
+            let _ = meta.event_tx.try_send(event)
 ```
+
+## Helper Functions
+
+### `serialize_commit_record`
+
+```rust
+/// Serialize a commit's write set into a WAL record payload.
+/// Format: commit_ts[8] || mutation_count[4] || mutations[...] ||
+///         catalog_mutation_count[4] || catalog_mutations[...]
+///
+/// Each mutation: collection_id[8] || doc_id[16] || op[1] || body_len[4] || body[body_len]
+///   op: 0x01=Insert, 0x02=Replace, 0x03=Delete
+///   body_len: 0 for Delete
+///
+/// Catalog mutations are serialized via a simple tag-length-value scheme:
+///   tag[1] || payload_len[4] || payload[...]
+///   Tags: 0x01=CreateCollection, 0x02=DropCollection, 0x03=CreateIndex, 0x04=DropIndex
+fn serialize_commit_record(write_set: &WriteSet, commit_ts: Ts) -> Vec<u8>;
+
+/// Deserialize a WAL_RECORD_TX_COMMIT payload for recovery.
+/// Returns (commit_ts, mutations, catalog_mutations).
+pub fn deserialize_commit_record(payload: &[u8])
+    -> Result<(Ts, Vec<(CollectionId, DocId, MutationOp, Option<Vec<u8>>)>, Vec<CatalogMutation>)>;
+```
+
+### `index_deltas_to_key_writes`
+
+```rust
+/// Convert IndexDeltas into IndexKeyWrites for the commit log.
+/// Groups by (collection_id, index_id), maps old_key/new_key directly.
+fn index_deltas_to_key_writes(
+    deltas: &[IndexDelta],
+) -> BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>>;
+```
+
+### `WriteSet::is_empty` Semantics
+
+`is_empty()` returns `true` when **both** `mutations` (document ops) and `catalog_mutations` (DDL ops) are empty. A transaction with only catalog mutations (e.g., `CREATE COLLECTION`) is NOT empty — it goes through full OCC validation and WAL persistence.
 
 ## Visibility Fence (`visible_ts`)
 
@@ -289,7 +447,7 @@ Read-only transactions with a subscription mode (Notify/Watch/Subscribe) need to
 1. Skip Steps 1–4 (no validation needed, no writes)
 2. Skip Step 5 (no commit log entry)
 3. Skip Steps 6a, 7, 8, 9 (no replication, no visibility change)
-4. Step 10: Register subscription
+4. Step 10: Register subscription (L6 creates the mpsc channel, calls `registry.register()` directly)
 5. Step 11: N/A (no writes = no invalidations)
 
 Read-only commits don't go through the single-writer channel at all — they can register subscriptions directly via the shared `SubscriptionRegistry` lock. This avoids serializing read-only commits behind write commits.
@@ -316,7 +474,11 @@ impl CommitCoordinator {
         initial_ts: Ts,          // highest commit_ts from WAL replay
         visible_ts: Ts,          // last WAL_RECORD_VISIBLE_TS from replay
         storage: Arc<StorageEngine>,
+        primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
+        secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
         replication: Box<dyn ReplicationHook>,
+        catalog_mutator: Arc<dyn CatalogMutator>,
+        index_resolver: Arc<dyn IndexResolver>,
         channel_size: usize,     // bounded channel capacity (default: 256)
     ) -> (Self, CommitHandle);
 
@@ -339,27 +501,29 @@ The commit coordinator writes two WAL record types:
 
 | Type Tag | Name | Payload |
 |----------|------|---------|
-| `0x07` | `WAL_RECORD_TX_COMMIT` | `commit_ts[8] \|\| mutation_count[4] \|\| mutations[...] \|\| catalog_mutation_count[4] \|\| catalog_mutations[...]` |
+| `0x01` | `WAL_RECORD_TX_COMMIT` | `commit_ts[8] \|\| mutation_count[4] \|\| mutations[...] \|\| catalog_mutation_count[4] \|\| catalog_mutations[...]` |
 | `0x09` | `WAL_RECORD_VISIBLE_TS` | `visible_ts[8]` |
 
 The `TxCommit` record contains everything needed to replay the commit:
-- Document mutations: `(collection_id, doc_id, op, body_len, body)`
-- Catalog mutations: serialized `CatalogMutation` entries
+- Document mutations: `collection_id[8] \|\| doc_id[16] \|\| op[1] \|\| body_len[4] \|\| body[body_len]`
+  - `op`: `0x01`=Insert, `0x02`=Replace, `0x03`=Delete (body_len=0 for Delete)
+- Catalog mutations: `tag[1] \|\| payload_len[4] \|\| payload[payload_len]`
+  - Tags: `0x01`=CreateCollection, `0x02`=DropCollection, `0x03`=CreateIndex, `0x04`=DropIndex
+
+**Note on existing WAL record types:** L2 defines separate WAL records for catalog operations (`WAL_RECORD_CREATE_COLLECTION` etc., tags 0x03–0x06). These are used by L3 for non-transactional catalog operations during recovery/startup. At runtime, all catalog mutations go through the `WAL_RECORD_TX_COMMIT` record for atomicity with data mutations.
 
 ## Tests
 
 ```
 t7_commit_success_basic
-    Create in-memory StorageEngine + CommitCoordinator.
+    Create in-memory StorageEngine + CommitCoordinator (with mock traits).
     Submit a commit with one insert. Assert CommitResult::Success.
     Verify commit_ts > begin_ts.
 
 t7_commit_occ_conflict
-    Submit commit A (reads interval [10,20), writes key 50).
-    Submit commit B (begin_ts before A, reads interval [10,20), writes key 60).
-    B should get ConflictError (A wrote into B's read interval — wait,
-    actually A writes key 50 which doesn't overlap B's interval.
-    Let's fix: A writes new_key=15, B reads [10,20) → conflict).
+    Submit commit A (writes new_key=15 into index).
+    Submit commit B (begin_ts before A, reads interval [10,20)).
+    B gets ConflictError because A wrote key 15 into B's read interval.
 
 t7_commit_occ_no_conflict
     Submit two commits with non-overlapping read/write sets.
@@ -375,20 +539,24 @@ t7_commit_subscribe_none_conflict_no_retry
 
 t7_commit_registers_subscription
     Submit commit with SubscriptionMode::Notify.
-    CommitResult::Success has subscription_id = Some(...).
+    CommitResult::Success has subscription_id = Some(...) and event_rx = Some(...).
 
 t7_commit_no_subscription_mode_none
     Submit commit with SubscriptionMode::None.
-    CommitResult::Success has subscription_id = None.
+    CommitResult::Success has subscription_id = None and event_rx = None.
 
 t7_commit_visible_ts_advances
     visible_ts starts at 0. Submit commit.
     visible_ts advances to commit_ts.
 
+t7_commit_visible_ts_not_advanced_until_replication
+    Mock ReplicationHook that delays response.
+    Submit commit. Verify visible_ts is NOT advanced until replication completes.
+
 t7_commit_invalidation_fires
-    Register subscription S1 watching interval [10, 20).
+    Register subscription S1 watching interval [10, 20) (with event channel).
     Submit commit writing key 15.
-    S1 receives InvalidationEvent.
+    S1's event_rx receives InvalidationEvent.
 
 t7_commit_subscribe_chain_continuation
     Register Subscribe subscription with queries Q0, Q1, Q2.
@@ -396,8 +564,9 @@ t7_commit_subscribe_chain_continuation
     InvalidationEvent has continuation with carried Q0 + first_query_id=1.
 
 t7_readonly_commit_registers_subscription
-    Submit "commit" with empty write set + SubscriptionMode::Watch.
+    Call CommitHandle directly (bypass channel) with empty write set + Watch.
     Subscription registered. No WAL record written.
+    event_rx returned to caller.
 
 t7_commit_ordering
     Submit 5 commits sequentially. Verify commit_ts is strictly increasing.
@@ -407,6 +576,30 @@ t7_commit_sequential_processing
     All succeed with different commit_ts values.
     Verify serialization (no interleaving).
 
+t7_commit_quorum_lost_rollback
+    Mock ReplicationHook that returns Err.
+    Submit commit. Verify:
+    - CommitResult::QuorumLost returned
+    - Materialized data rolled back (primary versions removed)
+    - Secondary index entries removed
+    - Commit log entry removed
+    - visible_ts NOT advanced
+
+t7_commit_catalog_only
+    Submit commit with only CatalogMutation::CreateCollection (no doc mutations).
+    write_set.is_empty() is false. Full OCC + WAL + materialize path runs.
+    CommitResult::Success.
+
+t7_commit_catalog_occ_conflict
+    Transaction A reads CatalogRead::CollectionByName("users").
+    Concurrent commit creates collection "users".
+    Transaction A gets ConflictError with ConflictKind::Catalog.
+
 t7_shutdown_graceful
     Drop all CommitHandle clones. Verify run() exits cleanly.
+
+t7_event_channel_full_no_block
+    Register subscription with small channel capacity (1).
+    Submit two rapid commits that invalidate the subscription.
+    Verify commit loop does NOT block (try_send drops the second event).
 ```

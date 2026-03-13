@@ -140,11 +140,22 @@ This works because intervals are sorted and non-overlapping: if the key doesn't 
 ### Catalog Validation
 
 ```rust
-/// Check catalog reads against concurrent catalog mutations.
-/// Returns Err on the first conflict found.
+/// Check if a set of catalog reads conflicts with a set of catalog mutations.
+/// Returns true if any read-write conflict exists.
+///
+/// This is a PUBLIC function, shared with T6 (subscriptions.rs) for
+/// subscription invalidation checks against catalog mutations.
+pub fn catalog_conflicts(
+    catalog_reads: &[CatalogRead],
+    catalog_mutations: &[CatalogMutation],
+) -> bool;
+
+/// Wrapper that returns ConflictError on the first conflict found.
+/// Used internally by validate().
 fn validate_catalog(
     catalog_reads: &[CatalogRead],
     catalog_mutations: &[CatalogMutation],
+    conflicting_ts: Ts,
 ) -> Result<(), ConflictError>;
 ```
 

@@ -1,8 +1,9 @@
 # T3: Write Set — Buffered Mutations + Index Delta Computation
 
 **File:** `crates/tx/src/write_set.rs`
-**Depends on:** L1 (`exdb-core`), L3 (`exdb-docstore::key_encoding`, `PrimaryIndex`)
+**Depends on:** L1 (`exdb-core`), L3 (`exdb-docstore::compute_index_entries`, `PrimaryIndex`)
 **Depended on by:** T7 (`commit.rs`), L4 (`merge.rs` via `MergeView`), L6 (Transaction)
+**Defines trait:** `IndexResolver` (implemented by L6's CatalogCache wrapper)
 
 ## Purpose
 
@@ -164,25 +165,49 @@ impl WriteSet {
 }
 ```
 
+## Index Resolver Trait
+
+The commit coordinator needs to look up which indexes exist on a collection to compute index deltas. To avoid L5 depending on L6's `CatalogCache` type, L5 defines a trait that L6 implements:
+
+```rust
+use exdb_core::field_path::FieldPath;
+
+/// Metadata about a single index, sufficient for delta computation.
+pub struct IndexInfo {
+    pub index_id: IndexId,
+    pub collection_id: CollectionId,
+    pub field_paths: Vec<FieldPath>,
+}
+
+/// Trait for looking up index metadata during commit.
+/// Defined in L5, implemented by L6 (via CatalogCache).
+pub trait IndexResolver: Send + Sync {
+    /// List all indexes on a collection (including the primary).
+    fn indexes_for_collection(&self, collection_id: CollectionId) -> Vec<IndexInfo>;
+}
+```
+
 ## Index Delta Computation
 
-At commit time, the `CommitCoordinator` calls `compute_index_deltas` to transform write set mutations into index deltas. This is a separate function (not a method on WriteSet) because it needs access to the catalog and primary indexes:
+At commit time, the `CommitCoordinator` calls `compute_index_deltas` to transform write set mutations into index deltas. This is a separate async function (not a method on WriteSet) because it needs access to the index resolver and primary indexes for reading old documents:
 
 ```rust
 /// Compute index deltas for all mutations in the write set.
 ///
 /// For each mutation:
-/// 1. Look up all indexes on the mutation's collection.
-/// 2. If previous_ts is set: read old document, extract old index keys.
+/// 1. Look up all indexes on the mutation's collection (via IndexResolver).
+/// 2. If previous_ts is set: read old document via PrimaryIndex, extract old index keys.
 /// 3. If body is set (not delete): extract new index keys.
 /// 4. Emit IndexDelta for each index.
 ///
 /// For array-indexed fields, one delta per array element.
-pub fn compute_index_deltas(
+///
+/// This function is async because reading old documents (step 2) requires
+/// PrimaryIndex::get_at_ts which is an async I/O operation.
+pub async fn compute_index_deltas(
     write_set: &WriteSet,
-    catalog: &CatalogCache,       // from L6, passed in
-    primary_indexes: &HashMap<CollectionId, PrimaryIndex>,  // from L6
-    secondary_indexes: &HashMap<IndexId, SecondaryIndex>,   // from L6
+    index_resolver: &dyn IndexResolver,
+    primary_indexes: &HashMap<CollectionId, Arc<PrimaryIndex>>,
 ) -> Result<Vec<IndexDelta>>;
 ```
 
@@ -190,18 +215,18 @@ pub fn compute_index_deltas(
 
 ```
 for each (collection_id, doc_id), entry in write_set.mutations:
-    indexes = catalog.list_indexes(collection_id)
+    indexes = index_resolver.indexes_for_collection(collection_id)
     for each index in indexes:
         // Old keys (if replacing/deleting)
         old_keys = []
         if entry.previous_ts is Some(ts):
-            old_doc = primary_indexes[collection_id].get_at_ts(doc_id, ts)
-            old_keys = extract_index_keys(old_doc, index.field_paths)
+            old_doc = primary_indexes[collection_id].get_at_ts(doc_id, ts).await?
+            old_keys = compute_index_entries(old_doc, &index.field_paths)
 
         // New keys (if inserting/replacing)
         new_keys = []
         if entry.body is Some(body):
-            new_keys = extract_index_keys(body, index.field_paths)
+            new_keys = compute_index_entries(body, &index.field_paths)
 
         // Emit deltas
         // For simple (non-array) indexes: one old_key, one new_key
@@ -210,6 +235,8 @@ for each (collection_id, doc_id), entry in write_set.mutations:
 ```
 
 **Note:** `compute_index_deltas` is called within the commit coordinator's single-writer context, so primary index reads are safe (no concurrent modifications during this phase).
+
+**Note:** `compute_index_entries` is from L3 (`exdb_docstore::compute_index_entries`). It computes encoded key prefixes; the caller appends `doc_id || inv_ts` to form the full secondary key via `make_secondary_key_from_prefix`.
 
 ## Read-Your-Writes Support
 
@@ -265,10 +292,12 @@ t3_catalog_mutations_ordered
     Add CreateCollection then CreateIndex. catalog_mutations preserves order.
 
 t3_compute_index_deltas_insert
-    Insert a document. Verify delta has old_key=None, new_key=Some(...).
+    Insert a document. Mock IndexResolver returns one index.
+    Verify delta has old_key=None, new_key=Some(...).
 
 t3_compute_index_deltas_delete
-    Delete a document with previous_ts. Verify delta has old_key=Some(...), new_key=None.
+    Delete a document with previous_ts. Mock IndexResolver + in-memory PrimaryIndex.
+    Verify delta has old_key=Some(...), new_key=None.
 
 t3_compute_index_deltas_replace
     Replace a document. Verify delta has both old_key and new_key.
@@ -276,4 +305,8 @@ t3_compute_index_deltas_replace
 t3_compute_index_deltas_array_field
     Insert document with array field [1, 2, 3] on an array index.
     Verify 3 deltas emitted (one per element).
+
+t3_compute_index_deltas_no_indexes
+    Insert a document into a collection with no secondary indexes.
+    IndexResolver returns empty. No deltas emitted.
 ```

@@ -1,7 +1,7 @@
 # T6: Subscription Registry — Notify / Watch / Subscribe + Carry-Forward
 
 **File:** `crates/tx/src/subscriptions.rs`
-**Depends on:** T2 (`read_set.rs`), L1 types
+**Depends on:** T2 (`read_set.rs`), T5 (`occ::catalog_conflicts`), L1 types
 **Depended on by:** T7 (`commit.rs`), L6 (Database), L8 (push notifications)
 
 ## Purpose
@@ -66,6 +66,10 @@ pub struct SubscriptionMeta {
     pub read_ts: Ts,
     /// The full read set (needed for split_before on chain continuation).
     pub read_set: ReadSet,
+    /// Channel sender for pushing invalidation events to the client.
+    /// L6 creates the (tx, rx) pair; L5 stores the tx here and uses it
+    /// to push events. The rx is wrapped in SubscriptionHandle (L6).
+    pub event_tx: mpsc::Sender<InvalidationEvent>,
 }
 
 /// Invalidation event produced when a commit overlaps with a subscription.
@@ -123,6 +127,8 @@ impl SubscriptionRegistry {
     /// Called after successful commit (or readonly commit with subscription).
     ///
     /// `mode` must not be `None` (caller should not register None subscriptions).
+    /// `event_tx` is the sender half of an mpsc channel. L6 keeps the receiver
+    /// and wraps it in a SubscriptionHandle for the client.
     ///
     /// Returns the SubscriptionId assigned to this subscription.
     pub fn register(
@@ -132,6 +138,7 @@ impl SubscriptionRegistry {
         tx_id: TxId,
         read_ts: Ts,
         read_set: ReadSet,
+        event_tx: mpsc::Sender<InvalidationEvent>,
     ) -> SubscriptionId;
 
     /// Remove a subscription explicitly.
@@ -206,11 +213,11 @@ check_invalidation(commit_ts, index_writes, catalog_mutations, allocate_tx):
                         .insert(sub_interval.query_id)
 
     // Phase 1b: Check catalog subscriptions
-    // (Catalog reads in subscriptions conflict with catalog mutations
-    //  in the same way as OCC validation)
+    // Uses occ::catalog_conflicts() — the same logic as OCC validation (T5).
+    // This is a shared public function to avoid duplicating conflict rules.
     if !catalog_mutations.is_empty():
         for each (sub_id, meta) in self.subscriptions:
-            if catalog_conflicts(meta.read_set.catalog_reads, catalog_mutations):
+            if occ::catalog_conflicts(&meta.read_set.catalog_reads, catalog_mutations):
                 // Catalog conflicts affect all queries (query_id = 0)
                 affected.entry(sub_id).or_default().insert(0)
 
@@ -250,6 +257,23 @@ check_invalidation(commit_ts, index_writes, catalog_mutations, allocate_tx):
 
     return events
 ```
+
+## Event Delivery
+
+`check_invalidation` returns `Vec<InvalidationEvent>` but does NOT push events to clients. The caller (CommitCoordinator, T7 step 11) is responsible for delivery:
+
+```
+// T7 step 11 — fire-and-forget push
+for event in invalidation_events:
+    let meta = subscriptions.get(event.subscription_id)
+    // try_send: non-blocking. If channel full, event is dropped
+    // (client is slow — bounded channel prevents memory growth).
+    meta.event_tx.try_send(event)
+```
+
+**Why try_send (not send)?** The invalidation push must not block the commit loop. If a client's channel is full, the event is dropped. The client can detect missed events via the `commit_ts` gap and re-query. The channel capacity (configurable, default: 64) should be generous enough that drops are rare.
+
+**Lifetime:** The `event_tx` sender is stored in `SubscriptionMeta` and remains valid as long as the subscription exists. When the subscription is removed (`remove()` or `Drop` on L6's `SubscriptionHandle`), the sender is dropped, closing the channel. The receiver (`SubscriptionHandle::next_event()`) returns `None`, signaling end-of-subscription.
 
 ## Carry-Forward Correctness
 

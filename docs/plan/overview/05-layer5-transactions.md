@@ -103,6 +103,9 @@ impl ReadSet {
                         interval: ReadInterval);
     pub fn add_catalog_read(&mut self, read: CatalogRead);
     pub fn next_query_id(&mut self) -> QueryId;
+    pub fn peek_next_query_id(&self) -> QueryId;
+    /// Explicitly set the counter (used by begin_chain_continuation in L6).
+    pub fn set_next_query_id(&mut self, id: QueryId);
     pub fn merge_overlapping(&mut self);  // merge adjacent/overlapping intervals
     pub fn interval_count(&self) -> usize;
 
@@ -119,9 +122,9 @@ impl ReadSet {
 
 **Interval merging:** When intervals overlap, the merged interval takes `query_id = min(both)`. This is conservative — a wider carried interval may cause more future conflicts, but never fewer.
 
-### `write_set.rs` — Write Set (Buffered Mutations)
+### `write_set.rs` — Write Set (Buffered Mutations) + IndexResolver Trait
 
-**WHY HERE:** Buffers document mutations and catalog mutations until commit. Contains domain-specific operations (insert, replace, delete) with document bodies, plus DDL operations (create/drop collection/index).
+**WHY HERE:** Buffers document mutations and catalog mutations until commit. Also defines the `IndexResolver` trait used by the commit coordinator to look up index metadata without depending on L6's `CatalogCache` type.
 
 ```rust
 pub struct WriteSet {
@@ -170,6 +173,20 @@ pub struct IndexDelta {
     pub new_key: Option<Vec<u8>>,  // None for deletes
 }
 
+/// Minimal index metadata needed for delta computation.
+pub struct IndexInfo {
+    pub index_id: IndexId,
+    pub collection_id: CollectionId,
+    pub field_paths: Vec<FieldPath>,
+}
+
+/// Trait for looking up index metadata during commit.
+/// Defined in L5, implemented by L6 (wrapping CatalogCache).
+/// Avoids L5 depending on L6's CatalogCache type.
+pub trait IndexResolver: Send + Sync {
+    fn indexes_for_collection(&self, collection_id: CollectionId) -> Vec<IndexInfo>;
+}
+
 impl WriteSet {
     pub fn new() -> Self;
     pub fn insert(&mut self, collection_id: CollectionId, doc_id: DocId,
@@ -182,17 +199,20 @@ impl WriteSet {
     pub fn add_catalog_mutation(&mut self, mutation: CatalogMutation);
     pub fn resolve_pending_collection(&self, name: &str) -> Option<CollectionId>;
     pub fn is_collection_dropped(&self, collection_id: CollectionId) -> bool;
+    /// Returns true when BOTH mutations and catalog_mutations are empty.
     pub fn is_empty(&self) -> bool;
     pub fn mutations_for_collection(&self, collection_id: CollectionId)
         -> impl Iterator<Item = (&DocId, &MutationEntry)>;
 }
 
-/// Compute index deltas (separate function, not method — needs catalog + indexes).
-pub fn compute_index_deltas(
+/// Compute index deltas for all mutations in the write set.
+/// Async because reading old documents for Replace/Delete requires
+/// PrimaryIndex::get_at_ts (async I/O). Uses IndexResolver (not CatalogCache)
+/// to avoid L5 → L6 dependency.
+pub async fn compute_index_deltas(
     write_set: &WriteSet,
-    catalog: &CatalogCache,
-    primary_indexes: &HashMap<CollectionId, PrimaryIndex>,
-    secondary_indexes: &HashMap<IndexId, SecondaryIndex>,
+    index_resolver: &dyn IndexResolver,
+    primary_indexes: &HashMap<CollectionId, Arc<PrimaryIndex>>,
 ) -> Result<Vec<IndexDelta>>;
 ```
 
@@ -245,6 +265,14 @@ pub fn validate(
     commit_ts: Ts,
 ) -> Result<(), ConflictError>;
 
+/// Check if any catalog read conflicts with any catalog mutation.
+/// Returns true if a conflict exists.
+/// PUBLIC — also used by T6 (subscriptions) to check catalog invalidations.
+pub fn catalog_conflicts(
+    catalog_reads: &[CatalogRead],
+    catalog_mutations: &[CatalogMutation],
+) -> bool;
+
 pub struct ConflictError {
     pub conflicting_ts: Ts,
     pub kind: ConflictKind,
@@ -263,17 +291,6 @@ pub enum ConflictKind {
         description: String,
     },
 }
-
-/// Check if a key falls within any interval in a group.
-/// Returns the query_id of the overlapping interval, or None.
-/// Uses binary search: O(log I) per key.
-fn key_overlaps_intervals(key: &[u8], intervals: &[ReadInterval]) -> Option<QueryId>;
-
-/// Validate catalog reads against concurrent catalog mutations.
-fn validate_catalog(
-    catalog_reads: &[CatalogRead],
-    concurrent_catalog_mutations: &[CatalogMutation],
-) -> Result<(), ConflictError>;
 ```
 
 ### `subscriptions.rs` — Subscription Registry (Notify / Watch / Subscribe)
@@ -303,6 +320,10 @@ pub struct SubscriptionMeta {
     pub tx_id: TxId,
     pub read_ts: Ts,
     pub read_set: ReadSet,  // full read set (for split_before on chain continuation)
+    /// Channel sender for pushing InvalidationEvents to the client.
+    /// Created at registration time (either by CommitCoordinator step 10
+    /// for write commits, or by L6 directly for read-only commits).
+    pub event_tx: mpsc::Sender<InvalidationEvent>,
 }
 
 /// Invalidation event — one per affected subscription per commit.
@@ -330,8 +351,11 @@ impl SubscriptionRegistry {
     pub fn new() -> Self;
 
     /// Register a read set as a subscription.
+    /// `event_tx`: sender for pushing InvalidationEvents to the client.
+    /// L6 wraps the receiver in a SubscriptionHandle.
     pub fn register(&mut self, mode: SubscriptionMode, session_id: u64,
-                    tx_id: TxId, read_ts: Ts, read_set: ReadSet) -> SubscriptionId;
+                    tx_id: TxId, read_ts: Ts, read_set: ReadSet,
+                    event_tx: mpsc::Sender<InvalidationEvent>) -> SubscriptionId;
 
     /// Remove a subscription.
     pub fn remove(&mut self, id: SubscriptionId);
@@ -373,6 +397,9 @@ pub enum CommitResult {
     Success {
         commit_ts: Ts,
         subscription_id: Option<SubscriptionId>,
+        /// Event receiver for the newly registered subscription (Some when subscription_id is Some).
+        /// L6 wraps this in a SubscriptionHandle for the client.
+        event_rx: Option<mpsc::Receiver<InvalidationEvent>>,
     },
     Conflict {
         error: ConflictError,
@@ -387,9 +414,23 @@ pub struct ConflictRetry {
     pub new_ts: Ts,
 }
 
-/// NOTE: The ReplicationHook trait is defined in L6 (database/replication_hook.rs).
-/// CommitCoordinator receives it as an injected dependency from L6.
-/// L5 does NOT define the trait — it only consumes it.
+/// Trait for replication — defined in L5, implemented by L6 or L7.
+/// Injected into CommitCoordinator at construction time.
+pub trait ReplicationHook: Send + Sync {
+    async fn replicate_and_wait(&self, lsn: Lsn, record: &[u8]) -> Result<()>;
+    fn has_quorum(&self) -> bool { true }
+    fn is_holding(&self) -> bool { false }
+}
+
+/// No-op replication for embedded/single-node. Provided by L5 as a default.
+pub struct NoReplication;
+
+/// Trait for applying/rolling back catalog mutations.
+/// Defined in L5, implemented by L6 (owns CatalogCache + catalog B-trees).
+pub trait CatalogMutator: Send + Sync {
+    async fn apply(&self, mutation: &CatalogMutation, commit_ts: Ts) -> Result<()>;
+    async fn rollback(&self, mutation: &CatalogMutation) -> Result<()>;
+}
 
 pub struct CommitCoordinator {
     ts_allocator: TsAllocator,
@@ -397,7 +438,11 @@ pub struct CommitCoordinator {
     commit_log: CommitLog,
     subscriptions: Arc<RwLock<SubscriptionRegistry>>,
     storage: Arc<StorageEngine>,
+    primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
+    secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
     replication: Box<dyn ReplicationHook>,
+    catalog_mutator: Arc<dyn CatalogMutator>,
+    index_resolver: Arc<dyn IndexResolver>,
     commit_rx: mpsc::Receiver<(CommitRequest, oneshot::Sender<CommitResult>)>,
     next_tx_id: AtomicU64,
 }
@@ -407,7 +452,11 @@ impl CommitCoordinator {
         initial_ts: Ts,
         visible_ts: Ts,
         storage: Arc<StorageEngine>,
+        primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
+        secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
         replication: Box<dyn ReplicationHook>,
+        catalog_mutator: Arc<dyn CatalogMutator>,
+        index_resolver: Arc<dyn IndexResolver>,
         channel_size: usize,
     ) -> (Self, CommitHandle);
 
@@ -416,24 +465,23 @@ impl CommitCoordinator {
     /// The single-writer commit loop
     pub async fn run(&mut self);
     // For each request:
-    //   1. OCC validation (index intervals + catalog reads vs commit log)
+    //   1. OCC validation (skip for empty write_set — read-only subscription commits)
     //      On conflict + Subscribe mode: auto-start retry tx, return ConflictRetry
     //   2. Assign commit_ts
-    //   3. Write WAL record + fsync
-    //   4a. Apply catalog mutations (ordered BEFORE data mutations)
-    //   4b. Apply data mutations to page store (via L3)
-    //   5. Update commit log
+    //   3. WAL_RECORD_TX_COMMIT (0x01) + fsync
+    //   4a. Apply catalog mutations via CatalogMutator (BEFORE data)
+    //   4b. Apply data mutations via PrimaryIndex + SecondaryIndex (L3)
+    //       Compute index deltas via compute_index_deltas()
+    //   5. Append to commit log
     //   6. START CONCURRENT:
-    //      a. self.replication.replicate_and_wait(lsn, record)
+    //      a. replication.replicate_and_wait(lsn, record)
     //      b. subscriptions.check_invalidation(index_writes, catalog_mutations)
-    //         For Subscribe mode: computes ChainContinuation with carried read set
-    //   7. AWAIT replication (6a)
-    //      ON SUCCESS: continue to step 8
-    //      ON FAILURE: rollback + hold state + QuorumLost
-    //   8. Write WAL_RECORD_VISIBLE_TS(commit_ts) + fsync
+    //   7. AWAIT replication
+    //      ON FAILURE: rollback data + catalog + commit log; respond QuorumLost
+    //   8. WAL_RECORD_VISIBLE_TS (0x09) + fsync
     //   9. Advance visible_ts = commit_ts
-    //  10. Register subscription (if mode != None) + respond to client
-    //  11. FIRE-AND-FORGET: push invalidation events to subscriber sessions
+    //  10. Create mpsc channel, register subscription (event_tx → registry, event_rx → result)
+    //  11. FIRE-AND-FORGET: push step-6b events via try_send on each sub's event_tx
 }
 
 /// Handle for submitting commit requests from any task

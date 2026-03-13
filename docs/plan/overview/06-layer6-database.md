@@ -1,6 +1,6 @@
 # Layer 6: Database Instance
 
-**Layer purpose:** Compose layers 1–5 into a usable embedded database. Owns lifecycle (open/close), collection and index management, transaction API, catalog cache, and defines the replication callback trait. This is the primary public API — fully functional without networking.
+**Layer purpose:** Compose layers 1–5 into a usable embedded database. Owns lifecycle (open/close), collection and index management, transaction API, catalog cache, and **implements** the L5-defined trait interfaces (`ReplicationHook`, `CatalogMutator`, `IndexResolver`). This is the primary public API — fully functional without networking.
 
 ## Design Principles
 
@@ -184,12 +184,20 @@ impl<'db> Transaction<'db> {
 
     /// Commit the transaction.
     /// - Readonly + subscription: registers read set, no OCC.
+    ///   Returns SubscriptionHandle in CommitResult.
     /// - Readonly + None: no-op (read set discarded).
     /// - Read-write: OCC validate + WAL + materialize + register subscription.
     pub async fn commit(self) -> CommitResult;
 
-    /// Explicit rollback (also happens on drop).
+    /// Explicit rollback. Discards all buffered mutations and read set.
+    /// No subscription is registered. Equivalent to drop without commit.
     pub fn rollback(self);
+
+    /// Reset transaction state: clears read + write sets, resets query_id
+    /// counter to 0. Keeps the same begin_ts (same snapshot).
+    /// Useful for retry loops within the same snapshot or discarding
+    /// partial work without closing the transaction.
+    pub fn reset(&mut self);
 
     // --- Introspection ---
 
@@ -197,6 +205,53 @@ impl<'db> Transaction<'db> {
     pub fn begin_ts(&self) -> Ts;
     pub fn is_readonly(&self) -> bool;
     pub fn subscription_mode(&self) -> SubscriptionMode;
+}
+
+/// Drop = implicit rollback. No subscription registered.
+/// The transaction is removed from the active transaction set.
+impl Drop for Transaction<'_> {
+    fn drop(&mut self) {
+        // Remove from Database's active transaction set.
+        // No commit, no subscription. Resources released.
+    }
+}
+```
+
+### SubscriptionHandle
+
+Returned from `CommitResult::Success` when subscription mode is not `None`. L6 constructs it from `event_rx` in the commit result. Provides the event stream and RAII cleanup.
+
+```rust
+pub struct SubscriptionHandle {
+    id: SubscriptionId,
+    registry: Arc<RwLock<SubscriptionRegistry>>,
+    /// Receiver for invalidation events.
+    /// For write commits: sourced from CommitResult::Success::event_rx.
+    /// For read-only commits: L6 creates the mpsc channel directly
+    ///   before calling registry.register(), keeps the receiver here.
+    events: mpsc::Receiver<InvalidationEvent>,
+}
+
+impl SubscriptionHandle {
+    /// The subscription's unique ID.
+    pub fn id(&self) -> SubscriptionId;
+
+    /// Wait for the next invalidation event.
+    /// Returns None if the subscription was removed (e.g., Notify mode
+    /// after firing, or server shutdown).
+    pub async fn next_event(&mut self) -> Option<InvalidationEvent>;
+
+    /// Explicitly end the subscription and remove it from the registry.
+    /// After this call, no further events will be received.
+    /// Also happens automatically on drop.
+    pub fn unsubscribe(self);
+}
+
+/// Drop = automatic unsubscribe. Removes from registry.
+impl Drop for SubscriptionHandle {
+    fn drop(&mut self) {
+        // registry.remove(self.id)
+    }
 }
 ```
 
@@ -213,51 +268,64 @@ impl Database {
         continuation: &ChainContinuation,
         opts: TransactionOptions,
     ) -> Transaction {
+        // Pre-load the carried read set, then set the query_id counter
+        // to first_query_id so new queries continue numbering from there.
+        let mut read_set = continuation.carried_read_set.clone();
+        // Adjust the starting query_id so new queries assigned in this
+        // transaction don't collide with already-carried query IDs.
+        // carried_read_set was produced by split_before(first_query_id),
+        // so all its intervals have query_id < first_query_id.
+        // We start the new transaction's counter at first_query_id.
+        // ReadSet::with_starting_query_id is used implicitly by ensuring
+        // next_query_id is set correctly via the internal counter.
+        read_set.set_next_query_id(continuation.first_query_id);
         Transaction {
             db: self,
             tx_id: continuation.new_tx_id,
             opts,
             begin_ts: continuation.new_ts,
-            read_set: ReadSet::with_starting_query_id(continuation.first_query_id)
-                .merge_from(&continuation.carried_read_set),
+            read_set,
             write_set: WriteSet::new(),
         }
     }
 }
 ```
 
-### `replication_hook.rs` — Replication Callback Trait
+### `replication_hook.rs` — Replication and Catalog Trait Implementations
 
-**WHY HERE:** The database knows it needs to replicate committed WAL records. It defines WHAT to replicate (the trait), but not HOW (the implementation). This is the dependency inversion point that lets replication live in a higher layer.
+**WHY HERE:** L5 defines `ReplicationHook`, `CatalogMutator`, and `IndexResolver` traits (dependency inversion — L5 defines the interface, L6 provides implementations). L6's `replication_hook.rs` houses these implementations and the `NoReplication` default.
 
 ```rust
-/// Trait for replication — defined in L6, implemented by L7 or any external code.
-/// The database calls this during commit (step 7-8) after WAL persist.
-/// The implementor decides how to transport the data (TCP, QUIC, etc.).
-pub trait ReplicationHook: Send + Sync {
-    /// Replicate a committed WAL record and wait for acknowledgment.
-    /// Called by CommitCoordinator after WAL fsync (step 7-8).
-    /// `lsn` — the log sequence number of the committed record
-    /// `record` — the raw WAL record bytes
-    async fn replicate_and_wait(&self, lsn: Lsn, record: &[u8]) -> Result<()>;
+// ReplicationHook is defined in L5 (exdb_tx::commit::ReplicationHook).
+// L5 also provides NoReplication. L6 re-exports it for convenience.
+pub use exdb_tx::commit::{ReplicationHook, NoReplication};
 
-    /// Whether the cluster currently has quorum.
-    /// Called before accepting new commit requests.
-    fn has_quorum(&self) -> bool { true }  // default: always (for NoReplication)
-
-    /// Whether the replicator is in hold state (quorum lost during commit).
-    fn is_holding(&self) -> bool { false }  // default: never (for NoReplication)
+// CatalogMutator is defined in L5 (exdb_tx::commit::CatalogMutator).
+// L6 implements it, wrapping CatalogCache + catalog B-trees.
+//
+// apply():  update catalog B-tree page → update CatalogCache in-memory
+// rollback(): reverse the mutation (remove created entry / restore dropped entry)
+pub struct CatalogMutatorImpl {
+    catalog: Arc<RwLock<CatalogCache>>,
+    storage: Arc<StorageEngine>,
 }
+impl exdb_tx::commit::CatalogMutator for CatalogMutatorImpl { ... }
 
-/// No-op implementation for embedded/single-node usage (default)
-pub struct NoReplication;
-
-impl ReplicationHook for NoReplication {
-    async fn replicate_and_wait(&self, _lsn: Lsn, _record: &[u8]) -> Result<()> {
-        Ok(())
-    }
+// IndexResolver is defined in L5 (exdb_tx::write_set::IndexResolver).
+// L6 implements it, reading from CatalogCache.
+pub struct IndexResolverImpl {
+    catalog: Arc<RwLock<CatalogCache>>,
 }
+impl exdb_tx::write_set::IndexResolver for IndexResolverImpl { ... }
 ```
+
+**Dependency inversion summary:**
+
+| Trait | Defined in | Implemented in |
+|-------|-----------|---------------|
+| `ReplicationHook` | L5 (`commit.rs`) | L7 (real replication), L5 (`NoReplication` default) |
+| `CatalogMutator` | L5 (`commit.rs`) | L6 (`CatalogMutatorImpl`) |
+| `IndexResolver` | L5 (`write_set.rs`) | L6 (`IndexResolverImpl`) |
 
 ### `catalog_cache.rs` — In-Memory Dual-Indexed Catalog
 

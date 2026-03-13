@@ -142,6 +142,15 @@ pub use commit::{
 
 6. **CommitCoordinator is `!Send`**: parking_lot guards inside StorageEngine async methods. Must run on `LocalSet` or single-threaded runtime. CommitHandle is `Send + Clone`.
 
+## L5/L6 Boundary — Transaction Lifecycle
+
+L5 provides the commit machinery (`CommitCoordinator`, `CommitHandle`, `ReadSet`, `WriteSet`). The **user-facing `Transaction` type** with `begin()`, `reset()`, `rollback()`, and `drop()` semantics (DESIGN.md 5.3) lives in **L6** (Database facade). L6 constructs a `Transaction` holding a `ReadSet`, `WriteSet`, `begin_ts`, and a `CommitHandle` reference. On commit, L6 packages these into a `CommitRequest` and submits to `CommitHandle::commit()`.
+
+- **`begin(options)`**: L6 reads `visible_ts` from `CommitHandle`, allocates a `TxId`, creates empty `ReadSet`/`WriteSet`.
+- **`reset()`**: L6 clears `ReadSet`/`WriteSet`, resets `next_query_id` to 0. Same `begin_ts`.
+- **`rollback()` / `drop(tx)`**: L6 discards `ReadSet`/`WriteSet`. No L5 interaction needed (no commit request sent).
+- **`commit()`**: L6 submits `CommitRequest` to `CommitHandle::commit()`. Returns `CommitResult`.
+
 ## L3 APIs Consumed
 
 | Function | File | Used By |

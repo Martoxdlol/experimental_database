@@ -109,31 +109,14 @@ impl ReadInterval {
     pub fn apply_delta(&mut self, old_key: Option<&[u8]>, new_key: Option<&[u8]>);
 }
 
-/// All intervals for a transaction, grouped by (collection, index)
+/// All intervals for a transaction, grouped by (collection, index).
+///
+/// Catalog reads (DDL observations) are recorded as regular intervals on
+/// reserved pseudo-collections (CATALOG_COLLECTIONS, CATALOG_INDEXES).
+/// No separate CatalogRead type is needed — see detailed plan T2.
 pub struct ReadSet {
     pub intervals: BTreeMap<(CollectionId, IndexId), Vec<ReadInterval>>,
-    pub catalog_reads: Vec<CatalogRead>,
     next_query_id: QueryId,
-}
-
-/// Records a catalog observation made during the transaction.
-/// Used for OCC conflict detection against concurrent DDL.
-pub enum CatalogRead {
-    /// Transaction resolved a collection name (e.g., tx.insert("users", ...)).
-    /// Conflicts with: create or drop of collection with this name.
-    CollectionByName(String),
-
-    /// Transaction listed all collections.
-    /// Conflicts with: any collection create or drop.
-    ListCollections,
-
-    /// Transaction resolved an index by name within a collection.
-    /// Conflicts with: create or drop of index with this name in this collection.
-    IndexByName(CollectionId, String),
-
-    /// Transaction listed indexes for a collection.
-    /// Conflicts with: any index create or drop in this collection.
-    ListIndexes(CollectionId),
 }
 
 impl ReadSet {
@@ -142,7 +125,6 @@ impl ReadSet {
     pub fn with_starting_query_id(first_query_id: QueryId) -> Self;
     pub fn add_interval(&mut self, collection_id: CollectionId, index_id: IndexId,
                         interval: ReadInterval);
-    pub fn add_catalog_read(&mut self, read: CatalogRead);
     pub fn next_query_id(&mut self) -> QueryId;
     pub fn peek_next_query_id(&self) -> QueryId;
     /// Explicitly set the counter (used by begin_chain_continuation in L6).
@@ -170,7 +152,7 @@ impl ReadSet {
 }
 ```
 
-**Carry-forward:** When a subscription chain fires at `query_id = Q_min`, `split_before(Q_min)` extracts unaffected intervals. These are provably unchanged (no concurrent commit touched them), so carrying them to the new transaction is equivalent to re-executing the same queries. Catalog reads are also carried when `Q_min > 0`; when `Q_min = 0` (catalog conflict), the entire read set is empty — the new transaction must re-read catalog state from scratch.
+**Carry-forward:** When a subscription chain fires at `query_id = Q_min`, `split_before(Q_min)` extracts unaffected intervals (including catalog intervals on reserved pseudo-collections). These are provably unchanged (no concurrent commit touched them), so carrying them to the new transaction is equivalent to re-executing the same queries. Catalog intervals are treated identically to data intervals — they are carried if their `query_id < Q_min`.
 
 **Interval merging:** When intervals overlap, the merged interval takes `query_id = min(both)`. This is conservative — a wider carried interval may cause more future conflicts, but never fewer.
 
@@ -275,11 +257,12 @@ pub async fn compute_index_deltas(
 **WHY HERE:** In-memory structure tracking recent commits for OCC validation and subscription invalidation. Core transaction infrastructure.
 
 ```rust
-/// Entry in the commit log tracking what a commit wrote
+/// Entry in the commit log tracking what a commit wrote.
+/// Catalog DDL writes appear as index_writes on reserved pseudo-collections
+/// (CATALOG_COLLECTIONS, CATALOG_INDEXES) — no separate field needed.
 pub struct CommitLogEntry {
     pub commit_ts: Ts,
     pub index_writes: BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>>,
-    pub catalog_mutations: Vec<CatalogMutation>,  // DDL ops in this commit (if any)
 }
 
 pub struct IndexKeyWrite {
@@ -306,30 +289,21 @@ impl CommitLog {
 
 ### `occ.rs` — OCC Validation (Conflict Detection)
 
-**WHY HERE:** Validates a transaction's read set (including catalog reads) against concurrent commits. Core consistency logic.
+**WHY HERE:** Validates a transaction's read set against concurrent commits. Core consistency logic. Catalog conflicts are handled uniformly — catalog reads/writes appear as intervals on reserved pseudo-collections.
 
 ```rust
 /// Validate read set against commit log.
-/// Checks both index interval overlaps and catalog read/write conflicts.
-/// Returns Ok(()) if no conflicts, Err(ConflictError) if conflicts found.
-///
-/// Interval overlap is checked via `ReadInterval::contains_key` — this respects
-/// the effective interval (original bounds + any LimitBoundary tightening) so that
-/// writes beyond the LIMIT cutoff do not cause spurious conflicts.
+/// Checks all interval overlaps (data AND catalog, uniformly) using
+/// ReadInterval::contains_key — respects the effective interval
+/// (original bounds + any LimitBoundary tightening) so that writes
+/// beyond the LIMIT cutoff do not cause spurious conflicts.
+/// No separate catalog_conflicts() function needed.
 pub fn validate(
     read_set: &ReadSet,
     commit_log: &CommitLog,
     begin_ts: Ts,
     commit_ts: Ts,
 ) -> Result<(), ConflictError>;
-
-/// Check if any catalog read conflicts with any catalog mutation.
-/// Returns true if a conflict exists.
-/// PUBLIC — also used by T6 (subscriptions) to check catalog invalidations.
-pub fn catalog_conflicts(
-    catalog_reads: &[CatalogRead],
-    catalog_mutations: &[CatalogMutation],
-) -> bool;
 
 pub struct ConflictError {
     pub conflicting_ts: Ts,
@@ -339,14 +313,12 @@ pub struct ConflictError {
 }
 
 pub enum ConflictKind {
-    /// Data interval overlap on an index
+    /// Interval overlap on an index (data or catalog).
+    /// For catalog conflicts, collection_id will be CATALOG_COLLECTIONS
+    /// or CATALOG_INDEXES — no separate variant needed.
     IndexInterval {
         collection_id: CollectionId,
         index_id: IndexId,
-    },
-    /// Catalog conflict (concurrent DDL vs this transaction's catalog reads)
-    Catalog {
-        description: String,
     },
 }
 ```
@@ -450,13 +422,14 @@ impl SubscriptionRegistry {
 
     /// Check all subscriptions against a new commit's writes.
     /// Uses `ReadInterval::contains_key` for overlap, respecting effective intervals
-    /// (original bounds + LimitBoundary). For Subscribe mode: computes
-    /// ChainContinuation with carried read set. For Notify mode: marks for removal.
+    /// (original bounds + LimitBoundary). Catalog writes appear as index_writes on
+    /// reserved pseudo-collections — handled uniformly, no separate parameter.
+    /// For Subscribe mode: computes ChainContinuation with carried read set.
+    /// For Notify mode: marks for removal.
     pub fn check_invalidation(
         &mut self,
         commit_ts: Ts,
         index_writes: &BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>>,
-        catalog_mutations: &[CatalogMutation],
         allocate_tx: impl FnMut() -> TxId,
     ) -> Vec<InvalidationEvent>;
 
@@ -519,12 +492,10 @@ pub trait ReplicationHook: Send + Sync {
 /// No-op replication for embedded/single-node. Provided by L5 as a default.
 pub struct NoReplication;
 
-/// Trait for applying/rolling back catalog mutations.
-/// Defined in L5, implemented by L6 (owns CatalogCache + catalog B-trees).
-pub trait CatalogMutator: Send + Sync {
-    async fn apply(&self, mutation: &CatalogMutation, commit_ts: Ts) -> Result<()>;
-    async fn rollback(&self, mutation: &CatalogMutation) -> Result<()>;
-}
+// No CatalogMutator trait needed — catalog mutations are regular writes on
+// reserved pseudo-collections. L6 detects writes to reserved CollectionIds
+// in the commit result and triggers physical side effects (page allocation,
+// CatalogCache updates) as a post-commit callback.
 
 pub struct CommitCoordinator {
     ts_allocator: Arc<TsAllocator>,       // shared with CommitHandle
@@ -535,7 +506,6 @@ pub struct CommitCoordinator {
     primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
     secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
     replication: Box<dyn ReplicationHook>,
-    catalog_mutator: Arc<dyn CatalogMutator>,
     index_resolver: Arc<dyn IndexResolver>,
     commit_rx: mpsc::Receiver<(CommitRequest, oneshot::Sender<CommitResult>)>,
     next_tx_id: Arc<AtomicU64>,            // shared with CommitHandle
@@ -549,7 +519,6 @@ impl CommitCoordinator {
         primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
         secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
         replication: Box<dyn ReplicationHook>,
-        catalog_mutator: Arc<dyn CatalogMutator>,
         index_resolver: Arc<dyn IndexResolver>,
         channel_size: usize,
     ) -> (Self, CommitHandle);
@@ -561,15 +530,13 @@ impl CommitCoordinator {
     //      On conflict + Subscribe mode: auto-start retry tx, return ConflictRetry
     //   2. Assign commit_ts
     //   3. WAL_RECORD_TX_COMMIT (0x01) + fsync
-    //   4a. Apply catalog mutations via CatalogMutator (BEFORE data)
-    //   4b. Apply data mutations via PrimaryIndex + SecondaryIndex (L3)
-    //       Compute index deltas via compute_index_deltas()
+    //   4. Apply mutations via PrimaryIndex + SecondaryIndex (L3)
+    //      Compute index deltas via compute_index_deltas()
+    //      (Catalog writes are regular IndexDeltas on reserved collections)
     //   5. Append to commit log
-    //   6. START CONCURRENT:
-    //      a. replication.replicate_and_wait(lsn, record)
-    //      b. subscriptions.check_invalidation(index_writes, catalog_mutations)
-    //   7. AWAIT replication
-    //      ON FAILURE: rollback data + catalog + commit log; respond QuorumLost
+    //   6. Check subscription invalidation (in-memory, fast)
+    //   7. Await replication: replicate_and_wait(lsn, record)
+    //      ON FAILURE: rollback commit log entry; respond QuorumLost
     //   8. WAL_RECORD_VISIBLE_TS (0x09) + fsync
     //   9. Advance visible_ts = commit_ts
     //  10. If subscription requested:
@@ -640,7 +607,7 @@ Vacuum must use `min(oldest_active_read_ts, visible_ts)` as its safe threshold -
 |-----------|---------|---------|
 | `SubscriptionMode` | L6 (TransactionOptions) | Transaction subscription mode |
 | `TsAllocator` | L5 internal, L6 (Database) | Timestamp management |
-| `LimitBoundary`, `ReadInterval`, `ReadSet`, `CatalogRead` | L4 (produces ReadIntervalInfo), L5 (validates), L6 (builds ReadInterval + LimitBoundary, DDL), L7 (replication) | Conflict surface + carry-forward |
+| `LimitBoundary`, `ReadInterval`, `ReadSet` | L4 (produces ReadIntervalInfo), L5 (validates), L6 (builds ReadInterval + LimitBoundary, DDL as intervals on pseudo-collections), L7 (replication) | Conflict surface + carry-forward |
 | `WriteSet`, `MutationEntry`, `CatalogMutation` | L4 (read-your-writes), L5 (commit), L6 (DDL) | Buffered mutations (data + catalog) |
 | `CommitHandle::commit` | L6 (Database) | Submit commit request |
 | `CommitResult`, `ConflictRetry` | L6 (transaction API), L8 (session response) | Success/conflict/retry reporting |

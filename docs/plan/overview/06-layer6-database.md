@@ -1,6 +1,6 @@
 # Layer 6: Database Instance
 
-**Layer purpose:** Compose layers 1–5 into a usable embedded database. Owns lifecycle (open/close), collection and index management, transaction API, catalog cache, and **implements** the L5-defined trait interfaces (`ReplicationHook`, `CatalogMutator`, `IndexResolver`). This is the primary public API — fully functional without networking.
+**Layer purpose:** Compose layers 1–5 into a usable embedded database. Owns lifecycle (open/close), collection and index management, transaction API, catalog cache, and **implements** the L5-defined trait interfaces (`ReplicationHook`, `IndexResolver`). Handles physical side effects of catalog DDL (B-tree allocation, CatalogCache updates) as a post-commit callback. This is the primary public API — fully functional without networking.
 
 ## Design Principles
 
@@ -226,7 +226,7 @@ L6 is responsible for assembling `ReadInterval` entries and recording them in th
 
 **`get(collection, doc_id)` execution:**
 
-1. Resolve collection name → `CollectionId` + record `CatalogRead::CollectionByName` in read set.
+1. Resolve collection name → `CollectionId` + record a point interval on `(CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX)` covering the encoded name key. This is the unified catalog read tracking — L6 encodes the catalog lookup as a regular interval on the reserved pseudo-collection.
 2. Check `write_set` for a pending mutation on this `doc_id`. If found, return it directly (read-your-own-writes). **Do NOT advance `query_id` or record a read interval** — the write set mutation subsumes any read on this doc for OCC purposes, and concurrent writes to this doc are covered by the doc's index deltas at commit.
    > Note: this means `get()` on a self-written doc does NOT contribute a subscription interval for that doc. If the subscription should fire on future writes to this doc, an explicit `query()` that reaches the index (not the write-set shortcut) is needed.
 3. Assign `query_id = read_set.next_query_id()`.
@@ -242,8 +242,8 @@ L6 is responsible for assembling `ReadInterval` entries and recording them in th
 
 **`query(collection, index, range, filter, order, limit)` execution:**
 
-1. Resolve collection name → `CollectionId` + record `CatalogRead::CollectionByName`.
-2. Resolve index name → `IndexMeta` + record `CatalogRead::IndexByName`.
+1. Resolve collection name → `CollectionId` + record a point interval on `(CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX)` covering the encoded name key.
+2. Resolve index name → `IndexMeta` + record a point interval on `(CATALOG_INDEXES, CATALOG_INDEXES_NAME_IDX)` covering the encoded `(collection_id, name)` key.
 3. Validate and encode range → `AccessMethod::IndexScan` or `AccessMethod::TableScan` via L4 `resolve_access` + `encode_range`.
 4. Assign `query_id = read_set.next_query_id()`.
 5. Call `execute_scan(method, ...)` → `(stream, read_interval_info)`.
@@ -346,25 +346,20 @@ impl Database {
 }
 ```
 
-### `replication_hook.rs` — Replication and Catalog Trait Implementations
+### `replication_hook.rs` — Replication and Index Resolver Trait Implementations
 
-**WHY HERE:** L5 defines `ReplicationHook`, `CatalogMutator`, and `IndexResolver` traits (dependency inversion — L5 defines the interface, L6 provides implementations). L6's `replication_hook.rs` houses these implementations and the `NoReplication` default.
+**WHY HERE:** L5 defines `ReplicationHook` and `IndexResolver` traits (dependency inversion — L5 defines the interface, L6 provides implementations). L6's `replication_hook.rs` houses these implementations and the `NoReplication` default.
 
 ```rust
 // ReplicationHook is defined in L5 (exdb_tx::commit::ReplicationHook).
 // L5 also provides NoReplication. L6 re-exports it for convenience.
 pub use exdb_tx::commit::{ReplicationHook, NoReplication};
 
-// CatalogMutator is defined in L5 (exdb_tx::commit::CatalogMutator).
-// L6 implements it, wrapping CatalogCache + catalog B-trees.
-//
-// apply():  update catalog B-tree page → update CatalogCache in-memory
-// rollback(): reverse the mutation (remove created entry / restore dropped entry)
-pub struct CatalogMutatorImpl {
-    catalog: Arc<RwLock<CatalogCache>>,
-    storage: Arc<StorageEngine>,
-}
-impl exdb_tx::commit::CatalogMutator for CatalogMutatorImpl { ... }
+// No CatalogMutator trait needed — catalog mutations are regular writes on
+// reserved pseudo-collections (CATALOG_COLLECTIONS, CATALOG_INDEXES).
+// L6 detects writes to reserved CollectionIds in the commit result and
+// triggers physical side effects (page allocation for new B-trees,
+// CatalogCache updates) as a post-commit callback.
 
 // IndexResolver is defined in L5 (exdb_tx::write_set::IndexResolver).
 // L6 implements it, reading from CatalogCache.
@@ -379,7 +374,6 @@ impl exdb_tx::write_set::IndexResolver for IndexResolverImpl { ... }
 | Trait | Defined in | Implemented in |
 |-------|-----------|---------------|
 | `ReplicationHook` | L5 (`commit.rs`) | L7 (real replication), L5 (`NoReplication` default) |
-| `CatalogMutator` | L5 (`commit.rs`) | L6 (`CatalogMutatorImpl`) |
 | `IndexResolver` | L5 (`write_set.rs`) | L6 (`IndexResolverImpl`) |
 
 ### `catalog_cache.rs` — In-Memory Dual-Indexed Catalog
@@ -628,11 +622,14 @@ Within the transaction, collection name resolution checks pending `CatalogMutati
 
 ### Catalog Read Tracking
 
-When a transaction resolves a collection or index name (e.g., `tx.insert("users", ...)` looks up "users" → CollectionId), a `CatalogRead::CollectionByName("users")` is recorded in the read set. At OCC validation, this is checked against concurrent commits' `CatalogMutation` entries:
+Catalog reads are recorded as **regular intervals on reserved pseudo-collections** (see DESIGN.md 5.6.7). L6 provides a thin wrapper that encodes catalog lookups into intervals:
 
-- `CatalogRead::CollectionByName("X")` conflicts with `CreateCollection{name: "X"}` or `DropCollection{name: "X"}` in any concurrent commit.
-- `CatalogRead::ListCollections` conflicts with **any** collection create or drop in any concurrent commit.
-- Index reads follow the same pattern scoped to a collection.
+- **Resolve collection by name** (e.g., `tx.insert("users", ...)`): records a point interval on `(CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX)` covering the encoded name key `encode_key_prefix(&[Scalar::String("users")])`.
+- **List all collections**: records a full-range interval on `(CATALOG_COLLECTIONS, PRIMARY)`.
+- **Resolve index by name**: records a point interval on `(CATALOG_INDEXES, CATALOG_INDEXES_NAME_IDX)` covering the encoded `(collection_id, name)` key.
+- **List indexes for a collection**: records a prefix-range interval on `(CATALOG_INDEXES, CATALOG_INDEXES_NAME_IDX)` covering the `collection_id` prefix.
+
+At OCC validation and subscription invalidation, these intervals are checked against concurrent catalog writes (which appear as `IndexKeyWrite` entries on the same reserved pseudo-collections) using the same `contains_key` overlap check as data intervals. No separate `CatalogRead` enum or `catalog_conflicts()` function is needed.
 
 This is conservative but correct, and DDL is rare enough that false conflicts are negligible.
 

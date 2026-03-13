@@ -400,7 +400,6 @@ CommitResult::Success { commit_ts, subscription_id, event_rx }
 fn build_commit_log_entry(
     commit_ts: Ts,
     index_deltas: &[IndexDelta],
-    catalog_mutations: Vec<CatalogMutation>,
 ) -> CommitLogEntry {
     let mut index_writes: BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>> = BTreeMap::new();
     for delta in index_deltas {
@@ -413,7 +412,7 @@ fn build_commit_log_entry(
                 new_key: delta.new_key.clone(),
             });
     }
-    CommitLogEntry { commit_ts, index_writes, catalog_mutations }
+    CommitLogEntry { commit_ts, index_writes }
 }
 ```
 

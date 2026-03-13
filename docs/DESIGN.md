@@ -1876,9 +1876,11 @@ For each `(collection_id, doc_id)` in the write set:
 
 ```
 IndexDelta {
-    index_id: IndexId
-    old_key:  Option<EncodedKey>    // None for inserts (no previous entry)
-    new_key:  Option<EncodedKey>    // None for deletes (entry removed)
+    collection_id: CollectionId
+    index_id:      IndexId
+    doc_id:        DocId
+    old_key:       Option<EncodedKey>    // None for inserts (no previous entry)
+    new_key:       Option<EncodedKey>    // None for deletes (entry removed)
 }
 ```
 
@@ -2260,7 +2262,7 @@ The writer is implemented as a dedicated tokio task that receives commit request
 Read-only queries run on any tokio task, concurrently with each other and with the writer:
 
 - **B-tree traversal**: readers acquire `SharedPageGuard`s (section 2.7) as they descend the B-tree. Multiple readers can hold shared guards on the same page simultaneously.
-- **MVCC isolation**: readers at `read_ts` skip versions with `ts > read_ts`, so they are unaffected by the writer inserting new versions concurrently. A reader never sees a partially-applied transaction — the writer updates the commit log (step 5) and advances `latest_committed_ts` (step 9 in 5.11) only after all page mutations are complete.
+- **MVCC isolation**: readers at `read_ts` skip versions with `ts > read_ts`, so they are unaffected by the writer inserting new versions concurrently. A reader never sees a partially-applied transaction — the writer updates the commit log (step 5) and advances `visible_ts` (step 9 in 5.11) only after all page mutations are complete.
 - **No read locks**: readers do not acquire any logical locks. OCC detects conflicts at commit time, not during reads.
 - **Cache misses**: when a reader hits a cold page, it reads from disk via positional I/O (section 2.7.1) without blocking other readers or the writer.
 
@@ -2321,25 +2323,33 @@ The commit protocol enforces a strict ordering of effects. When a client receive
 **Commit sequence** (on the primary):
 
 ```
-1. OCC validation                           [VALIDATE]
-2. Assign commit_ts                         [TIMESTAMP]
-3. Write WAL record + fsync                 [PERSIST]
-4. Apply mutations to page store            [MATERIALIZE]
-5. Update commit log                        [LOG]
-6. Invalidate local subscriptions/caches    [INVALIDATE]
-7. Replicate to all replicas (see 6.2)      [REPLICATE]
-   Each replica: apply WAL → update page
-   store → invalidate local subscriptions
-8. Wait for replica acknowledgements        [SYNC]
-9. Advance latest_committed_ts              [VISIBLE]
-10. Notify the client                       [RESPOND]
+1.  OCC validation                           [VALIDATE]
+2.  Assign commit_ts                         [TIMESTAMP]
+3.  Write WAL TxCommit record + fsync        [PERSIST]
+4.  Apply mutations to page store +          [MATERIALIZE]
+    compute index deltas
+5.  Append to commit log                     [LOG]
+6.  Check subscription invalidation          [INVALIDATE]
+7.  Replicate to all replicas (see 6.2)      [REPLICATE]
+    Each replica: apply WAL → update page
+    store → invalidate local subscriptions
+8.  Write WAL visible_ts record              [FENCE]
+9.  Advance visible_ts                       [VISIBLE]
+10. Register subscription (if requested)     [SUBSCRIBE]
+    a. extend_for_deltas on read set
+    b. Register in subscription registry
+11. Push invalidation events + respond       [RESPOND]
 ```
 
-**Critical ordering**: `latest_committed_ts` (step 9) is only advanced after all replicas confirm (step 8). This ensures that no new transaction on any node can begin at a timestamp for which some replica hasn't yet applied the data.
+**Terminology**: `visible_ts` is the latest timestamp safe for new readers. It is separate from the timestamp allocator's latest value (`ts_allocator.latest()`), which tracks the highest *allocated* timestamp and may be ahead of what has been replicated. New transactions acquire `begin_ts = visible_ts`, not `ts_allocator.latest()`.
+
+**Critical ordering**: `visible_ts` (step 9) is only advanced after all replicas confirm (step 7) and the WAL visible_ts record is persisted (step 8). This ensures that no new transaction on any node can begin at a timestamp for which some replica hasn't yet applied the data.
 
 **Monotonic visibility**: a query at timestamp T on any node is guaranteed to see all commits with `commit_ts ≤ T`. It is impossible for a newer timestamp to return older data than a query at an earlier timestamp.
 
 **Write-to-read latency**: the window between steps 3 and 9 is a brief period where the data is persisted but not yet visible to new transactions. This is intentional — visibility is deferred until all nodes are consistent. During this window, the committing client has not yet been notified, so no external observer can expect to see the data.
+
+**Subscription registration** (step 10): before registering the read set as a subscription, `extend_for_deltas` is called with the transaction's own index deltas to clear any stale `limit_boundary` values from boundary documents that the transaction itself moved. This is necessary because OCC (step 1) only checks concurrent commits in `(begin_ts, commit_ts)` — the transaction's own writes are never in that range, so their effect on boundary docs must be handled separately.
 
 ---
 
@@ -2364,7 +2374,7 @@ The primary continuously streams committed WAL records to all replicas:
    a. Applies the WAL record to its local page store and indexes.
    b. Invalidates local subscriptions/caches affected by the commit.
    c. Sends acknowledgement to primary.
-4. Primary waits for acknowledgements (see 6.5), then advances `latest_committed_ts`.
+4. Primary waits for acknowledgements (see 6.5), then advances `visible_ts`.
 
 ### 6.3 Transaction Execution on Replicas
 

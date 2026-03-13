@@ -8,4 +8,3 @@ exdb-core = { workspace = true }
 exdb-storage = { workspace = true }
 exdb-docstore = { workspace = true }
 exdb-query = { workspace = true }
-exdb-tx = { workspace = true }

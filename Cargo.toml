@@ -5,7 +5,6 @@ members = [
     "crates/storage",
     "crates/docstore",
     "crates/query",
-    "crates/tx",
     "crates/database",
     "crates/replication",
     "crates/wire",
@@ -24,7 +23,6 @@ exdb-core         = { path = "crates/core" }
 exdb-storage      = { path = "crates/storage" }
 exdb-docstore     = { path = "crates/docstore" }
 exdb-query        = { path = "crates/query" }
-exdb-tx           = { path = "crates/tx" }
 exdb              = { path = "crates/database" }
 exdb-replication  = { path = "crates/replication" }
 exdb-wire         = { path = "crates/wire" }

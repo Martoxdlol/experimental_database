@@ -1,10 +1,10 @@
 # Layer 7: Replication (Optional)
 
-**Layer purpose:** Implements the `ReplicationHook` trait defined by L6 (Database). Handles cluster membership, WAL streaming, snapshot transfer, transaction promotion, and recovery tier selection. This layer provides the replication TRANSPORT and CLUSTER COORDINATION — the database (L6) provides the replication PROTOCOL (when to call, what data).
+**Layer purpose:** Implements the `ReplicationHook` trait defined by L5 (Transactions). Handles cluster membership, WAL streaming, snapshot transfer, transaction promotion, and recovery tier selection. This layer provides the replication TRANSPORT and CLUSTER COORDINATION — L5's replication task calls `replicate_and_wait` for each committed WAL record; L7 handles the network transport and quorum acknowledgement.
 
 ## Design Principles
 
-1. **Implements, never imported by Database**: L7 implements the `ReplicationHook` trait from L6. The database never imports L7. Dependency flows: L7 → L6 (and L7 → L2 for WAL access).
+1. **Implements, never imported by Database**: L7 implements the `ReplicationHook` trait from L5 (injected into L5's `ReplicationRunner` at construction time by L6). The database never imports L7. Dependency flows: L7 → L5 (trait), L7 → L2 (WAL access).
 2. **Single connection per node pair**: Every pair of nodes shares exactly one bidirectional TCP connection. The node with the lower `NodeId` initiates. All traffic — heartbeats, WAL streaming, acks, snapshots — flows on this single connection.
 3. **Optional**: A single-node embedded database uses `NoReplication` (from L6) and never touches this layer.
 4. **Quorum-aware**: All replication decisions (commit acknowledgement, read serving, state transitions) are gated on quorum — a majority of the cluster being reachable.
@@ -226,7 +226,7 @@ The `wal_retention_size` constraint (default 1GB) provides a secondary bound: ev
 
 ### `primary_server.rs` — Primary Replication Server
 
-**WHY HERE:** Implements the primary-side replication by wrapping `PeerMesh` and implementing the `ReplicationHook` trait. The mesh handles all transport; this module adds the commit protocol and hold-state logic.
+**WHY HERE:** Implements the primary-side replication by wrapping `PeerMesh` and implementing the `ReplicationHook` trait from L5. Called by L5's `ReplicationRunner` (not the writer task) — the writer is never blocked on replication. The mesh handles all transport; this module adds the commit protocol and hold-state logic.
 
 ```rust
 use std::sync::atomic::AtomicBool;
@@ -467,6 +467,8 @@ let cluster = Arc::new(ClusterMembership::new(cluster_config));
 let mesh = Arc::new(PeerMesh::new(cluster.clone(), NodeRole::Primary));
 mesh.start().await?;
 let replicator = PrimaryReplicator::new(mesh.clone());
+// replicator is injected into L5's ReplicationRunner (via L6's Database::open)
+// The ReplicationRunner calls replicate_and_wait() — the writer is never blocked.
 let db = Database::open("./data", config, Some(Box::new(replicator))).await?;
 
 // === Replica node (same mesh infrastructure, different role) ===
@@ -489,7 +491,7 @@ let db = Database::open("./data", config, None).await?;  // NoReplication (defau
 | `ClusterMembership::cluster_size` | L7 internals | Quorum calculation |
 | `PeerMesh::new` / `start` | Operator/L8 (startup) | Initialize and start the peer connection mesh |
 | `PeerMesh::replicate_and_wait` | `PrimaryReplicator` | Send WAL record and wait for quorum acks |
-| `PrimaryReplicator` (implements `ReplicationHook`) | L6 (Database, via injection) | Quorum-based replication during commit |
+| `PrimaryReplicator` (implements `ReplicationHook`) | L5 (ReplicationRunner, injected by L6) | Quorum-based replication, called by replication task (not writer) |
 | `PrimaryReplicator::is_holding` | L8 (health checks, load balancers) | Whether primary is in hold state |
 | `ReplicaClient::is_fenced` | L8 (health checks, request routing) | Whether replica is accepting reads |
 | `PromotionClient::promote` | L8 (session on replica) | Write forwarding via mesh |

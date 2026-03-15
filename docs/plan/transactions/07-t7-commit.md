@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Single-writer commit coordinator implementing the 11-step commit protocol from DESIGN.md 5.12. Serializes all writes through one tokio task, orchestrating OCC validation, WAL persistence, mutation application, commit log updates, subscription invalidation, replication, and visibility fence advancement.
+Two-task commit architecture implementing the commit protocol from DESIGN.md 5.12. The **writer task** serializes page mutations (steps 1–5) with no network dependency. The **replication task** handles visibility advancement, subscription management, and client notification (steps 6–11). This split ensures the writer is never blocked on replication latency.
 
 ## Dependencies
 
@@ -19,6 +19,21 @@ Single-writer commit coordinator implementing the 11-step commit protocol from D
 - **L3 (`key_encoding.rs`)**: `make_secondary_key_from_prefix`
 - **L3 (`array_indexing.rs`)**: `compute_index_entries`
 - **tokio**: `mpsc`, `oneshot` (commit request/response channels)
+
+## Architecture Overview
+
+```
+                    ┌─────────────────────┐
+  CommitHandle ───► │   Writer Task       │  steps 1–5
+  (mpsc)            │   (single-writer)   │  OCC → ts → WAL → mutations → commit log
+                    └────────┬────────────┘
+                             │ replication_tx (mpsc)
+                             ▼
+                    ┌─────────────────────┐
+                    │  Replication Task   │  steps 6–11
+                    │  (serial, ordered)  │  replicate → visible_ts → subs → respond
+                    └─────────────────────┘
+```
 
 ## Rust Types
 
@@ -78,7 +93,7 @@ pub struct ConflictRetry {
 
 /// Trait for replication — defined in L5, implemented by L6 or L7.
 ///
-/// Injected into CommitCoordinator at construction time.
+/// Injected into the replication task at construction time.
 /// Default implementation: `NoReplication` (for embedded/single-node).
 #[async_trait::async_trait]
 pub trait ReplicationHook: Send + Sync {
@@ -113,6 +128,19 @@ pub enum CommitError {
     Io(#[from] std::io::Error),
 }
 
+/// Entry enqueued from writer task to replication task after steps 1–5 complete.
+struct ReplicationEntry {
+    commit_ts: Ts,
+    lsn: Lsn,
+    wal_payload: Vec<u8>,
+    read_set: ReadSet,
+    index_deltas: Vec<IndexDelta>,
+    subscription: SubscriptionMode,
+    session_id: u64,
+    tx_id: TxId,
+    response_tx: oneshot::Sender<CommitResult>,
+}
+
 /// The single-writer commit coordinator.
 ///
 /// **`!Send`**: Contains parking_lot guards from StorageEngine async
@@ -121,14 +149,26 @@ pub enum CommitError {
 pub struct CommitCoordinator {
     ts_allocator: Arc<TsAllocator>,
     visible_ts: Arc<AtomicU64>,
-    commit_log: CommitLog,
-    subscriptions: SubscriptionRegistry,
+    commit_log: Arc<RwLock<CommitLog>>,
     storage: Arc<StorageEngine>,
     primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
     secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
-    replication: Box<dyn ReplicationHook>,
     index_resolver: Arc<dyn IndexResolver>,
     commit_rx: mpsc::Receiver<(CommitRequest, oneshot::Sender<CommitResult>)>,
+    replication_tx: mpsc::Sender<ReplicationEntry>,
+    next_tx_id: Arc<AtomicU64>,
+}
+
+/// The replication task — processes committed entries in order.
+///
+/// `Send` — runs on any tokio task. No page guards held.
+pub struct ReplicationRunner {
+    visible_ts: Arc<AtomicU64>,
+    commit_log: Arc<RwLock<CommitLog>>,
+    subscriptions: Arc<RwLock<SubscriptionRegistry>>,
+    storage: Arc<StorageEngine>,
+    replication: Box<dyn ReplicationHook>,
+    replication_rx: mpsc::Receiver<ReplicationEntry>,
     next_tx_id: Arc<AtomicU64>,
 }
 
@@ -151,14 +191,17 @@ pub struct CommitHandle {
 
 ```rust
 impl CommitCoordinator {
-    /// Create a new commit coordinator and its handle.
+    /// Create a new commit coordinator, replication runner, and handle.
     ///
     /// `initial_ts`: highest committed timestamp from WAL recovery.
     /// `visible_ts`: last WAL_RECORD_VISIBLE_TS from recovery.
     /// `channel_size`: bounded capacity for the commit request channel.
+    /// `replication_queue_size`: bounded capacity for the writer→replication queue.
     ///
-    /// Returns (coordinator, handle). Coordinator must be `.run()` on a
-    /// LocalSet. Handle is distributed to application code.
+    /// Returns (coordinator, replication_runner, handle).
+    /// - Coordinator must be `.run()` on a LocalSet (owns page guards).
+    /// - ReplicationRunner must be `.run()` on any tokio task.
+    /// - Handle is distributed to application code.
     pub fn new(
         initial_ts: Ts,
         visible_ts: Ts,
@@ -168,7 +211,8 @@ impl CommitCoordinator {
         replication: Box<dyn ReplicationHook>,
         index_resolver: Arc<dyn IndexResolver>,
         channel_size: usize,
-    ) -> (Self, CommitHandle);
+        replication_queue_size: usize,
+    ) -> (Self, ReplicationRunner, CommitHandle);
 }
 ```
 
@@ -177,6 +221,9 @@ impl CommitCoordinator {
 ```rust
 impl CommitHandle {
     /// Submit a commit request and await the result.
+    ///
+    /// The response arrives after the replication task has confirmed
+    /// visibility — not immediately after the writer processes the commit.
     pub async fn commit(&self, request: CommitRequest) -> CommitResult {
         let (response_tx, response_rx) = oneshot::channel();
         // If send fails, the coordinator has been dropped
@@ -198,21 +245,32 @@ impl CommitHandle {
 }
 ```
 
-### The 11-Step Commit Loop
+### Writer Task (Steps 1–5)
 
 ```rust
 impl CommitCoordinator {
     /// The single-writer commit loop. Processes one commit at a time.
     ///
+    /// After steps 1–5, enqueues to the replication task and immediately
+    /// loops back for the next commit. Never blocked on network I/O.
+    ///
     /// Runs until the channel is closed (all handles dropped).
     pub async fn run(&mut self) {
         while let Some((request, response_tx)) = self.commit_rx.recv().await {
-            let result = self.process_commit(request).await;
-            let _ = response_tx.send(result);
+            match self.process_commit(request, response_tx).await {
+                Ok(()) => {} // enqueued to replication task
+                Err(result) => {} // OCC conflict or error, already responded
+            }
         }
     }
 
-    async fn process_commit(&mut self, req: CommitRequest) -> CommitResult {
+    /// Returns Ok(()) if enqueued to replication, Err if responded directly
+    /// (OCC conflict, read-only, or I/O error).
+    async fn process_commit(
+        &mut self,
+        req: CommitRequest,
+        response_tx: oneshot::Sender<CommitResult>,
+    ) -> Result<(), ()> {
         // see steps below
     }
 }
@@ -226,9 +284,10 @@ impl CommitCoordinator {
 // Read-only with subscription: still validate to ensure the subscription
 // is based on a consistent read.
 if !req.write_set.is_empty() || req.subscription != SubscriptionMode::None {
+    let commit_log = self.commit_log.read();
     // commit_ts_candidate = next timestamp that will be assigned
     let commit_ts_candidate = self.ts_allocator.latest() + 1;
-    if let Err(conflict) = validate(&req.read_set, &self.commit_log, req.begin_ts, commit_ts_candidate) {
+    if let Err(conflict) = validate(&req.read_set, &commit_log, req.begin_ts, commit_ts_candidate) {
         // On conflict + Subscribe mode: auto-start retry tx
         let retry = if req.subscription == SubscriptionMode::Subscribe {
             Some(ConflictRetry {
@@ -238,7 +297,8 @@ if !req.write_set.is_empty() || req.subscription != SubscriptionMode::None {
         } else {
             None
         };
-        return CommitResult::Conflict { error: conflict, retry };
+        let _ = response_tx.send(CommitResult::Conflict { error: conflict, retry });
+        return Err(());
     }
 }
 ```
@@ -312,66 +372,125 @@ for delta in &index_deltas {
 }
 ```
 
-#### Step 5: Append to Commit Log
+#### Step 5: Append to Commit Log + Enqueue to Replication
 
 ```rust
 let log_entry = build_commit_log_entry(commit_ts, &index_deltas);
-self.commit_log.append(log_entry);
-```
+self.commit_log.write().append(log_entry);
 
-#### Step 6: Subscription Invalidation Check
-
-```rust
-// Run invalidation check (fast, in-memory)
-let invalidation_events = self.subscriptions.check_invalidation(
+// Enqueue to replication task — writer is done with this commit.
+// The replication task will handle visibility, subscriptions, and client response.
+let entry = ReplicationEntry {
     commit_ts,
-    &self.commit_log.entries_in_range(commit_ts - 1, commit_ts + 1)[0].index_writes,
-    || self.next_tx_id.fetch_add(1, Ordering::AcqRel),
-);
+    lsn,
+    wal_payload,
+    read_set: req.read_set,
+    index_deltas,
+    subscription: req.subscription,
+    session_id: req.session_id,
+    tx_id: req.tx_id,
+    response_tx,
+};
+
+if self.replication_tx.send(entry).await.is_err() {
+    // Replication task has been dropped — should not happen in normal operation
+    tracing::error!("replication task dropped, cannot complete commit {commit_ts}");
+}
+// Writer immediately loops back for next commit
 ```
 
-**Note:** Since CommitCoordinator is `!Send`, steps 6 and 7 run sequentially (not via `tokio::spawn`). Invalidation check is fast (in-memory), replication may be slow.
-
-#### Step 7: Await Replication
+### Replication Task (Steps 6–11)
 
 ```rust
-if let Err(msg) = self.replication.replicate_and_wait(lsn, &wal_payload).await {
-    // Rollback: remove commit log entry
-    self.commit_log.remove(commit_ts);
-    // Data mutations (including catalog) are in the page store but invisible
-    // (visible_ts not advanced). Rollback vacuum (L3) handles cleanup on restart.
-    tracing::error!("replication failed, rolling back commit {commit_ts}: {msg}");
-    return CommitResult::QuorumLost;
+impl ReplicationRunner {
+    /// Process the replication queue in order.
+    ///
+    /// For each entry: replicate → advance visible_ts → subscriptions → respond.
+    /// Replications are pipelined but visible_ts advances strictly in order.
+    ///
+    /// On replication failure: rollback all entries beyond visible_ts and stop.
+    pub async fn run(&mut self) {
+        while let Some(entry) = self.replication_rx.recv().await {
+            if !self.process_entry(entry).await {
+                // Replication failure — drain remaining entries with QuorumLost
+                self.drain_with_error().await;
+                break;
+            }
+        }
+    }
+
+    /// Returns true on success, false on replication failure.
+    async fn process_entry(&mut self, entry: ReplicationEntry) -> bool {
+        // see steps below
+    }
+
+    /// After replication failure, drain the queue and respond QuorumLost.
+    async fn drain_with_error(&mut self) {
+        while let Ok(entry) = self.replication_rx.try_recv() {
+            let _ = entry.response_tx.send(CommitResult::QuorumLost);
+        }
+        // Also remove commit log entries beyond visible_ts
+        let visible = self.visible_ts.load(Ordering::Acquire);
+        self.commit_log.write().remove_after(visible);
+    }
 }
 ```
 
-#### Step 8: WAL visible_ts Record
+#### Step 6: Replicate
 
 ```rust
-self.storage.append_wal(WAL_RECORD_VISIBLE_TS, &commit_ts.to_le_bytes()).await?;
+if let Err(msg) = self.replication.replicate_and_wait(entry.lsn, &entry.wal_payload).await {
+    // Replication failed — respond QuorumLost to this client
+    let _ = entry.response_tx.send(CommitResult::QuorumLost);
+    tracing::error!("replication failed at commit_ts={}: {msg}", entry.commit_ts);
+    // Remove commit log entries beyond visible_ts (this entry + any enqueued after)
+    let visible = self.visible_ts.load(Ordering::Acquire);
+    self.commit_log.write().remove_after(visible);
+    return false; // signals caller to drain remaining entries
+}
 ```
 
-#### Step 9: Advance visible_ts
+#### Step 7: WAL visible_ts Record
 
 ```rust
-self.visible_ts.store(commit_ts, Ordering::Release);
+self.storage.append_wal(WAL_RECORD_VISIBLE_TS, &entry.commit_ts.to_le_bytes()).await?;
+```
+
+#### Step 8: Advance visible_ts
+
+```rust
+self.visible_ts.store(entry.commit_ts, Ordering::Release);
+```
+
+#### Step 9: Subscription Invalidation Check
+
+```rust
+// Run invalidation check (fast, in-memory)
+// Now safe because visible_ts has advanced — these commits are confirmed visible.
+let index_writes = build_index_writes(&entry.index_deltas);
+let mut subs = self.subscriptions.write();
+let invalidation_events = subs.check_invalidation(
+    entry.commit_ts,
+    &index_writes,
+    || self.next_tx_id.fetch_add(1, Ordering::AcqRel),
+);
 ```
 
 #### Step 10: Register Subscription (if requested)
 
 ```rust
-let (subscription_id, event_rx) = if req.subscription != SubscriptionMode::None {
+let (subscription_id, event_rx) = if entry.subscription != SubscriptionMode::None {
     // 10a: Clear stale limit boundaries from tx's own writes
-    let mut read_set = req.read_set;
-    read_set.extend_for_deltas(&index_deltas);
+    let mut read_set = entry.read_set;
+    read_set.extend_for_deltas(&entry.index_deltas);
 
     // 10b: Create channel and register
     let (event_tx, event_rx) = mpsc::channel(64);
-    let sub_id = self.subscriptions.register(
-        req.subscription,
-        req.session_id,
-        req.tx_id,
-        commit_ts,
+    let sub_id = subs.register(
+        entry.subscription,
+        entry.session_id,
+        entry.tx_id,
+        entry.commit_ts,
         read_set,
         event_tx,
     );
@@ -381,17 +500,19 @@ let (subscription_id, event_rx) = if req.subscription != SubscriptionMode::None 
 };
 ```
 
-#### Step 11: Push Invalidation Events
+#### Step 11: Push Invalidation Events + Respond
 
 ```rust
 // Fire-and-forget: push events via try_send on each sub's event_tx
-self.subscriptions.push_events(invalidation_events);
-```
+subs.push_events(invalidation_events);
+drop(subs); // release subscription lock before responding
 
-#### Return Success
-
-```rust
-CommitResult::Success { commit_ts, subscription_id, event_rx }
+// Respond to client — commit is now fully visible and replicated
+let _ = entry.response_tx.send(CommitResult::Success {
+    commit_ts: entry.commit_ts,
+    subscription_id,
+    event_rx,
+});
 ```
 
 ### Helper: build_commit_log_entry
@@ -416,46 +537,75 @@ fn build_commit_log_entry(
 }
 ```
 
+### Helper: build_index_writes
+
+```rust
+/// Extract index writes from deltas for subscription invalidation check.
+/// Same structure as CommitLogEntry.index_writes but built from the
+/// ReplicationEntry's deltas directly.
+fn build_index_writes(
+    index_deltas: &[IndexDelta],
+) -> BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>> {
+    // identical to build_commit_log_entry but returns just the map
+}
+```
+
 ### Helper: serialize_wal_payload / deserialize_wal_payload
 
 Binary serialization of commit data for WAL. Format documented in Step 3 above. These are private helper functions within commit.rs.
 
 ## Design Decisions
 
-### 1. Sequential steps 6+7 (not concurrent)
+### 1. Two-task architecture (writer + replication)
 
-Since `CommitCoordinator` is `!Send` (parking_lot guards in StorageEngine), we cannot use `tokio::spawn` for concurrent execution. Steps 6 (invalidation check) and 7 (replication) run sequentially. This is acceptable because:
-- Invalidation check is fast (in-memory HashMap lookups)
-- Replication latency is the bottleneck regardless
-- The single-writer model means only one commit is in-flight at a time
+The writer task (steps 1–5) handles only local operations: OCC validation, WAL fsync, page mutations, and commit log updates. No network I/O ever blocks the writer. After step 5, the commit is enqueued to the replication task via a bounded mpsc channel.
 
-### 2. Rollback on replication failure
+The replication task (steps 6–11) processes entries in strict commit order. It handles replication, visibility advancement, subscription management, and client notification. This task can be `Send` — it holds no page guards.
 
-Initial implementation removes the commit log entry. All mutations (data and catalog, which are now unified) remain in the page store but are invisible because `visible_ts` is not advanced. On restart, rollback vacuum (L3) cleans up versions beyond `visible_ts`. Full reverse-write rollback is a future optimization.
+**Why**: Replication latency (network round-trips, quorum waiting) is orders of magnitude slower than local page mutations. Decoupling them means the writer can process N commits ahead while replication catches up. Without this split, every commit would be blocked on the slowest replica.
 
-### 3. Channel-based request submission
+### 2. Shared CommitLog via Arc<RwLock>
 
-CommitHandle sends `(CommitRequest, oneshot::Sender<CommitResult>)` via a bounded mpsc channel. The coordinator processes one request at a time. This provides natural backpressure — if the channel is full, callers block on `send`. Default channel capacity: 256.
+The commit log is shared between the writer (appends entries at step 5) and the replication task (removes entries on rollback). The writer takes a write lock briefly to append; OCC validation (step 1) takes a read lock to scan. The replication task takes a write lock only on failure (to remove entries beyond visible_ts).
 
-### 4. Shared state via Arc
+### 3. Replication failure and rollback
 
-`TsAllocator`, `visible_ts`, `next_tx_id` are shared between CommitCoordinator and CommitHandle via `Arc`. The coordinator is the only writer for `visible_ts`; handles only read it.
+On replication failure at `commit_ts = N`:
 
-### 5. Read-only subscription commits
+1. The failing entry's client receives `QuorumLost`.
+2. All commit log entries with `ts > visible_ts` are removed. This is critical because the writer may have validated subsequent commits (ts = N+1, N+2, ...) against the now-invalid entry at ts = N.
+3. All remaining entries in the replication queue receive `QuorumLost`.
+4. The replication task stops — no further entries are processed.
+5. The writer must be signaled to stop accepting new commits (the replication_tx channel being dropped serves as this signal — the writer's `replication_tx.send()` will fail).
+6. Page store cleanup: mutations for `ts > visible_ts` are physically present but invisible. Rollback vacuum (L3) cleans them up on restart.
 
-Read-only transactions with `subscription != None` still go through the commit coordinator. OCC validation runs (to ensure the subscription is based on a consistent read), but steps 3–5 (WAL, mutations, commit log) are skipped. Steps 10–11 (subscription registration + invalidation push) still execute.
+### 4. Channel-based request submission
 
-### 6. Unified catalog handling
+CommitHandle sends `(CommitRequest, oneshot::Sender<CommitResult>)` via a bounded mpsc channel. The writer processes one request at a time. The oneshot sender is forwarded to the replication task, which sends the response after visibility is confirmed. Default channel capacities: commit channel = 256, replication queue = 256.
 
-Catalog mutations are regular writes on reserved pseudo-collections (CATALOG_COLLECTIONS, CATALOG_INDEXES). L5 has no CatalogMutator trait — it treats catalog writes identically to data writes. L6 detects writes to reserved CollectionIds in the commit result and triggers physical side effects (page allocation for new B-trees, CatalogCache updates) as a post-commit callback. This eliminates ~100 lines of catalog-specific code from L5 (CatalogRead enum, catalog_conflicts function, CatalogMutator trait, special-casing in OCC and subscriptions).
+### 5. Shared state via Arc
+
+`TsAllocator`, `visible_ts`, `next_tx_id`, `CommitLog`, and `SubscriptionRegistry` are shared between CommitCoordinator, ReplicationRunner, and CommitHandle via `Arc`. The replication task is the only writer for `visible_ts`; the writer and handles only read it.
+
+### 6. Read-only subscription commits
+
+Read-only transactions with `subscription != None` still go through the commit coordinator. OCC validation runs (to ensure the subscription is based on a consistent read), but steps 3–5 (WAL, mutations, commit log) are skipped. The entry is still enqueued to the replication task for subscription registration — but with no WAL payload, replication is a no-op, so visibility is immediate.
+
+### 7. Unified catalog handling
+
+Catalog mutations are regular writes on reserved pseudo-collections (CATALOG_COLLECTIONS, CATALOG_INDEXES). L5 has no CatalogMutator trait — it treats catalog writes identically to data writes. L6 detects writes to reserved CollectionIds in the commit result and triggers physical side effects (page allocation for new B-trees, CatalogCache updates) as a post-commit callback. This eliminates ~100 lines of catalog-specific code from L5.
+
+### 8. Subscription invalidation after visible_ts
+
+Subscriptions are checked for invalidation (step 9) only after `visible_ts` advances (step 8). This ensures clients never receive invalidation events for commits that might be rolled back due to replication failure. In the old architecture, invalidation happened before replication — a failing replication would have already sent events that need to be retracted.
 
 ## Error Handling
 
 | Error | Cause | Handling |
 |-------|-------|----------|
-| `CommitResult::Conflict` | OCC validation fails | Returned to caller. Subscribe mode includes ConflictRetry. |
-| `CommitResult::QuorumLost` | Replication failure or coordinator dropped | Commit rolled back, returned to caller. |
-| `CommitError::Io` | WAL write or index mutation I/O failure | Propagated. Coordinator remains usable for subsequent commits. |
+| `CommitResult::Conflict` | OCC validation fails (step 1) | Writer responds directly to caller. Subscribe mode includes ConflictRetry. |
+| `CommitResult::QuorumLost` | Replication failure or coordinator/replication task dropped | Replication task responds to affected client + all queued clients. |
+| `CommitError::Io` | WAL write or index mutation I/O failure | Writer propagates to caller. Writer remains usable for subsequent commits. |
 
 ## Tests
 
@@ -463,42 +613,52 @@ Catalog mutations are regular writes on reserved pseudo-collections (CATALOG_COL
 
 1. **commit_read_only**: Empty write set, no subscription → success, no WAL write.
 2. **commit_single_insert**: One insert → success, commit_ts assigned, WAL written.
-3. **commit_advances_visible_ts**: After commit, `handle.visible_ts()` == commit_ts.
+3. **commit_advances_visible_ts**: After commit response received, `handle.visible_ts()` == commit_ts.
 4. **commit_sequential_timestamps**: Two commits get sequential commit_ts values.
 5. **commit_handle_clone**: Multiple handles can submit commits.
 
+### Writer–replication pipeline
+
+6. **writer_does_not_block_on_replication**: Mock slow replication (100ms). Submit two commits — both get commit_ts assigned immediately. Second commit does not wait for first replication.
+7. **visible_ts_lags_commit_ts**: With slow replication, `visible_ts` is behind `ts_allocator.latest()` until replication completes.
+8. **visible_ts_advances_in_order**: Three commits replicated — visible_ts advances 1→2→3 in strict order.
+
 ### OCC conflict
 
-6. **commit_occ_conflict**: Two transactions read overlapping ranges, first commits, second conflicts.
-7. **commit_occ_conflict_subscribe_retry**: Subscribe mode conflict includes ConflictRetry.
-8. **commit_occ_passes_disjoint**: Transactions with disjoint ranges both commit.
+9. **commit_occ_conflict**: Two transactions read overlapping ranges, first commits, second conflicts.
+10. **commit_occ_conflict_subscribe_retry**: Subscribe mode conflict includes ConflictRetry.
+11. **commit_occ_passes_disjoint**: Transactions with disjoint ranges both commit.
 
 ### Subscription registration
 
-9. **commit_with_notify**: Notify mode → subscription_id returned, event_rx present.
-10. **commit_with_watch**: Watch mode subscription persists across invalidations.
-11. **commit_with_subscribe_chain**: Subscribe mode → on invalidation, ChainContinuation delivered.
+12. **commit_with_notify**: Notify mode → subscription_id returned, event_rx present.
+13. **commit_with_watch**: Watch mode subscription persists across invalidations.
+14. **commit_with_subscribe_chain**: Subscribe mode → on invalidation, ChainContinuation delivered.
 
 ### Invalidation flow
 
-12. **invalidation_fires_on_overlap**: Commit A registers subscription. Commit B writes into interval → A receives event.
-13. **invalidation_respects_limit**: Write beyond LimitBoundary → no invalidation.
-14. **extend_for_deltas_before_registration**: Own writes clear stale limit before subscription registration.
+15. **invalidation_fires_on_overlap**: Commit A registers subscription. Commit B writes into interval → A receives event.
+16. **invalidation_respects_limit**: Write beyond LimitBoundary → no invalidation.
+17. **extend_for_deltas_before_registration**: Own writes clear stale limit before subscription registration.
+18. **invalidation_after_visible_ts**: Subscription invalidation events are only delivered after visible_ts advances (not before replication confirms).
 
 ### Catalog (unified)
 
-15. **commit_catalog_write_produces_delta**: Write to CATALOG_COLLECTIONS produces IndexDelta on reserved collection.
-16. **commit_catalog_conflict_via_interval**: Concurrent DDL write overlaps catalog read interval → conflict.
+19. **commit_catalog_write_produces_delta**: Write to CATALOG_COLLECTIONS produces IndexDelta on reserved collection.
+20. **commit_catalog_conflict_via_interval**: Concurrent DDL write overlaps catalog read interval → conflict.
 
 ### Replication
 
-17. **commit_no_replication**: NoReplication passes through.
-18. **commit_replication_failure**: Mock replication fails → QuorumLost, commit log entry removed.
+21. **commit_no_replication**: NoReplication passes through — visible_ts advances immediately.
+22. **replication_failure_responds_quorum_lost**: Mock replication fails → client receives QuorumLost.
+23. **replication_failure_drains_queue**: Two commits enqueued, first fails replication → both receive QuorumLost.
+24. **replication_failure_removes_commit_log**: After failure, commit log entries beyond visible_ts are removed.
+25. **replication_failure_stops_writer**: After replication task stops, writer's replication_tx.send() fails — writer stops accepting commits.
 
 ### WAL payload
 
-19. **wal_payload_roundtrip**: Serialize and deserialize WAL payload, verify contents match.
+26. **wal_payload_roundtrip**: Serialize and deserialize WAL payload, verify contents match.
 
 ### Read-only with subscription
 
-20. **read_only_subscription_validates**: Read-only tx with subscription → OCC runs, subscription registered, no WAL write.
+27. **read_only_subscription_validates**: Read-only tx with subscription → OCC runs, subscription registered, no WAL write.

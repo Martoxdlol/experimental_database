@@ -446,9 +446,9 @@ impl SubscriptionRegistry {
 }
 ```
 
-### `commit.rs` — Single-Writer Commit Protocol
+### `commit.rs` — Two-Task Commit Protocol
 
-**WHY HERE:** Orchestrates the full 11-step commit sequence. The serialization point for all writes.
+**WHY HERE:** Orchestrates the commit sequence split across two tasks. The writer task (steps 1–5) serializes page mutations with no network dependency. The replication task (steps 6–11) handles replication, visibility, subscriptions, and client response.
 
 ```rust
 pub struct CommitRequest {
@@ -499,16 +499,27 @@ pub struct NoReplication;
 
 pub struct CommitCoordinator {
     ts_allocator: Arc<TsAllocator>,       // shared with CommitHandle
-    visible_ts: Arc<AtomicU64>,            // shared with CommitHandle
-    commit_log: CommitLog,
-    subscriptions: Arc<RwLock<SubscriptionRegistry>>,
+    visible_ts: Arc<AtomicU64>,            // shared with CommitHandle + ReplicationRunner
+    commit_log: Arc<RwLock<CommitLog>>,    // shared with ReplicationRunner
     storage: Arc<StorageEngine>,
     primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
     secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
-    replication: Box<dyn ReplicationHook>,
     index_resolver: Arc<dyn IndexResolver>,
     commit_rx: mpsc::Receiver<(CommitRequest, oneshot::Sender<CommitResult>)>,
-    next_tx_id: Arc<AtomicU64>,            // shared with CommitHandle
+    replication_tx: mpsc::Sender<ReplicationEntry>,
+    next_tx_id: Arc<AtomicU64>,            // shared with CommitHandle + ReplicationRunner
+}
+
+/// Replication task — processes committed entries in order.
+/// `Send` — no page guards held. Runs on any tokio task.
+pub struct ReplicationRunner {
+    visible_ts: Arc<AtomicU64>,
+    commit_log: Arc<RwLock<CommitLog>>,
+    subscriptions: Arc<RwLock<SubscriptionRegistry>>,
+    storage: Arc<StorageEngine>,
+    replication: Box<dyn ReplicationHook>,
+    replication_rx: mpsc::Receiver<ReplicationEntry>,
+    next_tx_id: Arc<AtomicU64>,
 }
 
 impl CommitCoordinator {
@@ -521,9 +532,11 @@ impl CommitCoordinator {
         replication: Box<dyn ReplicationHook>,
         index_resolver: Arc<dyn IndexResolver>,
         channel_size: usize,
-    ) -> (Self, CommitHandle);
+        replication_queue_size: usize,
+    ) -> (Self, ReplicationRunner, CommitHandle);
 
-    /// The single-writer commit loop
+    /// Writer task — steps 1–5, then enqueue to replication task.
+    /// Never blocked on network I/O.
     pub async fn run(&mut self);
     // For each request:
     //   1. OCC validation (skip for empty write_set — read-only subscription commits)
@@ -534,23 +547,29 @@ impl CommitCoordinator {
     //      Compute index deltas via compute_index_deltas()
     //      (Catalog writes are regular IndexDeltas on reserved collections)
     //   5. Append to commit log
-    //   6. Check subscription invalidation (in-memory, fast)
-    //   7. Await replication: replicate_and_wait(lsn, record)
-    //      ON FAILURE: rollback commit log entry; respond QuorumLost
-    //   8. WAL_RECORD_VISIBLE_TS (0x09) + fsync
-    //   9. Advance visible_ts = commit_ts
-    //  10. If subscription requested:
-    //      a. Call read_set.extend_for_deltas(&index_deltas) — clears stale
-    //         limit_boundary on any interval whose boundary doc was written by
-    //         THIS transaction (the OCC read set and subscription read set differ
-    //         because the tx's own writes are not in the commit log range checked
-    //         by OCC, but they can still move boundary docs).
-    //      b. Create mpsc channel, register adjusted read_set as subscription
-    //         (event_tx → registry, event_rx → result).
-    //  11. FIRE-AND-FORGET: push step-6b events via try_send on each sub's event_tx
+    //      → enqueue ReplicationEntry to replication task (carries read_set,
+    //        index_deltas, subscription mode, oneshot sender)
+    //      → immediately loop back for next commit
 }
 
-/// Handle for submitting commit requests from any task
+impl ReplicationRunner {
+    /// Replication task — steps 6–11, processes entries in strict commit order.
+    pub async fn run(&mut self);
+    // For each entry from the writer:
+    //   6. Replicate: replicate_and_wait(lsn, record)
+    //      ON FAILURE: remove commit log entries > visible_ts,
+    //      respond QuorumLost to all queued clients, stop.
+    //   7. WAL_RECORD_VISIBLE_TS (0x09) + fsync
+    //   8. Advance visible_ts = commit_ts
+    //   9. Check subscription invalidation (in-memory, fast)
+    //  10. If subscription requested:
+    //      a. Call read_set.extend_for_deltas(&index_deltas)
+    //      b. Create mpsc channel, register adjusted read_set as subscription
+    //  11. Push invalidation events + respond to client via oneshot
+}
+
+/// Handle for submitting commit requests from any task.
+/// Response arrives after the replication task confirms visibility.
 #[derive(Clone)]
 pub struct CommitHandle {
     tx: mpsc::Sender<(CommitRequest, oneshot::Sender<CommitResult>)>,
@@ -575,8 +594,9 @@ impl CommitHandle {
 **Key rules:**
 
 - `begin()` uses `visible_ts`, **NOT** `ts_allocator.latest()`.
-- `visible_ts` only advances after replication confirms the commit **AND** the advancement is persisted to WAL (via `WAL_RECORD_VISIBLE_TS`).
-- Without replication (`NoReplication`): `visible_ts` advances immediately after the commit's WAL fsync — no fence is needed.
+- `visible_ts` only advances after replication confirms the commit **AND** the advancement is persisted to WAL (via `WAL_RECORD_VISIBLE_TS`). Controlled exclusively by the replication task.
+- Without replication (`NoReplication`): `visible_ts` advances immediately after the commit's WAL fsync — the replication task's `replicate_and_wait` is a no-op.
+- The writer can process commits ahead of `visible_ts` — it is never blocked on replication.
 
 **Why this matters (phantom read prevention):**
 

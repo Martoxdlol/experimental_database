@@ -2,7 +2,7 @@
 
 ## Scope
 
-Layer 5: Transactions. Timestamp allocation, read/write set management, OCC validation via commit log, subscription registry with three modes (Notify / Watch / Subscribe), read set carry-forward for subscription chains, and the single-writer commit protocol. This is the concurrency and consistency layer.
+Layer 5: Transactions. Timestamp allocation, read/write set management, OCC validation via commit log, subscription registry with three modes (Notify / Watch / Subscribe), read set carry-forward for subscription chains, and the two-task commit architecture (writer task + replication task). This is the concurrency and consistency layer.
 
 **Depends on:** Layer 1 (Core Types), Layer 2 (Storage Engine), Layer 3 (Document Store).
 **No knowledge of:** Layer 6+ (Database, Replication, Wire Protocol).
@@ -20,6 +20,8 @@ Layer 5: Transactions. Timestamp allocation, read/write set management, OCC vali
 | T6 | Subscriptions | `subscriptions.rs` | T2, T3, T4 | Yes |
 | T7 | Commit Protocol | `commit.rs` | T1–T6, L2 (StorageEngine), L3 (PrimaryIndex, SecondaryIndex) | Yes (with mocks) |
 
+**T7 architecture:** Two tasks — `CommitCoordinator` (writer, steps 1–5, `!Send`) and `ReplicationRunner` (replication + subscriptions + client response, steps 6–11, `Send`).
+
 ## Implementation Phases
 
 ### Phase A: Foundations (T1 + T2 + T3) — Parallel, No Internal Dependencies
@@ -32,7 +34,7 @@ Build the in-memory commit log that indexes writes by (collection, index) for OC
 OCC validation and subscription invalidation both use ReadInterval::contains_key as the core overlap check. Build and test in parallel.
 
 ### Phase D: Commit Protocol (T7) — Depends on Phases A–C
-The single-writer commit coordinator orchestrating the 11-step protocol. Integrates all prior modules with L2 (WAL) and L3 (PrimaryIndex, SecondaryIndex).
+Two-task commit architecture: the writer task (CommitCoordinator, steps 1–5) serializes page mutations with no network dependency; the replication task (ReplicationRunner, steps 6–11) handles replication, visibility advancement, subscriptions, and client response. Integrates all prior modules with L2 (WAL) and L3 (PrimaryIndex, SecondaryIndex).
 
 ## File Map
 
@@ -45,7 +47,7 @@ tx/
   commit_log.rs       — T4: CommitLog, CommitLogEntry, IndexKeyWrite
   occ.rs              — T5: OCC validation, ConflictError
   subscriptions.rs    — T6: SubscriptionRegistry, InvalidationEvent, ChainContinuation
-  commit.rs           — T7: CommitCoordinator, CommitHandle, 11-step protocol
+  commit.rs           — T7: CommitCoordinator (writer), ReplicationRunner, CommitHandle
 ```
 
 ## Dependency Direction
@@ -89,6 +91,8 @@ tempfile = { workspace = true }
 
 Does NOT depend on `exdb-query`. L5 defines `IndexResolver` trait that L6 implements. L6 bridges L4 and L5.
 
+**L6 startup**: creates `CommitCoordinator` + `ReplicationRunner` + `CommitHandle` via `CommitCoordinator::new()`. Spawns the coordinator on a `LocalSet` (it is `!Send`). Spawns the replication runner on any tokio task (it is `Send`).
+
 ## Public Facade
 
 ```rust
@@ -121,9 +125,10 @@ pub use subscriptions::{
     InvalidationEvent, ChainContinuation,
 };
 
-// Commit protocol (L6 owns CommitCoordinator, distributes CommitHandle)
+// Commit protocol (L6 owns CommitCoordinator + ReplicationRunner, distributes CommitHandle)
 pub use commit::{
-    CommitCoordinator, CommitHandle, CommitRequest, CommitResult, CommitError,
+    CommitCoordinator, ReplicationRunner, CommitHandle,
+    CommitRequest, CommitResult, CommitError,
     ConflictRetry, ReplicationHook, NoReplication,
 };
 ```
@@ -138,13 +143,17 @@ pub use commit::{
 
 4. **Unified catalog conflict detection**: Catalog operations (DDL) are modeled as regular read/write intervals on reserved pseudo-collections (`CATALOG_COLLECTIONS`, `CATALOG_INDEXES`). No separate `CatalogRead`/`catalog_conflicts` — the same `contains_key` check handles both data and catalog conflicts. L6 provides a thin wrapper that encodes catalog operations into intervals. This means catalog subscriptions (e.g., "notify me when a new collection is created") work automatically.
 
-5. **Visibility fence (`visible_ts`)**: Separate from `ts_allocator.latest()`. Only advances after replication confirms + WAL persists `WAL_RECORD_VISIBLE_TS`.
+5. **Visibility fence (`visible_ts`)**: Separate from `ts_allocator.latest()`. Only advances after replication confirms + WAL persists `WAL_RECORD_VISIBLE_TS`. Controlled exclusively by the replication task — writer never advances it.
 
-6. **CommitCoordinator is `!Send`**: parking_lot guards inside StorageEngine async methods. Must run on `LocalSet` or single-threaded runtime. CommitHandle is `Send + Clone`.
+6. **CommitCoordinator is `!Send`**: parking_lot guards inside StorageEngine async methods. Must run on `LocalSet` or single-threaded runtime. **ReplicationRunner is `Send`** — no page guards, runs on any tokio task. CommitHandle is `Send + Clone`.
+
+7. **Subscription invalidation after visibility**: Subscriptions are checked (step 9) only after `visible_ts` advances (step 8). Clients never receive invalidation events for commits that might be rolled back due to replication failure.
+
+8. **Replication failure rollback**: On failure, all commit log entries beyond `visible_ts` are removed. The writer is signaled to stop (replication channel dropped). Pending clients receive `QuorumLost`. Page store mutations beyond `visible_ts` are cleaned up by rollback vacuum (L3) on restart.
 
 ## L5/L6 Boundary — Transaction Lifecycle
 
-L5 provides the commit machinery (`CommitCoordinator`, `CommitHandle`, `ReadSet`, `WriteSet`). The **user-facing `Transaction` type** with `begin()`, `reset()`, `rollback()`, and `drop()` semantics (DESIGN.md 5.3) lives in **L6** (Database facade). L6 constructs a `Transaction` holding a `ReadSet`, `WriteSet`, `begin_ts`, and a `CommitHandle` reference. On commit, L6 packages these into a `CommitRequest` and submits to `CommitHandle::commit()`.
+L5 provides the commit machinery (`CommitCoordinator`, `ReplicationRunner`, `CommitHandle`, `ReadSet`, `WriteSet`). The **user-facing `Transaction` type** with `begin()`, `reset()`, `rollback()`, and `drop()` semantics (DESIGN.md 5.3) lives in **L6** (Database facade). L6 constructs a `Transaction` holding a `ReadSet`, `WriteSet`, `begin_ts`, and a `CommitHandle` reference. On commit, L6 packages these into a `CommitRequest` and submits to `CommitHandle::commit()`. The response arrives after the replication task has confirmed visibility — not immediately after the writer processes the commit.
 
 - **`begin(options)`**: L6 reads `visible_ts` from `CommitHandle`, allocates a `TxId`, creates empty `ReadSet`/`WriteSet`.
 - **`reset()`**: L6 clears `ReadSet`/`WriteSet`, resets `next_query_id` to 0. Same `begin_ts`.

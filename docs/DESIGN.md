@@ -2238,14 +2238,15 @@ All I/O and computation runs on the tokio async runtime. CPU-bound work (page op
 
 #### 5.11.2 Single Writer
 
-A single **writer task** serializes all operations that modify the page store. The writer processes one commit at a time, executing steps 1–6 of the commit protocol (section 5.12) sequentially:
+A single **writer task** serializes all operations that modify the page store. The writer processes one commit at a time, executing steps 1–5 of the commit protocol (section 5.12) sequentially:
 
 1. OCC validation against the commit log.
 2. Assign `commit_ts` (atomic increment).
 3. Write WAL record + fsync (via the WAL writer's group commit channel — see 2.8.6).
 4. Apply mutations to the page store: acquire exclusive page guards (section 2.7), modify B-tree pages, mark dirty.
 5. Update the commit log.
-6. Invalidate local subscriptions and caches.
+
+After step 5, the writer enqueues the commit to the **replication task** (see 5.12) and immediately loops back to process the next commit. Replication, visibility advancement, subscription invalidation, and client notification all happen on the replication task — the writer is never blocked on network I/O.
 
 The writer is the **only** code path that acquires `ExclusivePageGuard`s on buffer pool frames (outside of recovery and checkpoint mark-clean). This means:
 
@@ -2253,16 +2254,16 @@ The writer is the **only** code path that acquires `ExclusivePageGuard`s on buff
 - **Free list and heap**: accessed exclusively by the writer (section 2.6). No locks required.
 - **Catalog mutations** (create/drop collection/index): also serialized through the writer.
 
-The writer is implemented as a dedicated tokio task that receives commit requests via a bounded async channel. Callers submit `(read_set, write_set)` and await a oneshot response with the result (success + `commit_ts`, or conflict error).
+The writer is implemented as a dedicated tokio task that receives commit requests via a bounded async channel. Callers submit `(read_set, write_set)` and the result is delivered via a oneshot channel — but the response is sent by the replication task after visibility is confirmed, not by the writer itself.
 
-**Throughput**: the single writer is the serialization bottleneck. Under high write load, throughput is bounded by the speed of one commit pipeline iteration. The WAL group commit (section 2.8.6) amortizes fsync cost. Page mutations are in-memory (buffer pool), so step 4 is fast. The practical bottleneck is WAL fsync latency, which group commit mitigates.
+**Throughput**: the single writer is the serialization bottleneck for page mutations. Under high write load, throughput is bounded by the speed of one commit pipeline iteration (OCC + WAL fsync + page mutations + commit log). The WAL group commit (section 2.8.6) amortizes fsync cost. Page mutations are in-memory (buffer pool), so step 4 is fast. Replication latency does not affect writer throughput — it only affects the delay before clients receive confirmation and `visible_ts` advances.
 
 #### 5.11.3 Concurrent Readers
 
 Read-only queries run on any tokio task, concurrently with each other and with the writer:
 
 - **B-tree traversal**: readers acquire `SharedPageGuard`s (section 2.7) as they descend the B-tree. Multiple readers can hold shared guards on the same page simultaneously.
-- **MVCC isolation**: readers at `read_ts` skip versions with `ts > read_ts`, so they are unaffected by the writer inserting new versions concurrently. A reader never sees a partially-applied transaction — the writer updates the commit log (step 5) and advances `visible_ts` (step 9 in 5.11) only after all page mutations are complete.
+- **MVCC isolation**: readers at `read_ts` skip versions with `ts > read_ts`, so they are unaffected by the writer inserting new versions concurrently. A reader never sees a partially-applied transaction — `visible_ts` (advanced by the replication task after replication confirms, see 5.12) only moves forward after all page mutations are complete and replicated. Readers always begin at `visible_ts`, so they only see fully committed and replicated data.
 - **No read locks**: readers do not acquire any logical locks. OCC detects conflicts at commit time, not during reads.
 - **Cache misses**: when a reader hits a cold page, it reads from disk via positional I/O (section 2.7.1) without blocking other readers or the writer.
 
@@ -2305,7 +2306,8 @@ To prevent deadlocks, locks are always acquired in this order:
 | Operation | Runs on | Page access | Serialized? |
 |-----------|---------|-------------|-------------|
 | Read query | Any tokio task | `SharedPageGuard` | No — fully concurrent |
-| Transaction commit (steps 1–6) | Writer task | `ExclusivePageGuard` | Yes — single writer |
+| Transaction commit (steps 1–5) | Writer task | `ExclusivePageGuard` | Yes — single writer |
+| Replication + visibility + subscriptions | Replication task | None (in-memory + network) | Yes — serial per commit |
 | WAL fsync | WAL writer task | None | Yes — group commit batches |
 | Checkpoint (DWB + scatter) | Checkpoint task | Positional I/O + mark-clean | Concurrent with reads; brief writer lock for snapshot |
 | Vacuum | Writer task (submitted) | `ExclusivePageGuard` | Yes — through writer |
@@ -2320,7 +2322,11 @@ The commit protocol enforces a strict ordering of effects. When a client receive
 3. All replicas have applied the changes.
 4. Any new transaction on any node will see the committed data.
 
-**Commit sequence** (on the primary):
+The protocol is split across two tasks to minimize writer blocking:
+
+#### 5.12.1 Writer Task (steps 1–5)
+
+The single writer processes these steps sequentially for each commit. No network I/O — only local computation, WAL fsync, and in-memory page mutations. After step 5, the writer enqueues the commit to the replication task and immediately loops back for the next commit.
 
 ```
 1.  OCC validation                           [VALIDATE]
@@ -2329,27 +2335,54 @@ The commit protocol enforces a strict ordering of effects. When a client receive
 4.  Apply mutations to page store +          [MATERIALIZE]
     compute index deltas
 5.  Append to commit log                     [LOG]
-6.  Check subscription invalidation          [INVALIDATE]
-7.  Replicate to all replicas (see 6.2)      [REPLICATE]
+    → enqueue (commit_ts, lsn, wal_payload,
+      read_set, write_set, index_deltas,
+      subscription_mode, oneshot_sender)
+      to replication task
+```
+
+#### 5.12.2 Replication Task (steps 6–11)
+
+A separate dedicated task processes the replication queue **in order**. Replications are pipelined: multiple commits can be in-flight to replicas simultaneously, but `visible_ts` advances strictly in commit order. After each successful replication, the task handles subscriptions and responds to the client.
+
+```
+6.  Replicate to all replicas (see 6.2)      [REPLICATE]
     Each replica: apply WAL → update page
     store → invalidate local subscriptions
-8.  Write WAL visible_ts record              [FENCE]
-9.  Advance visible_ts                       [VISIBLE]
+7.  Write WAL visible_ts record              [FENCE]
+8.  Advance visible_ts                       [VISIBLE]
+9.  Check subscription invalidation          [INVALIDATE]
 10. Register subscription (if requested)     [SUBSCRIBE]
     a. extend_for_deltas on read set
     b. Register in subscription registry
 11. Push invalidation events + respond       [RESPOND]
 ```
 
+#### 5.12.3 Replication Failure and Rollback
+
+On replication failure at `commit_ts = N` (where `visible_ts = M`, `M < N`):
+
+1. **Stop processing**: the replication task stops draining the queue. No further replications are attempted.
+2. **Rollback commit log**: remove all commit log entries for `ts > visible_ts`. This is necessary because OCC validation on the writer may have validated subsequent commits against now-invalid entries.
+3. **Signal writer to stop**: the writer must stop accepting new commits, since any commits validated after the failed entry built on reverted state.
+4. **Respond to clients**: all pending clients in the replication queue (ts = N and beyond) receive `QuorumLost`.
+5. **Page store cleanup**: mutations for `ts > visible_ts` are physically present in the page store but invisible (they are beyond `visible_ts`). Rollback vacuum (L3) cleans up these versions on restart.
+
+Without replication (`NoReplication`): steps 6 is a no-op (returns immediately). The replication task still runs but does no network I/O — `visible_ts` advances immediately after each commit.
+
+#### 5.12.4 Ordering Properties
+
 **Terminology**: `visible_ts` is the latest timestamp safe for new readers. It is separate from the timestamp allocator's latest value (`ts_allocator.latest()`), which tracks the highest *allocated* timestamp and may be ahead of what has been replicated. New transactions acquire `begin_ts = visible_ts`, not `ts_allocator.latest()`.
 
-**Critical ordering**: `visible_ts` (step 9) is only advanced after all replicas confirm (step 7) and the WAL visible_ts record is persisted (step 8). This ensures that no new transaction on any node can begin at a timestamp for which some replica hasn't yet applied the data.
+**Critical ordering**: `visible_ts` (step 8) is only advanced after all replicas confirm (step 6) and the WAL visible_ts record is persisted (step 7). This ensures that no new transaction on any node can begin at a timestamp for which some replica hasn't yet applied the data.
 
 **Monotonic visibility**: a query at timestamp T on any node is guaranteed to see all commits with `commit_ts ≤ T`. It is impossible for a newer timestamp to return older data than a query at an earlier timestamp.
 
-**Write-to-read latency**: the window between steps 3 and 9 is a brief period where the data is persisted but not yet visible to new transactions. This is intentional — visibility is deferred until all nodes are consistent. During this window, the committing client has not yet been notified, so no external observer can expect to see the data.
+**Write-to-read latency**: the window between steps 3 and 8 is a period where the data is persisted but not yet visible to new transactions. This is intentional — visibility is deferred until all nodes are consistent. During this window, the committing client has not yet been notified, so no external observer can expect to see the data. The writer can process additional commits during this window, pipelining ahead of visibility.
 
 **Subscription registration** (step 10): before registering the read set as a subscription, `extend_for_deltas` is called with the transaction's own index deltas to clear any stale `limit_boundary` values from boundary documents that the transaction itself moved. This is necessary because OCC (step 1) only checks concurrent commits in `(begin_ts, commit_ts)` — the transaction's own writes are never in that range, so their effect on boundary docs must be handled separately.
+
+**Subscription invalidation ordering** (step 9): invalidation is checked after `visible_ts` advances (step 8), ensuring that subscriptions are only invalidated for commits that are visible. This prevents delivering invalidation events for commits that might be rolled back due to replication failure.
 
 ---
 
@@ -2366,15 +2399,17 @@ Single **Primary** with multiple **Read Replicas**. All nodes can accept client 
 
 ### 6.2 WAL Streaming
 
-The primary continuously streams committed WAL records to all replicas:
+The primary's **replication task** (see 5.12.2) streams committed WAL records to all replicas. The writer and replication task are decoupled — the writer produces committed WAL records, the replication task consumes them:
 
-1. Primary commits a transaction (WAL + page store + local invalidation).
-2. Primary sends the WAL record to all replicas via persistent TCP connections.
+1. Writer commits a transaction (WAL + page mutations + commit log) and enqueues the record to the replication task.
+2. Replication task sends the WAL record to all replicas via persistent TCP connections.
 3. Each replica:
    a. Applies the WAL record to its local page store and indexes.
    b. Invalidates local subscriptions/caches affected by the commit.
    c. Sends acknowledgement to primary.
-4. Primary waits for acknowledgements (see 6.5), then advances `visible_ts`.
+4. Replication task receives acknowledgements (see 6.5), advances `visible_ts`, processes subscriptions, and responds to the client.
+
+Replications are pipelined: the replication task can have multiple WAL records in-flight to replicas, but `visible_ts` advances strictly in commit order. The writer is never blocked on replication — it continues processing commits as long as there is room in the replication queue.
 
 ### 6.3 Transaction Execution on Replicas
 
@@ -2396,7 +2431,7 @@ When a write transaction on a replica reaches commit:
 
 1. Originating replica sends to primary: `{ begin_ts, read_set, write_set }`.
 2. Primary assigns `commit_ts` and validates OCC against its commit log.
-3. If valid: primary executes the full commit protocol (5.11 steps 3–9).
+3. If valid: primary executes the full commit protocol (5.12 steps 3–11).
 4. Primary responds to originating replica: `{ commit_ts }` on success, or `{ conflict }` on OCC failure.
 5. Originating replica notifies the client (success or error, following `subscribe` semantics from 5.1).
 

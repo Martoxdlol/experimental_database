@@ -345,7 +345,8 @@ pub fn remove_session(&mut self, session_id: u64) {
 ```rust
 /// Push invalidation events to subscriber channels.
 ///
-/// Called by CommitCoordinator (T7 step 11) after check_invalidation.
+/// Called by ReplicationRunner (T7 step 11) after check_invalidation,
+/// once visible_ts has advanced and the commit is confirmed visible.
 /// Uses try_send; full channels or closed receivers are silently dropped.
 pub fn push_events(&self, events: Vec<InvalidationEvent>) {
     for event in events {
@@ -370,6 +371,8 @@ pub fn push_events(events: Vec<(InvalidationEvent, mpsc::Sender<InvalidationEven
 ```
 
 This avoids the lookup-after-removal problem.
+
+**Threading model:** `check_invalidation`, `register`, and `push_events` are all called by the **replication task** (T7 steps 9–11), not by the writer task. The `SubscriptionRegistry` is behind `Arc<RwLock>` and shared with `CommitHandle` (for `remove_session` on disconnect). The replication task takes a write lock during steps 9–11. This is safe because subscription operations are in-memory and fast.
 
 ## Error Handling
 

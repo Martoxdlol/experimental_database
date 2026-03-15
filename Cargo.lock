@@ -1448,6 +1448,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "exdb-tx"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "exdb-core",
+ "exdb-docstore",
+ "exdb-storage",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "exdb-wire"
 version = "0.1.0"
 dependencies = [

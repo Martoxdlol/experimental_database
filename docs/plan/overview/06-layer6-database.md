@@ -5,7 +5,7 @@
 ## Design Principles
 
 1. **Embedded-first**: `Database` is a Rust struct you instantiate directly. No server, no network, no protocol.
-2. **Replication via callback**: The database defines a `ReplicationHook` trait. It calls the hook at the right moment during commit (step 7-8). The database does NOT know how replication messages are transported — that's the implementor's concern.
+2. **Replication via callback**: L5 defines a `ReplicationHook` trait. The `ReplicationRunner` (step 6 of the commit protocol) calls the hook after the writer task completes local processing. The database does NOT know how replication messages are transported — that's the implementor's concern.
 3. **No upward dependencies**: Database knows nothing about API, networking, auth, sessions, or transport. Higher layers (L7, L8) depend on Database, never the reverse.
 
 ## Modules

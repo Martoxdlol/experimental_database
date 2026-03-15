@@ -1,6 +1,6 @@
 # Layer 5: Transaction Manager
 
-**Layer purpose:** Timestamp allocation, read/write set management, OCC validation via commit log, subscription registry with three modes (Notify / Watch / Subscribe), read set carry-forward for subscription chains, and the single-writer commit protocol. This is the concurrency and consistency layer.
+**Layer purpose:** Timestamp allocation, read/write set management, OCC validation via commit log, subscription registry with three modes (Notify / Watch / Subscribe), read set carry-forward for subscription chains, and the two-task commit architecture (writer task + replication task). This is the concurrency and consistency layer.
 
 **Detailed implementation plan:** See [docs/plan/transactions/](../transactions/00-overview.md)
 
@@ -440,7 +440,8 @@ impl SubscriptionRegistry {
     pub fn remove_session(&mut self, session_id: u64);
 
     /// Push invalidation events to subscriber channels.
-    /// Called by CommitCoordinator (T7 step 11) after check_invalidation.
+    /// Called by ReplicationRunner (T7 step 11) after check_invalidation,
+    /// once visible_ts has advanced and the commit is confirmed visible.
     /// Uses try_send; events for removed subscriptions are silently dropped.
     pub fn push_events(&self, events: Vec<InvalidationEvent>);
 }
@@ -482,7 +483,7 @@ pub struct ConflictRetry {
 }
 
 /// Trait for replication — defined in L5, implemented by L6 or L7.
-/// Injected into CommitCoordinator at construction time.
+/// Injected into ReplicationRunner at construction time.
 pub trait ReplicationHook: Send + Sync {
     async fn replicate_and_wait(&self, lsn: Lsn, record: &[u8]) -> Result<()>;
     fn has_quorum(&self) -> bool { true }

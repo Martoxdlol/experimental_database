@@ -1,77 +1,101 @@
 # Interaction Diagrams
 
-## 1. Document Write Commit (Full 11-Step Protocol)
+## 1. Document Write Commit (Full 11-Step, Two-Task Protocol)
+
+The commit protocol is split across two tasks: the **writer task** (CommitCoordinator, steps 1–5) handles local operations with no network dependency. The **replication task** (ReplicationRunner, steps 6–11) handles replication, visibility, subscriptions, and client response. The writer is never blocked on replication.
 
 ```
-Caller          Database(L6)   CommitCoord(L5)   WAL(L2)     DocStore(L3)  Replication(L7)  Subs(L5)
-  |                 |                |               |              |              |             |
-  |--tx.commit()--->|                |               |              |              |             |
-  |                 |--CommitReq---->|               |              |              |             |
-  |                 |                |               |              |              |             |
-  |                 |          1. VALIDATE            |              |              |             |
-  |                 |          OCC check read_set     |              |              |             |
-  |                 |          vs commit_log           |              |              |             |
-  |                 |                |               |              |              |             |
-  |                 |          2. TIMESTAMP            |              |              |             |
-  |                 |          commit_ts = alloc()     |              |              |             |
-  |                 |                |               |              |              |             |
-  |                 |          3. PERSIST              |              |              |             |
-  |                 |                |--append+fsync->|              |              |             |
-  |                 |                |<---lsn---------|              |              |             |
-  |                 |                |               |              |              |             |
-  |                 |          4. MATERIALIZE          |              |              |             |
-  |                 |                |------------insert_version---->|              |             |
-  |                 |                |<-------------------------------|              |             |
-  |                 |                |               |              |              |             |
-  |                 |          5. LOG                  |              |              |             |
-  |                 |          commit_log.append()     |              |              |             |
-  |                 |                |               |              |              |             |
-  |                 |          6. CONCURRENT START     |              |              |             |
-  |                 |          6a.   |---------------------------------------->|   |             |
-  |                 |                |               |              | replicate    |             |
-  |                 |          6b.   |---------------------------------------------->|             |
-  |                 |                |               |              |   check_invalidation()     |
-  |                 |                |               |              |              |             |
-  |                 |          7. AWAIT REPLICATION    |              |              |             |
-  |                 |                |<----------------------------------------|   |             |
-  |                 |                |               |              |   ack         |             |
-  |                 |                |               |              |              |             |
-  |                 |       === SUCCESS PATH ===      |              |              |             |
-  |                 |                |               |              |              |             |
-  |                 |          8. PERSIST VISIBLE_TS   |              |              |             |
-  |                 |                |--append+fsync->|              |              |             |
-  |                 |                |   VISIBLE_TS   |              |              |             |
-  |                 |                |               |              |              |             |
-  |                 |          9. ADVANCE visible_ts   |              |              |             |
-  |                 |          (new readers can now    |              |              |             |
-  |                 |           see commit_ts data)    |              |              |             |
-  |                 |                |               |              |              |             |
-  |                 |         10. RESPOND              |              |              |             |
-  |                 |<--CommitResult--|               |              |              |             |
-  |<--ok(commit_ts)-|                |               |              |              |             |
-  |                 |                |               |              |              |             |
-  |                 |         11. PUSH INVALIDATION (fire-and-forget to subscriber sessions)    |
-  |                 |                |               |              |              |             |
-  |                 |       === FAILURE PATH (quorum lost at step 7) ===                       |
-  |                 |                |               |              |              |             |
-  |                 |          7f. ROLLBACK MATERIALIZE              |              |             |
-  |                 |                |--------delete_keys(write_set+index_deltas)->|             |
-  |                 |                |<-------------------------------|              |             |
-  |                 |                |               |              |              |             |
-  |                 |          8f. REMOVE FROM COMMIT LOG            |              |             |
-  |                 |          commit_log.remove()    |              |              |             |
-  |                 |                |               |              |              |             |
-  |                 |          9f. ENTER HOLD STATE   |              |              |             |
-  |                 |          (block new mutations)  |              |              |             |
-  |                 |                |               |              |              |             |
-  |                 |         10f. RESPOND            |              |              |             |
-  |                 |<--QuorumLost---|               |              |              |             |
-  |<--err(QuorumLost)|               |              |              |              |             |
+Caller       Database(L6)   CommitCoord(L5)   WAL(L2)   DocStore(L3)
+  |              |                |               |           |
+  |--tx.commit-->|                |               |           |
+  |              |--CommitReq---->|               |           |
+  |              |                |               |           |
+  |              |   ┌─── WRITER TASK (steps 1–5, !Send) ────┐
+  |              |   │                                        │
+  |              |   │  1. VALIDATE                           │
+  |              |   │  OCC check read_set vs commit_log      │
+  |              |   │                                        │
+  |              |   │  2. TIMESTAMP                           │
+  |              |   │  commit_ts = ts_allocator.allocate()    │
+  |              |   │                                        │
+  |              |   │  3. PERSIST                             │
+  |              |   │     |--append+fsync-->|                │
+  |              |   │     |<---lsn---------|                │
+  |              |   │                                        │
+  |              |   │  4. MATERIALIZE                         │
+  |              |   │     |----------insert_version--------->│
+  |              |   │     |<---------------------------------│
+  |              |   │     compute index deltas               │
+  |              |   │     apply secondary index mutations    │
+  |              |   │                                        │
+  |              |   │  5. LOG + ENQUEUE                       │
+  |              |   │  commit_log.append()                    │
+  |              |   │  → enqueue ReplicationEntry to          │
+  |              |   │    replication task via mpsc             │
+  |              |   │  → immediately loop for next commit     │
+  |              |   └────────────────────────────────────────┘
+  |              |                                  mpsc
+  |              |                                   │
+  |              |                                   ▼
+  |              |            ReplicationRunner(L5)   Replication(L7)   Subs(L5)
+  |              |                  |                      |              |
+  |              |   ┌─── REPLICATION TASK (steps 6–11, Send) ───────────┐
+  |              |   │                                                    │
+  |              |   │  6. REPLICATE                                      │
+  |              |   │     |--replicate_and_wait-->|                     │
+  |              |   │     |<-----ack-------------|                     │
+  |              |   │                                                    │
+  |              |   │  7. FENCE                                          │
+  |              |   │     WAL append VISIBLE_TS record + fsync          │
+  |              |   │                                                    │
+  |              |   │  8. VISIBLE                                        │
+  |              |   │     visible_ts.store(commit_ts)                    │
+  |              |   │     (new readers can now see commit_ts data)       │
+  |              |   │                                                    │
+  |              |   │  9. INVALIDATE                                     │
+  |              |   │     |--check_invalidation------------------------>│
+  |              |   │     |<---Vec<InvalidationEvent>------------------|│
+  |              |   │                                                    │
+  |              |   │  10. SUBSCRIBE (if requested)                      │
+  |              |   │     a. extend_for_deltas on read set              │
+  |              |   │     b. register in subscription registry          │
+  |              |   │                                                    │
+  |              |   │  11. RESPOND + PUSH                                │
+  |              |   │     push invalidation events (fire-and-forget)    │
+  |              |<──│──CommitResult──────────────────────────────────────│
+  |<--ok(commit_ts)  │                                                    │
+  |              |   └────────────────────────────────────────────────────┘
+
+=== FAILURE PATH (quorum lost at step 6) ===
+
+ReplicationRunner(L5)         CommitLog(L5)
+       |                           |
+  6f. replicate_and_wait fails     |
+       |                           |
+  7f. RESPOND QuorumLost           |
+       to this client              |
+       |                           |
+  8f. ROLLBACK COMMIT LOG          |
+       |--remove_after(visible_ts)->|
+       |                           |
+  9f. DRAIN remaining queue entries |
+       respond QuorumLost to all   |
+       |                           |
+  10f. STOP (drop replication_rx)  |
+       Writer detects channel      |
+       closed → stops accepting    |
+       new commits                 |
+       |                           |
+  Page store: mutations for ts > visible_ts remain but are
+  invisible. Rollback vacuum (L3) cleans them on restart.
 ```
 
-Note: Steps 6a (replicate) and 6b (check invalidation) run concurrently. Without replication (NoReplication), 6a is a no-op. Step 11 pushes invalidation events to subscriber sessions asynchronously — the committing client does NOT wait for other clients to receive their subscription notifications.
-
-Note: On quorum loss, the rollback uses the in-memory write_set + index_deltas (still available in the commit coordinator) to delete the exact B-tree keys that were just inserted in step 4. No WAL scan needed for live rollback.
+Notes:
+- The writer task processes steps 1–5 with no network I/O. After step 5, it enqueues to the replication task and immediately loops back for the next commit.
+- The replication task processes entries in strict commit order. Replications can be pipelined (multiple in-flight to replicas), but `visible_ts` advances strictly in order.
+- Without replication (`NoReplication`), step 6 is a no-op — `visible_ts` advances immediately.
+- On replication failure, page mutations are NOT immediately rolled back. They are invisible (beyond `visible_ts`) and cleaned up by rollback vacuum on restart.
+- Step 11 pushes invalidation events asynchronously — the committing client does NOT wait for other clients to receive their subscription notifications.
 
 ## 2. Point Read (Get by ID) — Embedded Usage
 
@@ -145,41 +169,48 @@ Scan Execution Detail:
 
 ## 4. Subscription Invalidation on Commit
 
+Subscription invalidation happens in the **replication task** (ReplicationRunner), AFTER `visible_ts` has advanced (step 8). This ensures clients never receive invalidation events for commits that might be rolled back due to replication failure.
+
 ```
-CommitCoord(L5)       SubscriptionRegistry(L5)        Database(L6)        Caller
-     |                         |                          |                  |
-     | (after step 5: LOG)     |                          |                  |
-     |                         |                          |                  |
-     |--check_invalidation---->|                          |                  |
-     |   (index_writes from    |                          |                  |
-     |    this commit)         |                          |                  |
-     |                         |                          |                  |
-     |   For each (coll, idx): |                          |                  |
-     |     For each key_write: |                          |                  |
-     |       old_key overlap?  |                          |                  |
-     |       new_key overlap?  |                          |                  |
-     |       -> collect (sub_id,|                         |                  |
-     |          query_id)      |                          |                  |
-     |                         |                          |                  |
-     |<--Vec<InvalidationEvent>|                          |                  |
-     |                         |                          |                  |
-     | For each event:         |                          |                  |
-     |   if mode=Subscribe:    |                          |                  |
-     |     begin new tx        |                          |                  |
-     |                         |                          |                  |
-     | Return invalidation events in CommitResult         |                  |
-     |---CommitResult--------->|------------------------->|                  |
-     |                         |                          |--callback/poll-->|
+ReplicationRunner(L5)    SubscriptionRegistry(L5)        Caller
+     |                         |                            |
+     | (after step 8: visible_ts advanced)                  |
+     |                         |                            |
+     | 9. INVALIDATE           |                            |
+     |--check_invalidation---->|                            |
+     |   (index_writes from    |                            |
+     |    this commit)         |                            |
+     |                         |                            |
+     |   For each (coll, idx): |                            |
+     |     For each key_write: |                            |
+     |       old_key overlap?  |                            |
+     |       new_key overlap?  |                            |
+     |       -> collect (sub_id,|                           |
+     |          query_id)      |                            |
+     |                         |                            |
+     |<--Vec<InvalidationEvent>|                            |
+     |                         |                            |
+     | 10. SUBSCRIBE           |                            |
+     |   if subscription req:  |                            |
+     |   extend_for_deltas()   |                            |
+     |--register()------------>|                            |
+     |                         |                            |
+     | 11. RESPOND + PUSH      |                            |
+     |   push_events() (fire-and-forget to other subs)     |
+     |   respond to client via oneshot                     |
+     |---CommitResult-------------------------------------------->|
 ```
 
-Note: In embedded mode, the caller receives invalidation events directly in the CommitResult or via a subscription channel. In network mode (L8), the session pushes them over the wire.
+Note: In embedded mode, the caller receives invalidation events via a subscription channel (mpsc::Receiver<InvalidationEvent>). In network mode (L8), the session pushes them over the wire.
 
 ## 5. WAL Replication Primary -> Replica
 
 ```
 Primary(L6)      PrimaryReplicator(L7)    Network         ReplicaClient(L7)    Replica(L6)
   |                     |                    |                   |                  |
-  | (commit step 7)     |                    |                   |                  |
+  | (commit step 6,     |                    |                   |                  |
+  |  called by          |                    |                   |                  |
+  |  ReplicationRunner) |                    |                   |                  |
   |--replicate_and_wait->|                   |                   |                  |
   |   (via trait)        |                   |                   |                  |
   |                      |--WAL record------>|---WAL record----->|                  |
@@ -245,7 +276,14 @@ Primary(L6)      PrimaryReplicator(L7)    Network         ReplicaClient(L7)    R
                     +------+------+
                            |
                     +------v------+
-                    | Start Tasks  |  commit coordinator,
+                    | Rollback Vac |  if committed ts >
+                    | (L3)         |  visible_ts: clean up
+                    |              |  un-replicated entries
+                    +------+------+
+                           |
+                    +------v------+
+                    | Start Tasks  |  commit coordinator +
+                    |              |  replication runner,
                     |              |  checkpoint, vacuum
                     +------+------+
                            |
@@ -261,8 +299,8 @@ Caller                          Database(L6)
   |                                |  recovery + catalog load + start tasks
   |<--Ok(Database)----------------|
   |                                |
-  |--begin_mutation()----------->|  allocate begin_ts
-  |<--Ok(MutationTransaction)----|
+  |--begin(opts)---------------->|  allocate begin_ts = visible_ts
+  |<--Ok(Transaction)-----------|
   |                                |
   |--tx.create_collection------->|  buffer CatalogMutation in write set,
   |      ("users")                |  return provisional CollectionId
@@ -275,12 +313,14 @@ Caller                          Database(L6)
   |--tx.get("users", &id)------->|  read-your-writes from write set
   |<--Ok(Some(doc))--------------|
   |                                |
-  |--tx.commit(opts)------------->|  OCC + WAL + catalog apply +
-  |                                |  data materialize + replicate
+  |--tx.commit()---------------->|  Writer: OCC + WAL + materialize
+  |                                |  + commit log → enqueue
+  |                                |  Replication: replicate →
+  |                                |  visible_ts → subs → respond
   |<--CommitResult::Success------|
   |                                |
-  |--begin_readonly()----------->|  snapshot at visible_ts
-  |<--ReadonlyTransaction--------|
+  |--begin(readonly: true)------>|  snapshot at visible_ts
+  |<--Ok(Transaction)-----------|
   |                                |
   |--tx.query("users",...) ----->|  scan + filter + read set
   |<--Ok(Vec<Doc>)---------------|
@@ -300,7 +340,7 @@ Client              Session(L8)       Database(L6)
   |<--ok----------------|                  |
   |                     |                  |
   |--begin(db,rw)------>|                  |
-  |                     |--begin_mutation->|  allocate begin_ts
+  |                     |--begin(opts)--->|  allocate begin_ts = visible_ts
   |                     |<--tx-------------|
   |<--ok(tx:1)----------|                  |
   |                     |                  |

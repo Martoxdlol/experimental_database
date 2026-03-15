@@ -2439,16 +2439,14 @@ If OCC fails and `subscribe: true`: the originating replica starts a new write t
 
 ### 6.5 Replication Consistency
 
-**Default: strict synchronous replication** — the primary waits for **all** replicas to acknowledge before advancing the committed timestamp.
+**Quorum-based synchronous replication** — the primary sends each WAL record to all online replicas and waits for acknowledgements. On timeout (`primary_ack_timeout`, default 5s):
 
-**Configurable**: can be relaxed to **Primary + 1** (at least one replica confirms; remaining catch up asynchronously). This trades some consistency for lower write latency.
+- If the acks received (plus self) form a **majority** of `cluster_size` → the commit succeeds. Timed-out replicas catch up later via incremental catch-up.
+- If the acks received (plus self) do **not** form a majority → the primary enters **hold state** and returns `QuorumLost`. No further commits are accepted until quorum is restored.
 
-| Mode | Guarantees | Trade-off |
-|------|-----------|-----------|
-| Strict (all replicas) | Any read on any node immediately sees committed data. | Write latency = max(replica round-trips). |
-| Primary + 1 | Committed data is on at least 2 nodes. Lagging replicas may serve slightly stale reads. | Lower write latency. |
+During normal operation (all replicas online), this effectively waits for all replicas. During partial failure, it degrades gracefully to majority quorum rather than blocking indefinitely.
 
-In both modes, the committing client is only notified after the required acknowledgements are received.
+In all cases, the committing client is only notified after the required acknowledgements are received and `visible_ts` has advanced.
 
 ### 6.6 Monotonic Reads
 

@@ -100,11 +100,20 @@ impl CommitLog {
 
     /// Remove a specific entry by commit_ts.
     ///
-    /// Used for rollback on replication failure (commit step 7).
     /// Returns the removed entry, or None if not found.
     pub fn remove(&mut self, commit_ts: Ts) -> Option<CommitLogEntry> {
         let pos = self.entries.iter().position(|e| e.commit_ts == commit_ts)?;
         Some(self.entries.remove(pos))
+    }
+
+    /// Remove all entries with commit_ts > threshold.
+    ///
+    /// Used for rollback on replication failure: removes all commit log
+    /// entries beyond visible_ts. This is critical because the writer may
+    /// have validated subsequent commits against now-invalid entries.
+    pub fn remove_after(&mut self, threshold: Ts) {
+        let cutoff = self.entries.partition_point(|e| e.commit_ts <= threshold);
+        self.entries.truncate(cutoff);
     }
 
     /// Number of entries in the log.
@@ -160,3 +169,6 @@ No fallible operations. All methods are infallible. Debug assertions catch misus
 9. **prune_empty_log**: Prune on empty log is a no-op.
 10. **remove_existing**: Remove entry at specific ts, verify it's returned and log shrinks.
 11. **remove_nonexistent**: Remove non-existent ts returns None.
+12. **remove_after_basic**: Append at ts 1, 2, 3, 4, 5. `remove_after(3)` removes entries at 4, 5. `len()` == 3.
+13. **remove_after_none**: `remove_after(10)` on log with entries 1–5 removes nothing.
+14. **remove_after_all**: `remove_after(0)` removes all entries.

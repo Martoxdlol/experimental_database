@@ -145,7 +145,7 @@ pub use commit::{
 
 5. **Visibility fence (`visible_ts`)**: Separate from `ts_allocator.latest()`. Only advances after replication confirms + WAL persists `WAL_RECORD_VISIBLE_TS`. Controlled exclusively by the replication task — writer never advances it.
 
-6. **CommitCoordinator is `!Send`**: parking_lot guards inside StorageEngine async methods. Must run on `LocalSet` or single-threaded runtime. **ReplicationRunner is `Send`** — no page guards, runs on any tokio task. CommitHandle is `Send + Clone`.
+6. **CommitCoordinator is `!Send`**: B-tree operations (via PrimaryIndex/SecondaryIndex) hold `parking_lot::RwLock` page guards (`ExclusivePageGuard` in BufferPool) across `.await` points (e.g., `split_leaf().await` during insert). Must run on `LocalSet` or single-threaded runtime. **ReplicationRunner is `Send`** — only calls `append_wal` (channel-based, no page guards) and sync subscription operations. CommitHandle is `Send + Clone`.
 
 7. **Subscription invalidation after visibility**: Subscriptions are checked (step 9) only after `visible_ts` advances (step 8). Clients never receive invalidation events for commits that might be rolled back due to replication failure.
 

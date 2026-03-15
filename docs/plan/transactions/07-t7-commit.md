@@ -143,8 +143,10 @@ struct ReplicationEntry {
 
 /// The single-writer commit coordinator.
 ///
-/// **`!Send`**: Contains parking_lot guards from StorageEngine async
-/// methods. Must be spawned on a `tokio::task::LocalSet` or single-threaded
+/// **`!Send`**: B-tree operations (via PrimaryIndex/SecondaryIndex) hold
+/// `parking_lot::RwLock` page guards (`ExclusivePageGuard` in BufferPool)
+/// across `.await` points (e.g., `split_leaf().await` during insert).
+/// Must be spawned on a `tokio::task::LocalSet` or single-threaded
 /// runtime. The `CommitHandle` is `Send + Clone` and can be used from any task.
 pub struct CommitCoordinator {
     ts_allocator: Arc<TsAllocator>,
@@ -341,10 +343,16 @@ updating CatalogCache) are triggered by L6 when it detects writes to
 reserved CollectionIds in the commit result. No CatalogMutator trait needed.
 
 ```rust
-// Apply mutations to primary and secondary indexes
-let primaries = self.primary_indexes.read();
-let secondaries = self.secondary_indexes.read();
+// Clone Arc'd indexes and drop the parking_lot read guards immediately.
+// These guards must NOT be held across .await — holding a parking_lot guard
+// across an await point makes the future !Send and blocks concurrent readers
+// for the entire mutation loop.
+let primaries: HashMap<CollectionId, Arc<PrimaryIndex>> =
+    self.primary_indexes.read().clone();
+let secondaries: HashMap<IndexId, Arc<SecondaryIndex>> =
+    self.secondary_indexes.read().clone();
 
+// Apply mutations to primary indexes
 for ((coll_id, doc_id), entry) in &req.write_set.mutations {
     let primary = &primaries[coll_id];
     let body_bytes = entry.body.as_ref().map(|v| serde_json::to_vec(v).unwrap());
@@ -355,7 +363,7 @@ for ((coll_id, doc_id), entry) in &req.write_set.mutations {
 let index_deltas = compute_index_deltas(
     &req.write_set,
     self.index_resolver.as_ref(),
-    &primaries.iter().map(|(&k, v)| (k, v.clone())).collect(),
+    &primaries,
     commit_ts,
 ).await?;
 
@@ -453,7 +461,11 @@ if let Err(msg) = self.replication.replicate_and_wait(entry.lsn, &entry.wal_payl
 #### Step 7: WAL visible_ts Record
 
 ```rust
-self.storage.append_wal(WAL_RECORD_VISIBLE_TS, &entry.commit_ts.to_le_bytes()).await?;
+if let Err(e) = self.storage.append_wal(WAL_RECORD_VISIBLE_TS, &entry.commit_ts.to_le_bytes()).await {
+    tracing::error!("failed to persist visible_ts WAL record: {e}");
+    let _ = entry.response_tx.send(CommitResult::QuorumLost);
+    return false;
+}
 ```
 
 #### Step 8: Advance visible_ts

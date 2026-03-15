@@ -128,9 +128,10 @@ pub use error::{DatabaseError, TransactionError};
 pub use exdb_core::types::{CollectionId, DocId, IndexId, Ts};
 pub use exdb_core::field_path::FieldPath;
 pub use exdb_core::filter::{Filter, RangeExpr};
+pub use transaction::TransactionResult;
 pub use exdb_tx::{
     SubscriptionMode, InvalidationEvent, ChainContinuation,
-    CommitResult, ConflictRetry, ReplicationHook, NoReplication,
+    ConflictRetry, ReplicationHook, NoReplication,
 };
 pub use exdb_storage::btree::ScanDirection;
 ```
@@ -144,6 +145,11 @@ A single `db.begin(opts)` creates both read-only and read-write transactions (DE
 ```rust
 let mut tx = db.begin(TransactionOptions::default())?;     // read-write
 let mut tx = db.begin(TransactionOptions::readonly())?;     // read-only
+// L8 sets session_id for subscription cleanup on disconnect:
+let mut tx = db.begin(TransactionOptions {
+    session_id: session.id(),
+    ..TransactionOptions::default()
+})?;
 ```
 
 ### 2. Transaction Borrows Database
@@ -359,7 +365,7 @@ let mut tx = db.begin(TransactionOptions {
 })?;
 let users = tx.query("users", "_created_at", &[], None, None, Some(50)).await?;
 let result = tx.commit().await?;
-if let CommitResult::Success { subscription_handle, .. } = result {
+if let TransactionResult::Success { subscription_handle, .. } = result {
     // Every future commit touching the watched interval fires an event
     let mut handle = subscription_handle.unwrap();
     while let Some(event) = handle.next_event().await {

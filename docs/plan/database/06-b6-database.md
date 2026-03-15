@@ -123,9 +123,13 @@ impl Database {
 impl Database {
     /// Begin a transaction.
     ///
-    /// The snapshot timestamp (`begin_ts`) is set to `visible_ts` — the latest
-    /// committed + replicated timestamp. This ensures the snapshot only includes
-    /// fully committed and replicated data.
+    /// - `begin_ts` is set to `commit_handle.visible_ts()` (latest committed +
+    ///   replicated timestamp).
+    /// - `tx_id` is allocated via `commit_handle.allocate_tx_id()`.
+    /// - `wall_clock_ms` is captured from `SystemTime::now()` (for `_created_at`).
+    /// - `session_id` for subscription cleanup comes from `opts.session_id`
+    ///   (default 0 for embedded; L8 sets it to the connection's session ID).
+    /// - Increments `active_tx_count`.
     ///
     /// # Errors
     ///

@@ -39,18 +39,23 @@ pub struct TransactionOptions {
     pub readonly: bool,
     /// Subscription mode — controls post-commit read set behavior.
     pub subscription: SubscriptionMode,
+    /// Session ID for subscription association. Used by L8 to clean up
+    /// all subscriptions for a session on disconnect via
+    /// `SubscriptionRegistry::remove_session(session_id)`.
+    /// Embedded callers leave this at the default (0).
+    pub session_id: u64,
 }
 
 impl TransactionOptions {
     /// Convenience constructor for read-only transactions.
     pub fn readonly() -> Self {
-        Self { readonly: true, subscription: SubscriptionMode::None }
+        Self { readonly: true, subscription: SubscriptionMode::None, session_id: 0 }
     }
 }
 
 impl Default for TransactionOptions {
     fn default() -> Self {
-        Self { readonly: false, subscription: SubscriptionMode::None }
+        Self { readonly: false, subscription: SubscriptionMode::None, session_id: 0 }
     }
 }
 
@@ -77,9 +82,14 @@ impl Default for TransactionOptions {
 /// the database.
 pub struct Transaction<'db> {
     db: &'db Database,
-    tx_id: u64,
+    /// Allocated via `CommitHandle::allocate_tx_id()` in `Database::begin()`.
+    tx_id: TxId,
     opts: TransactionOptions,
+    /// Set to `CommitHandle::visible_ts()` in `Database::begin()`.
     begin_ts: Ts,
+    /// Wall-clock milliseconds since epoch, captured once at `begin()`.
+    /// Used for `_created_at` on all inserts in this transaction (DESIGN.md 1.11).
+    wall_clock_ms: u64,
     read_set: ReadSet,
     write_set: WriteSet,
     committed: bool,
@@ -97,11 +107,13 @@ pub struct Transaction<'db> {
 impl<'db> Transaction<'db> {
     /// Get a document by ID.
     ///
-    /// 1. Check write set (read-your-writes). If found, return immediately
-    ///    WITHOUT recording a read interval (DESIGN.md 5.4 — the write
-    ///    set mutation subsumes any read for OCC purposes).
-    /// 2. Record catalog read for collection name resolution.
-    /// 3. Assign query_id.
+    /// 1. Assign query_id.
+    /// 2. Resolve collection name → CollectionId (+ catalog read interval
+    ///    with this query_id).
+    /// 3. Check write set (read-your-writes). If found, return immediately
+    ///    WITHOUT recording a data read interval (DESIGN.md 5.4 — the write
+    ///    set mutation subsumes any read for OCC purposes). The catalog
+    ///    read interval from step 2 is still recorded.
     /// 4. Execute primary get via L4.
     /// 5. Build ReadInterval (point interval, no LimitBoundary).
     /// 6. Record in read_set.
@@ -154,11 +166,15 @@ impl<'db> Transaction<'db> {
     /// Insert a document. Returns the auto-generated DocId.
     ///
     /// 1. Check readonly → error.
-    /// 2. Resolve collection (write-set-aware).
-    /// 3. Generate ULID → DocId.
-    /// 4. Set `_id` and `_created_at` on the document.
-    /// 5. Check document size limit.
-    /// 6. Buffer in write_set as Insert.
+    /// 2. Check timeout.
+    /// 3. Resolve collection (write-set-aware, with catalog read interval).
+    /// 4. Generate ULID → DocId.
+    /// 5. Set `_id` (ULID string) and `_created_at` (wall-clock milliseconds
+    ///    since epoch, captured once at transaction begin and reused for all
+    ///    inserts in this tx — DESIGN.md 1.11) on the document.
+    /// 6. Strip `_meta` from the body (reserved, never persisted).
+    /// 7. Check document size limit.
+    /// 8. Buffer in write_set as Insert.
     pub async fn insert(
         &mut self,
         collection: &str,
@@ -327,11 +343,15 @@ impl Drop for Transaction<'_> {
 
 ```rust
 /// Result of a committed transaction.
+///
+/// Wraps L5's `CommitResult`, converting the raw `event_rx` channel
+/// into an RAII `SubscriptionHandle` for ergonomic use.
 pub enum TransactionResult {
     /// Commit succeeded.
     Success {
         commit_ts: Ts,
         /// Subscription handle (present when subscription mode != None).
+        /// Constructed by L6 from `CommitResult::Success::event_rx`.
         subscription_handle: Option<SubscriptionHandle>,
     },
     /// OCC conflict detected.
@@ -342,6 +362,29 @@ pub enum TransactionResult {
     },
     /// Replication quorum lost.
     QuorumLost,
+}
+```
+
+**Mapping from L5 `CommitResult` to L6 `TransactionResult`:**
+
+L5's `CommitResult::Success` contains `subscription_id: Option<SubscriptionId>` and
+`event_rx: Option<mpsc::Receiver<InvalidationEvent>>`. L6 wraps these into a
+`SubscriptionHandle`:
+
+```rust
+// Inside Transaction::commit():
+match commit_result {
+    CommitResult::Success { commit_ts, subscription_id, event_rx } => {
+        let handle = match (subscription_id, event_rx) {
+            (Some(id), Some(rx)) => Some(SubscriptionHandle::new(id, registry, rx)),
+            _ => None,
+        };
+        Ok(TransactionResult::Success { commit_ts, subscription_handle: handle })
+    }
+    CommitResult::Conflict { error, retry } => {
+        Ok(TransactionResult::Conflict { error, retry })
+    }
+    CommitResult::QuorumLost => Ok(TransactionResult::QuorumLost),
 }
 ```
 

@@ -167,13 +167,13 @@ impl<'db> Transaction<'db> {
 
     /// Create a collection. Returns a provisional CollectionId that can be
     /// used immediately for inserts within this same transaction.
-    pub fn create_collection(&mut self, name: &str) -> Result<CollectionId>;
+    pub fn create_collection(&mut self, name: &str) -> Result<()>;
     pub fn drop_collection(&mut self, name: &str) -> Result<()>;
 
     // --- Index Management (DDL, error if readonly) ---
 
     pub fn create_index(&mut self, collection: &str, name: &str,
-                        fields: Vec<FieldPath>) -> Result<IndexId>;
+                        fields: Vec<FieldPath>) -> Result<()>;
     pub fn drop_index(&mut self, collection: &str, name: &str) -> Result<()>;
 
     // --- Catalog reads (recorded in read set for OCC / subscriptions) ---
@@ -614,9 +614,11 @@ Collection and index management (create, drop) are transactional operations perf
 2. **Isolation**: Concurrent transactions that read the catalog (e.g., resolving a collection name for an insert) are validated against DDL commits via OCC. A transaction that read "users" exists will conflict if another transaction drops "users" concurrently.
 3. **Serialization**: All DDL flows through the `CommitCoordinator`'s single-writer loop, so catalog updates never race with each other or with data mutations.
 
-### Provisional IDs
+### Internal ID Allocation
 
-When `tx.create_collection("users")` is called, a `CollectionId` is allocated eagerly from the atomic counter and returned immediately. This allows the transaction to insert documents into the new collection before committing. On abort, the ID is simply never committed — a harmless gap in the ID sequence.
+When `tx.create_collection("users")` is called, a `CollectionId` is allocated internally from the atomic counter. The ID is **not returned to the user** — the API returns `Result<()>`. Users always reference collections and indexes by name. This avoids leaking internal identifiers and keeps the API clean.
+
+Internally, the allocated ID is stored in a `CatalogMutation::CreateCollection` in the write set. Subsequent operations in the same transaction (e.g., `tx.insert("users", ...)`) resolve the name via `write_set.resolve_pending_collection("users")` to get the internal ID. On abort, the ID is simply never committed — a harmless gap in the sequence.
 
 Within the transaction, collection name resolution checks pending `CatalogMutation::CreateCollection` entries in the write set first, then falls back to the committed `CatalogCache`.
 

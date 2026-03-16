@@ -107,17 +107,18 @@ pub struct Transaction<'db> {
 impl<'db> Transaction<'db> {
     /// Get a document by ID.
     ///
-    /// 1. Assign query_id.
-    /// 2. Resolve collection name → CollectionId (+ catalog read interval
+    /// 1. Check timeout.
+    /// 2. Assign query_id.
+    /// 3. Resolve collection name → CollectionId (+ catalog read interval
     ///    with this query_id).
-    /// 3. Check write set (read-your-writes). If found, return immediately
+    /// 4. Check write set (read-your-writes). If found, return immediately
     ///    WITHOUT recording a data read interval (DESIGN.md 5.4 — the write
     ///    set mutation subsumes any read for OCC purposes). The catalog
-    ///    read interval from step 2 is still recorded.
-    /// 4. Execute primary get via L4.
-    /// 5. Build ReadInterval (point interval, no LimitBoundary).
-    /// 6. Record in read_set.
-    /// 7. Return document or None.
+    ///    read interval from step 3 is still recorded.
+    /// 5. Execute primary get via L4.
+    /// 6. Build ReadInterval (point interval, no LimitBoundary).
+    /// 7. Record in read_set.
+    /// 8. Return document or None.
     pub async fn get(
         &mut self,
         collection: &str,
@@ -126,18 +127,21 @@ impl<'db> Transaction<'db> {
 
     /// Query documents using an index.
     ///
-    /// 1. Resolve collection name → CollectionId (+ catalog read interval).
-    /// 2. Resolve index name → IndexMeta (+ catalog read interval).
-    ///    2a. Check index state == Ready. If Building → IndexNotReady error.
-    /// 3. Validate and encode range via L4.
-    /// 4. Assign query_id.
-    /// 5. Execute scan via L4.
-    /// 6. If read-write tx: build MergeView from write_set, call merge_with_writes.
-    /// 7. Drain results, check read set size limits.
-    /// 8. Compute LimitBoundary (if limit hit and exactly N rows returned).
-    /// 9. Build ReadInterval with query_id + limit_boundary.
-    /// 10. Record in read_set.
-    /// 11. Return documents.
+    /// 1. Check timeout.
+    /// 2. Assign query_id.
+    /// 3. Resolve collection name → CollectionId (+ catalog read interval
+    ///    with this query_id).
+    /// 4. Resolve index name → IndexMeta (+ catalog read interval with
+    ///    this query_id).
+    ///    4a. Check index state == Ready. If Building → IndexNotReady error.
+    /// 5. Validate and encode range via L4.
+    /// 6. Execute scan via L4.
+    /// 7. If read-write tx: build MergeView from write_set, call merge_with_writes.
+    /// 8. Drain results, check read set size limits.
+    /// 9. Compute LimitBoundary (if limit hit and exactly N rows returned).
+    /// 10. Build ReadInterval with query_id + limit_boundary.
+    /// 11. Record in read_set.
+    /// 12. Return documents.
     pub async fn query(
         &mut self,
         collection: &str,
@@ -165,16 +169,14 @@ impl<'db> Transaction<'db> {
 impl<'db> Transaction<'db> {
     /// Insert a document. Returns the auto-generated DocId.
     ///
-    /// 1. Check readonly → error.
-    /// 2. Check timeout.
-    /// 3. Resolve collection (write-set-aware, with catalog read interval).
-    /// 4. Generate ULID → DocId.
-    /// 5. Set `_id` (ULID string) and `_created_at` (wall-clock milliseconds
-    ///    since epoch, captured once at transaction begin and reused for all
-    ///    inserts in this tx — DESIGN.md 1.11) on the document.
-    /// 6. Strip `_meta` from the body (reserved, never persisted).
-    /// 7. Check document size limit.
-    /// 8. Buffer in write_set as Insert.
+    /// 1. Check readonly + timeout.
+    /// 2. Resolve collection (write-set-aware, with catalog read interval).
+    /// 3. Generate ULID → DocId.
+    /// 4. Set `_id` (ULID string) and `_created_at` (wall-clock ms since epoch,
+    ///    captured once at `begin()` — DESIGN.md 1.11) on the document.
+    /// 5. Strip `_meta` from the body (reserved, never persisted).
+    /// 6. Check document size limit.
+    /// 7. Buffer in write_set as Insert.
     pub async fn insert(
         &mut self,
         collection: &str,
@@ -183,7 +185,7 @@ impl<'db> Transaction<'db> {
 
     /// Replace a document entirely.
     ///
-    /// 1. Check readonly.
+    /// 1. Check readonly + timeout.
     /// 2. Resolve collection.
     /// 3. Read current version (write-set first, then primary index).
     ///    Error if not found (DESIGN.md 1.8).
@@ -199,7 +201,7 @@ impl<'db> Transaction<'db> {
 
     /// Patch a document (shallow merge, DESIGN.md 1.8, 1.12.1).
     ///
-    /// 1. Check readonly.
+    /// 1. Check readonly + timeout.
     /// 2. Resolve collection.
     /// 3. Read current version (write-set first, then primary index).
     ///    Error if not found (DESIGN.md 1.8).
@@ -225,7 +227,7 @@ impl<'db> Transaction<'db> {
 
     /// Delete a document.
     ///
-    /// 1. Check readonly.
+    /// 1. Check readonly + timeout.
     /// 2. Resolve collection.
     /// 3. Verify document exists (write-set first, then primary index).
     ///    Error if not found (DESIGN.md 1.8).
@@ -468,32 +470,35 @@ If fewer than N rows are returned, the scan exhausted the range → `limit_bound
 ```
 tx.query("users", "by_age", [gte("age", 18)], None, Asc, Some(10))
   │
-  ├── 1. resolve_collection("users") → CollectionId(5)
-  │       └── CatalogTracker::record_collection_name_lookup(read_set, qid, "users")
+  ├── 1. check_timeout()
   │
-  ├── 2. resolve_index(5, "by_age") → IndexMeta { index_id: 3, fields: ["age"] }
-  │       └── CatalogTracker::record_index_name_lookup(read_set, qid, 5, "by_age")
+  ├── 2. query_id = read_set.next_query_id()
   │
-  ├── 3. L4::resolve_access → AccessMethod::IndexScan { lower, upper, ... }
+  ├── 3. resolve_collection("users") → CollectionId(5)
+  │       └── CatalogTracker::record_collection_name_lookup(read_set, query_id, "users")
   │
-  ├── 4. query_id = read_set.next_query_id()
+  ├── 4. resolve_index(5, "by_age") → IndexMeta { index_id: 3, fields: ["age"] }
+  │       └── CatalogTracker::record_index_name_lookup(read_set, query_id, 5, "by_age")
+  │       └── check index state == Ready
   │
-  ├── 5. L4::execute_scan → QueryScanStream + ReadIntervalInfo
+  ├── 5. L4::resolve_access → AccessMethod::IndexScan { lower, upper, ... }
   │
-  ├── 6. build_merge_view(CollectionId(5)) → MergeView { inserts, deletes, replaces }
+  ├── 6. L4::execute_scan → QueryScanStream + ReadIntervalInfo
   │
-  ├── 7. L4::merge_with_writes(stream, merge_view, sort_fields, range, filter, dir, limit)
+  ├── 7. build_merge_view(CollectionId(5)) → MergeView { inserts, deletes, replaces }
+  │
+  ├── 8. L4::merge_with_writes(stream, merge_view, sort_fields, range, filter, dir, limit)
   │       → Vec<ScanRow>  (merged, sorted, limit-capped)
   │
-  ├── 8. check_read_limits()
+  ├── 9. check_read_limits()
   │
-  ├── 9. compute_limit_boundary(last_row, index_meta, Asc, 10, returned_count)
-  │       → Some(LimitBoundary::Upper(last_key)) if returned_count == 10
+  ├── 10. compute_limit_boundary(last_row, index_meta, Asc, 10, returned_count)
+  │        → Some(LimitBoundary::Upper(last_key)) if returned_count == 10
   │
-  ├── 10. ReadInterval { query_id, lower, upper, limit_boundary }
+  ├── 11. ReadInterval { query_id, lower, upper, limit_boundary }
   │        └── read_set.add_interval(CollectionId(5), IndexId(3), interval)
   │
-  └── 11. Return Vec<serde_json::Value>
+  └── 12. Return Vec<serde_json::Value>
 ```
 
 ## Tests

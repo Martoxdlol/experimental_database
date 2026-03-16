@@ -122,7 +122,7 @@ pub use subscription::SubscriptionHandle;
 pub use system_database::{SystemDatabase, DatabaseMeta, DatabaseState};
 
 // Errors
-pub use error::{DatabaseError, TransactionError};
+pub use error::{DatabaseError, Result};
 
 // Re-exports from lower layers (convenience)
 pub use exdb_core::types::{CollectionId, DocId, IndexId, Ts};
@@ -284,10 +284,10 @@ pub enum DatabaseError {
     CollectionNotFound(String),
     #[error("collection already exists: {0}")]
     CollectionAlreadyExists(String),
-    #[error("index not found: {0}")]
-    IndexNotFound(String),
-    #[error("index already exists: {0}")]
-    IndexAlreadyExists(String),
+    #[error("index not found: {collection}.{index}")]
+    IndexNotFound { collection: String, index: String },
+    #[error("index already exists: {collection}.{index}")]
+    IndexAlreadyExists { collection: String, index: String },
     #[error("document not found")]
     DocNotFound,
     #[error("readonly transaction cannot write")]
@@ -298,14 +298,22 @@ pub enum DatabaseError {
     DocTooLarge { size: usize, max: usize },
     #[error("collection dropped in this transaction")]
     CollectionDropped,
-    #[error("index not ready (still building)")]
-    IndexNotReady,
+    #[error("index not ready (still building): {0}")]
+    IndexNotReady(String),
+    #[error("cannot drop system index: {0}")]
+    SystemIndex(String),
     #[error("invalid field path: {0}")]
     InvalidFieldPath(String),
+    #[error("transaction timeout")]
+    TransactionTimeout,
+    #[error("database is shutting down")]
+    ShuttingDown,
     #[error("range error: {0}")]
     Range(#[from] exdb_query::RangeError),
     #[error("commit error: {0}")]
     Commit(String),
+    #[error("replication quorum lost")]
+    QuorumLost,
 }
 
 /// Alias for Result<T, DatabaseError>.
@@ -391,5 +399,5 @@ db.close().await?;
 | `Database::storage()` | L7 (WAL streaming) | Storage access for replication |
 | `SystemDatabase` | L8 (server) | Multi-database management |
 | `SubscriptionHandle` | L8 (push to client) | RAII subscription wrapper |
-| `CommitResult`, `ConflictRetry` | L8 (session response) | Success/conflict reporting |
+| `TransactionResult`, `ConflictRetry` | L8 (session response) | Success/conflict reporting |
 | `ReplicationHook` trait | L7 (implements) | Replication callback |

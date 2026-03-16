@@ -832,6 +832,77 @@ async fn index_on_empty_collection_becomes_ready() {
     db.close().await.unwrap();
 }
 
+/// Build an index over many documents — verifies that the periodic
+/// checkpoint during build prevents BufferPoolFull by flushing dirty pages.
+/// Uses a small buffer pool (64 pages) so the test can trigger pressure
+/// without needing millions of documents.
+#[tokio::test]
+async fn index_build_with_buffer_pool_pressure() {
+    // Small buffer pool: 64 pages × 4096 bytes = 256 KB
+    let config = DatabaseConfig {
+        page_size: 4096,
+        memory_budget: 4096 * 64,
+        external_threshold: 1024,
+        ..Default::default()
+    };
+    let db = Database::open_in_memory(config, None).await.unwrap();
+
+    // Create collection
+    let mut tx = db.begin(TransactionOptions::default()).unwrap();
+    tx.create_collection("items").await.unwrap();
+    tx.commit().await.unwrap();
+
+    // Insert enough documents to generate more dirty secondary index pages
+    // than the 64-frame buffer pool can hold without flushing.
+    // Each doc produces ~1 secondary key. With ~100 keys per leaf page,
+    // 200 docs needs ~2 leaf pages. But B-tree splits and internal nodes
+    // add more. With 64 frames total (shared by primary + secondary +
+    // catalog), this is a tight fit. 500 docs should push the boundary.
+    for batch in 0..5 {
+        let mut tx = db.begin(TransactionOptions::default()).unwrap();
+        for i in 0..100 {
+            let n = batch * 100 + i;
+            tx.insert(
+                "items",
+                json!({"sku": format!("SKU-{n:05}"), "price": n}),
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    // Create an index — the background builder must handle the small pool
+    let mut tx = db.begin(TransactionOptions::default()).unwrap();
+    tx.create_index("items", "price_idx", vec![FieldPath::single("price")])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Wait for Ready — if checkpoint-during-build works, this succeeds.
+    // If dirty pages fill the pool, build() returns BufferPoolFull and the
+    // index stays Building forever → test times out.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let mut tx = db.begin(TransactionOptions::readonly()).unwrap();
+        let indexes = tx.list_indexes("items").unwrap();
+        tx.rollback();
+
+        if indexes
+            .iter()
+            .any(|i| i.name == "price_idx" && i.state == exdb::IndexState::Ready)
+        {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("index build did not complete — possible BufferPoolFull");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    db.close().await.unwrap();
+}
+
 /// Building indexes are dropped on restart (D3 crash recovery policy).
 #[tokio::test]
 async fn building_index_dropped_on_restart() {

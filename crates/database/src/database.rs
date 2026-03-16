@@ -326,8 +326,33 @@ impl Database {
                         idx_meta.field_paths.clone(),
                     );
 
-                    match builder.build(build_ts, None).await {
+                    // Use progress channel to trigger periodic checkpoints
+                    // during long builds, flushing dirty pages so the buffer
+                    // pool doesn't fill up.
+                    let (progress_tx, mut progress_rx) =
+                        tokio::sync::watch::channel(exdb_docstore::index_builder::BuildProgress {
+                            docs_scanned: 0,
+                            entries_inserted: 0,
+                            elapsed_ms: 0,
+                        });
+                    let checkpoint_storage = Arc::clone(&storage);
+                    let checkpoint_shutdown = shutdown.clone();
+                    let checkpoint_task = tokio::task::spawn_local(async move {
+                        while progress_rx.changed().await.is_ok() {
+                            if checkpoint_shutdown.is_cancelled() {
+                                break;
+                            }
+                            // Checkpoint every progress report (every 1000 docs)
+                            // to flush dirty secondary index pages.
+                            if let Err(e) = checkpoint_storage.checkpoint().await {
+                                tracing::warn!("index build checkpoint failed: {e}");
+                            }
+                        }
+                    });
+
+                    match builder.build(build_ts, Some(progress_tx)).await {
                         Ok(entries) => {
+                            checkpoint_task.abort();
                             tracing::info!(
                                 "index {:?} ({}) built: {} entries",
                                 idx_meta.index_id, idx_meta.name, entries,
@@ -369,6 +394,7 @@ impl Database {
                             );
                         }
                         Err(e) => {
+                            checkpoint_task.abort();
                             tracing::error!(
                                 "index build failed for {:?} ({}): {e}",
                                 idx_meta.index_id, idx_meta.name,

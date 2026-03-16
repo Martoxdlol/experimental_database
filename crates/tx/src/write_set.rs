@@ -127,7 +127,7 @@ pub trait IndexResolver: Send + Sync {
 /// This means `CreateCollection` is processed before `CreateIndex` for
 /// the `_created_at` auto-index, so the primary index exists when the
 /// secondary index is created.
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 pub trait CatalogMutationHandler: Send + Sync {
     /// Handle a CreateCollection mutation.
     ///
@@ -169,7 +169,7 @@ pub trait CatalogMutationHandler: Send + Sync {
 /// No-op catalog mutation handler (for tests without catalog support).
 pub struct NoOpCatalogHandler;
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl CatalogMutationHandler for NoOpCatalogHandler {
     async fn handle_create_collection(&self, _: CollectionId, _: &str) -> std::io::Result<()> {
         Ok(())

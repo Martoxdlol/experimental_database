@@ -548,6 +548,14 @@ impl ReplicationRunner {
 
             // ── Step 8: Advance visible_ts ──
             self.visible_ts.store(entry.commit_ts, Ordering::Release);
+
+            // Persist visible_ts in FileHeader so it survives checkpoint + reopen
+            let commit_ts = entry.commit_ts;
+            if let Err(e) = self.storage.update_file_header(|fh| {
+                fh.visible_ts.set(commit_ts);
+            }).await {
+                tracing::error!("failed to persist visible_ts to file header: {e}");
+            }
         }
 
         // ── Step 9: Subscription Invalidation Check ──

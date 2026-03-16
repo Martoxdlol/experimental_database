@@ -12,6 +12,7 @@ pub mod index_resolver;
 pub mod catalog_tracker;
 pub mod catalog_recovery;
 pub mod catalog_mutation_handler;
+pub mod catalog_persistence;
 pub mod transaction;
 pub mod database;
 pub mod subscription;

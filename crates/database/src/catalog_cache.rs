@@ -63,6 +63,12 @@ impl CatalogCache {
         }
     }
 
+    /// Set the next ID counters (used during recovery from FileHeader).
+    pub fn set_next_ids(&self, next_collection_id: u64, next_index_id: u64) {
+        self.next_collection_id.store(next_collection_id, Ordering::Relaxed);
+        self.next_index_id.store(next_index_id, Ordering::Relaxed);
+    }
+
     // ── By Name ──
 
     pub fn get_collection_by_name(&self, name: &str) -> Option<&CollectionMeta> {

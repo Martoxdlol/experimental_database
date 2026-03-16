@@ -9,21 +9,26 @@ use std::sync::Arc;
 use exdb_core::field_path::FieldPath;
 use exdb_core::types::{CollectionId, IndexId};
 use exdb_docstore::{PrimaryIndex, SecondaryIndex};
-use exdb_storage::engine::StorageEngine;
+use exdb_storage::engine::{BTreeHandle, StorageEngine};
 use exdb_tx::CatalogMutationHandler;
 use parking_lot::RwLock;
 
 use crate::catalog_cache::{CatalogCache, CollectionMeta, IndexMeta, IndexState};
+use crate::catalog_persistence;
 
 /// L6 implementation of L5's `CatalogMutationHandler`.
 ///
 /// Holds shared references to all the state it needs to update:
-/// storage (for B-tree creation), catalog cache, and index handle maps.
+/// storage (for B-tree creation), catalog cache, index handle maps,
+/// and the persistent catalog B-tree.
 pub(crate) struct CatalogMutationHandlerImpl {
     storage: Arc<StorageEngine>,
     catalog: Arc<RwLock<CatalogCache>>,
     primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
     secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
+    /// The catalog B-tree (rooted at FileHeader::catalog_root_page).
+    /// `None` for in-memory databases (no persistence needed).
+    catalog_btree: Option<Arc<BTreeHandle>>,
 }
 
 impl CatalogMutationHandlerImpl {
@@ -32,17 +37,19 @@ impl CatalogMutationHandlerImpl {
         catalog: Arc<RwLock<CatalogCache>>,
         primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
         secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
+        catalog_btree: Option<Arc<BTreeHandle>>,
     ) -> Self {
         Self {
             storage,
             catalog,
             primary_indexes,
             secondary_indexes,
+            catalog_btree,
         }
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl CatalogMutationHandler for CatalogMutationHandlerImpl {
     async fn handle_create_collection(
         &self,
@@ -64,15 +71,29 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
             .write()
             .insert(collection_id, Arc::clone(&primary));
 
-        // Update catalog cache
-        let mut catalog = self.catalog.write();
-        if catalog.get_collection_by_id(collection_id).is_none() {
-            catalog.add_collection(CollectionMeta {
-                collection_id,
-                name: name.to_string(),
-                primary_root_page: root_page,
-                doc_count: 0,
-            });
+        // Update catalog cache (scoped to drop guard before any .await)
+        {
+            let mut catalog = self.catalog.write();
+            if catalog.get_collection_by_id(collection_id).is_none() {
+                catalog.add_collection(CollectionMeta {
+                    collection_id,
+                    name: name.to_string(),
+                    primary_root_page: root_page,
+                    doc_count: 0,
+                });
+            }
+        }
+
+        // Persist to catalog B-tree
+        if let Some(cat_btree) = &self.catalog_btree {
+            catalog_persistence::write_collection(cat_btree, collection_id, name, root_page)
+                .await?;
+            self.storage.update_file_header(|fh| {
+                let current = fh.next_collection_id.get();
+                if collection_id.0 >= current {
+                    fh.next_collection_id.set(collection_id.0 + 1);
+                }
+            }).await?;
         }
 
         Ok(())
@@ -82,21 +103,32 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
         &self,
         collection_id: CollectionId,
     ) -> std::io::Result<()> {
-        // Remove from catalog (cascades indexes)
-        let mut catalog = self.catalog.write();
-        let indexes: Vec<IndexId> = catalog
-            .list_indexes(collection_id)
-            .iter()
-            .map(|m| m.index_id)
-            .collect();
-        catalog.remove_collection(collection_id);
-        drop(catalog);
+        // Remove from catalog + index handles (scoped to avoid !Send across .await)
+        let indexes: Vec<IndexId> = {
+            let mut catalog = self.catalog.write();
+            let ids: Vec<IndexId> = catalog
+                .list_indexes(collection_id)
+                .iter()
+                .map(|m| m.index_id)
+                .collect();
+            catalog.remove_collection(collection_id);
+            ids
+        };
 
-        // Remove index handles
-        self.primary_indexes.write().remove(&collection_id);
-        let mut sec = self.secondary_indexes.write();
-        for idx_id in indexes {
-            sec.remove(&idx_id);
+        {
+            self.primary_indexes.write().remove(&collection_id);
+            let mut sec = self.secondary_indexes.write();
+            for idx_id in &indexes {
+                sec.remove(idx_id);
+            }
+        }
+
+        // Remove from persistent catalog
+        if let Some(cat_btree) = &self.catalog_btree {
+            catalog_persistence::remove_collection(cat_btree, collection_id).await?;
+            for idx_id in &indexes {
+                catalog_persistence::remove_index(cat_btree, *idx_id).await?;
+            }
         }
 
         Ok(())
@@ -113,28 +145,44 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
         let btree = self.storage.create_btree().await?;
         let root_page = btree.root_page();
 
-        // Get the primary index for this collection (must exist already)
-        let primary = {
-            let primaries = self.primary_indexes.read();
-            primaries.get(&collection_id).cloned()
-        };
-
-        if let Some(primary) = primary {
-            let secondary = Arc::new(SecondaryIndex::new(btree, primary));
-            self.secondary_indexes.write().insert(index_id, secondary);
+        // Get primary + register secondary (scoped to avoid !Send across .await)
+        {
+            let primary = {
+                let primaries = self.primary_indexes.read();
+                primaries.get(&collection_id).cloned()
+            };
+            if let Some(primary) = primary {
+                let secondary = Arc::new(SecondaryIndex::new(btree, primary));
+                self.secondary_indexes.write().insert(index_id, secondary);
+            }
         }
 
         // Update catalog cache
-        let mut catalog = self.catalog.write();
-        if catalog.get_index_by_id(index_id).is_none() {
-            catalog.add_index(IndexMeta {
-                index_id,
-                collection_id,
-                name: name.to_string(),
-                field_paths: field_paths.to_vec(),
-                root_page,
-                state: IndexState::Ready,
-            });
+        {
+            let mut catalog = self.catalog.write();
+            if catalog.get_index_by_id(index_id).is_none() {
+                catalog.add_index(IndexMeta {
+                    index_id,
+                    collection_id,
+                    name: name.to_string(),
+                    field_paths: field_paths.to_vec(),
+                    root_page,
+                    state: IndexState::Ready,
+                });
+            }
+        }
+
+        // Persist to catalog B-tree
+        if let Some(cat_btree) = &self.catalog_btree {
+            catalog_persistence::write_index(
+                cat_btree, index_id, collection_id, name, field_paths, root_page,
+            ).await?;
+            self.storage.update_file_header(|fh| {
+                let current = fh.next_index_id.get();
+                if index_id.0 >= current {
+                    fh.next_index_id.set(index_id.0 + 1);
+                }
+            }).await?;
         }
 
         Ok(())
@@ -144,8 +192,16 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
         &self,
         index_id: IndexId,
     ) -> std::io::Result<()> {
-        self.catalog.write().remove_index(index_id);
-        self.secondary_indexes.write().remove(&index_id);
+        {
+            self.catalog.write().remove_index(index_id);
+            self.secondary_indexes.write().remove(&index_id);
+        }
+
+        // Remove from persistent catalog
+        if let Some(cat_btree) = &self.catalog_btree {
+            catalog_persistence::remove_index(cat_btree, index_id).await?;
+        }
+
         Ok(())
     }
 }
@@ -174,6 +230,7 @@ mod tests {
             Arc::clone(&catalog),
             Arc::clone(&primaries),
             Arc::clone(&secondaries),
+            None, // no persistent catalog for tests
         );
         (handler, catalog, primaries, secondaries)
     }

@@ -8,7 +8,10 @@ use exdb::{
     Database, DatabaseConfig, DatabaseError, DocId, FieldPath, Filter,
     RangeExpr, ScanDirection, TransactionOptions, TransactionResult,
 };
+use exdb_core::encoding::decode_document;
+use exdb_docstore::PrimaryIndex;
 use serde_json::Value;
+use tokio_stream::StreamExt;
 
 #[allow(dead_code)]
 /// High-level database handle for the studio UI.
@@ -94,6 +97,39 @@ impl L6Handle {
             .await?;
         tx.rollback();
         Ok(docs)
+    }
+
+    /// Scan documents with their DocIds (for edit/delete operations).
+    /// Uses the primary index directly to get (DocId, decoded body) pairs.
+    pub async fn scan_with_ids(
+        &self,
+        collection: &str,
+        direction: ScanDirection,
+        limit: usize,
+    ) -> Result<Vec<(DocId, Value)>, DatabaseError> {
+        let meta = self.db.get_collection(collection)
+            .ok_or_else(|| DatabaseError::CollectionNotFound(collection.to_string()))?;
+
+        let storage = self.db.storage();
+        let config = self.db.config();
+        let btree = storage.open_btree(meta.primary_root_page);
+        let primary = PrimaryIndex::new(btree, Arc::clone(storage), config.external_threshold);
+
+        let read_ts = self.db.commit_handle().visible_ts();
+        let read_ts = if read_ts == 0 { u64::MAX } else { read_ts };
+
+        let mut stream = primary.scan_at_ts(read_ts, direction);
+        let mut results = Vec::new();
+        while let Some(item) = stream.next().await {
+            let (doc_id, _ts, body_bytes) = item.map_err(DatabaseError::Storage)?;
+            let doc = decode_document(&body_bytes)
+                .map_err(|e| DatabaseError::Commit(format!("decode: {e}")))?;
+            results.push((doc_id, doc));
+            if results.len() >= limit {
+                break;
+            }
+        }
+        Ok(results)
     }
 
     // ─── Document Writes ───

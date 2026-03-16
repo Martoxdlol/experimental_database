@@ -291,29 +291,40 @@ impl CatalogPersistence {
 
         // Re-serialize the full index entry to the ID B-tree
         if let Some(meta) = cache.get_index(index_id) {
-            let field_paths: Vec<Vec<String>> = meta
-                .field_paths
-                .iter()
-                .map(|fp| fp.segments().iter().map(|s| s.to_string()).collect())
-                .collect();
-            let entry = IndexEntry {
-                index_id: meta.index_id.0,
-                collection_id: meta.collection_id.0,
-                name: meta.name.clone(),
-                field_paths,
-                root_page: meta.root_page,
-                state: CatalogIndexState::Ready,
-                index_type: IndexType::BTree,
-                aux_root_pages: vec![],
-                config: vec![],
-            };
-
-            let id_key =
-                catalog_btree::make_catalog_id_key(CatalogEntityType::Index, index_id.0);
-            let id_value = catalog_btree::serialize_index(&entry);
-            id_btree.insert(&id_key, &id_value).await?;
+            Self::apply_index_ready_btree(id_btree, meta).await?;
         }
 
+        Ok(())
+    }
+
+    /// Write the Ready state to the durable B-tree only (no cache update).
+    /// Used by the background index builder where the cache update must happen
+    /// outside the async call to avoid holding a parking_lot guard across .await.
+    pub async fn apply_index_ready_btree(
+        id_btree: &BTreeHandle,
+        meta: &IndexMeta,
+    ) -> std::io::Result<()> {
+        let field_paths: Vec<Vec<String>> = meta
+            .field_paths
+            .iter()
+            .map(|fp| fp.segments().iter().map(|s| s.to_string()).collect())
+            .collect();
+        let entry = IndexEntry {
+            index_id: meta.index_id.0,
+            collection_id: meta.collection_id.0,
+            name: meta.name.clone(),
+            field_paths,
+            root_page: meta.root_page,
+            state: CatalogIndexState::Ready,
+            index_type: IndexType::BTree,
+            aux_root_pages: vec![],
+            config: vec![],
+        };
+
+        let id_key =
+            catalog_btree::make_catalog_id_key(CatalogEntityType::Index, meta.index_id.0);
+        let id_value = catalog_btree::serialize_index(&entry);
+        id_btree.insert(&id_key, &id_value).await?;
         Ok(())
     }
 }

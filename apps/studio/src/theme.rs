@@ -1078,6 +1078,284 @@ body {
     margin-bottom: 8px;
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+   Collection Detail — full-bleed layout
+   ═══════════════════════════════════════════════════════════════════ */
+
+.collection-detail {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    overflow: hidden;
+    min-height: 0;
+}
+
+.collection-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 12px;
+    height: 36px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+.collection-bar-name {
+    font-weight: 600;
+    font-size: 13px;
+    margin-right: 12px;
+}
+
+.collection-bar-tabs {
+    display: flex;
+    gap: 0;
+    height: 100%;
+}
+
+.bar-tab {
+    display: flex;
+    align-items: center;
+    padding: 0 14px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.1s;
+    user-select: none;
+}
+
+.bar-tab:hover { color: var(--text-primary); }
+.bar-tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   Studio Data Grid — full-screen table (Prisma/Beekeeper style)
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* Outer panel — fills all remaining space */
+.grid-panel {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+
+/* Compact toolbar */
+.grid-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 12px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    height: 36px;
+}
+
+.grid-toolbar-left,
+.grid-toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.grid-toolbar-sep {
+    width: 1px;
+    height: 18px;
+    background: var(--border);
+}
+
+.grid-status {
+    font-size: 11px;
+    color: var(--text-secondary);
+    padding: 0 4px;
+}
+
+/* Toolbar buttons */
+.grid-btn {
+    padding: 3px 10px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 11px;
+    transition: all 0.1s;
+}
+
+.grid-btn:hover { background: var(--bg-tertiary); }
+.grid-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.grid-btn:disabled:hover { background: transparent; }
+.grid-btn.accent { border-color: var(--accent); color: var(--accent); }
+.grid-btn.accent:hover { background: var(--accent); color: #fff; }
+.grid-btn.active { background: var(--bg-tertiary); }
+
+.grid-select {
+    padding: 3px 6px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 11px;
+}
+
+/* Insert bar */
+.grid-insert-bar {
+    padding: 8px 12px;
+    background: var(--bg-primary);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+.grid-insert-editor {
+    width: 100%;
+    padding: 6px 8px;
+    font-family: inherit;
+    font-size: 12px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    resize: none;
+    tab-size: 2;
+    margin-bottom: 6px;
+}
+
+.grid-insert-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* Scrollable grid area — fills all remaining space */
+.grid-scroll {
+    flex: 1;
+    overflow: auto;
+    min-height: 0;
+}
+
+.grid-empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-secondary);
+    font-size: 14px;
+}
+
+/* The grid table */
+.studio-grid {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    table-layout: auto;
+}
+
+.studio-grid thead {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+}
+
+.studio-grid thead th {
+    background: var(--bg-secondary);
+    padding: 6px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-align: left;
+    border-bottom: 2px solid var(--border);
+    white-space: nowrap;
+    user-select: none;
+}
+
+/* Row number gutter */
+.grid-row-num {
+    width: 48px;
+    min-width: 48px;
+    max-width: 48px;
+    text-align: center !important;
+    color: var(--text-secondary) !important;
+    font-size: 11px !important;
+    cursor: pointer;
+    user-select: none;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border);
+    padding: 4px 0 !important;
+}
+
+/* Actions column */
+.grid-actions-col { width: 36px; min-width: 36px; }
+.grid-actions-cell {
+    width: 36px;
+    text-align: center;
+    padding: 2px !important;
+    opacity: 0;
+    transition: opacity 0.1s;
+}
+.grid-row:hover .grid-actions-cell { opacity: 1; }
+
+.btn-icon {
+    width: 22px; height: 22px;
+    border: none; background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer; border-radius: 3px;
+    font-size: 12px;
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: all 0.1s;
+}
+.btn-icon:hover { background: var(--bg-tertiary); color: var(--text-primary); }
+.btn-icon-danger:hover { background: #3d2a2a; color: var(--write-danger); }
+
+/* Data rows */
+.grid-row { transition: background 0.05s; }
+.grid-row:hover { background: rgba(122, 162, 247, 0.04); }
+.grid-row.expanded { background: rgba(122, 162, 247, 0.08); }
+.grid-row:hover .grid-row-num {
+    color: var(--accent) !important;
+    background: rgba(122, 162, 247, 0.06);
+}
+
+/* Data cells */
+.grid-cell {
+    padding: 4px 12px;
+    font-size: 12px;
+    border-bottom: 1px solid var(--border);
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: default;
+}
+.grid-cell:hover { background: rgba(122, 162, 247, 0.06); }
+.null-cell .cell-text { color: var(--text-secondary); font-style: italic; font-size: 11px; }
+
+/* Editing */
+.grid-cell.editing { padding: 0; background: var(--bg-primary); border: 2px solid var(--accent); }
+.grid-cell-input {
+    width: 100%; padding: 3px 10px;
+    border: none; background: transparent;
+    color: var(--text-primary); font-family: inherit; font-size: 12px; outline: none;
+}
+
+/* Expanded detail */
+.grid-detail-row td { padding: 0 !important; border-bottom: 2px solid var(--accent); }
+.row-detail {
+    padding: 8px 12px 8px 60px;
+    background: var(--bg-secondary);
+}
+.row-detail .doc-json { margin: 0; max-height: 300px; font-size: 11px; }
+
+/* Column header */
+.grid-col-header { position: relative; }
+
 /* Event Log */
 .event-log {
     max-height: 300px;

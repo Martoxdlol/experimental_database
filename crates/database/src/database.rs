@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use exdb_core::types::{CollectionId, IndexId};
-use exdb_docstore::{PrimaryIndex, SecondaryIndex};
+use exdb_docstore::{IndexBuilder, PrimaryIndex, SecondaryIndex};
 use exdb_storage::engine::StorageEngine;
+use exdb_storage::wal::WAL_RECORD_INDEX_READY;
 use exdb_tx::{
     CommitCoordinator, CommitHandle, NoReplication, ReplicationHook,
     SubscriptionRegistry,
@@ -18,8 +19,9 @@ use exdb_tx::{
 use parking_lot::RwLock;
 use tokio_util::task::LocalPoolHandle;
 
-use crate::catalog_cache::CatalogCache;
+use crate::catalog_cache::{CatalogCache, IndexMeta, IndexState};
 use crate::catalog_mutation_handler::CatalogMutationHandlerImpl;
+use crate::catalog_persistence::CatalogPersistence;
 use crate::catalog_recovery::DatabaseRecoveryHandler;
 use crate::config::DatabaseConfig;
 use crate::error::{DatabaseError, Result};
@@ -45,6 +47,7 @@ pub struct Database {
     _coordinator_pool: LocalPoolHandle,
     _runner_handle: Option<tokio::task::JoinHandle<()>>,
     _checkpoint_handle: Option<tokio::task::JoinHandle<()>>,
+    _index_builder_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Database {
@@ -57,19 +60,13 @@ impl Database {
         let path = path.as_ref().to_path_buf();
         let storage_config = config.to_storage_config();
 
-        // Create storage engine with recovery handler
         let storage = Arc::new(
             StorageEngine::open(&path, storage_config, &mut exdb_storage::recovery::NoOpHandler)
                 .await?,
         );
 
-        // Run L6 recovery
         let recovery_handler =
             DatabaseRecoveryHandler::new(Arc::clone(&storage)).await?;
-
-        // WAL replay (records after checkpoint are already replayed by StorageEngine::open,
-        // but we need to re-open and replay for L6 state. For file-backed, the WAL was already
-        // replayed by the storage engine — DatabaseRecoveryHandler picks up from catalog B-trees.)
 
         let state = recovery_handler.into_state();
 
@@ -125,13 +122,37 @@ impl Database {
         config: DatabaseConfig,
         path: Option<PathBuf>,
         storage: Arc<StorageEngine>,
-        catalog: CatalogCache,
+        mut catalog: CatalogCache,
         primary_indexes: HashMap<CollectionId, Arc<PrimaryIndex>>,
-        secondary_indexes: HashMap<IndexId, Arc<SecondaryIndex>>,
+        mut secondary_indexes: HashMap<IndexId, Arc<SecondaryIndex>>,
         recovered_ts: u64,
         visible_ts: u64,
         replication: Option<Box<dyn ReplicationHook>>,
     ) -> Result<Self> {
+        // ── Drop Building indexes from prior crash (D3) ──
+        // Building indexes are incomplete — drop them so users can recreate.
+        // Partial B-tree pages are orphaned but harmless.
+        let building = catalog.building_indexes();
+        if !building.is_empty() {
+            let fh = storage.file_header().await;
+            let id_btree = storage.open_btree(fh.catalog_root_page.get());
+            let name_btree = storage.open_btree(fh.catalog_name_root_page.get());
+            for idx in &building {
+                tracing::info!(
+                    "dropping incomplete Building index {:?} ({}) on collection {:?}",
+                    idx.index_id, idx.name, idx.collection_id,
+                );
+                secondary_indexes.remove(&idx.index_id);
+                CatalogPersistence::apply_drop_index(
+                    &id_btree,
+                    &name_btree,
+                    &mut catalog,
+                    idx.index_id,
+                )
+                .await?;
+            }
+        }
+
         let catalog = Arc::new(RwLock::new(catalog));
         let primary_indexes = Arc::new(RwLock::new(primary_indexes));
         let secondary_indexes = Arc::new(RwLock::new(secondary_indexes));
@@ -165,8 +186,8 @@ impl Database {
             replication_hook,
             index_resolver,
             catalog_handler,
-            256,  // channel_size
-            256,  // replication_queue_size
+            256,
+            256,
         );
 
         // Spawn coordinator on LocalSet (CommitCoordinator is !Send)
@@ -198,6 +219,25 @@ impl Database {
             }
         });
 
+        // Spawn index builder task on LocalSet (B-tree ops hold parking_lot
+        // guards across .await, same as CommitCoordinator)
+        let builder_storage = Arc::clone(&storage);
+        let builder_catalog = Arc::clone(&catalog);
+        let builder_primaries = Arc::clone(&primary_indexes);
+        let builder_secondaries = Arc::clone(&secondary_indexes);
+        let builder_commit = commit_handle.clone();
+        let builder_shutdown = shutdown.clone();
+        let builder_handle = coordinator_pool.spawn_pinned(move || {
+            Self::index_builder_loop(
+                builder_storage,
+                builder_catalog,
+                builder_primaries,
+                builder_secondaries,
+                builder_commit,
+                builder_shutdown,
+            )
+        });
+
         Ok(Database {
             name,
             config,
@@ -212,8 +252,133 @@ impl Database {
             _coordinator_pool: coordinator_pool,
             _runner_handle: Some(runner_handle),
             _checkpoint_handle: Some(checkpoint_handle),
+            _index_builder_handle: Some(builder_handle),
         })
     }
+
+    /// Background index builder loop.
+    ///
+    /// Polls for indexes in `Building` state and builds them by scanning the
+    /// primary index. On completion, writes `WAL_RECORD_INDEX_READY` and
+    /// transitions the index to `Ready`.
+    ///
+    /// Runs on a `LocalSet` because B-tree operations hold parking_lot guards
+    /// across `.await` points (same as CommitCoordinator).
+    async fn index_builder_loop(
+        storage: Arc<StorageEngine>,
+        catalog: Arc<RwLock<CatalogCache>>,
+        primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
+        secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
+        commit_handle: CommitHandle,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        loop {
+                // Poll every 100ms for new Building indexes
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    _ = shutdown.cancelled() => break,
+                }
+
+                // Find all Building indexes
+                let building: Vec<IndexMeta> = catalog.read().building_indexes();
+                if building.is_empty() {
+                    continue;
+                }
+
+                for idx_meta in building {
+                    if shutdown.is_cancelled() {
+                        break;
+                    }
+
+                    // Get handles — clone Arcs, drop guards immediately
+                    let primary = primary_indexes
+                        .read()
+                        .get(&idx_meta.collection_id)
+                        .cloned();
+                    let secondary = secondary_indexes
+                        .read()
+                        .get(&idx_meta.index_id)
+                        .cloned();
+
+                    let (primary, secondary) = match (primary, secondary) {
+                        (Some(p), Some(s)) => (p, s),
+                        _ => {
+                            tracing::warn!(
+                                "index builder: missing handles for {:?}, skipping",
+                                idx_meta.index_id,
+                            );
+                            continue;
+                        }
+                    };
+
+                    // Snapshot timestamp: use current visible_ts
+                    let build_ts = commit_handle.visible_ts();
+
+                    tracing::info!(
+                        "building index {:?} ({}) on collection {:?} at ts={}",
+                        idx_meta.index_id, idx_meta.name,
+                        idx_meta.collection_id, build_ts,
+                    );
+
+                    let builder = IndexBuilder::new(
+                        primary,
+                        secondary,
+                        idx_meta.field_paths.clone(),
+                    );
+
+                    match builder.build(build_ts, None).await {
+                        Ok(entries) => {
+                            tracing::info!(
+                                "index {:?} ({}) built: {} entries",
+                                idx_meta.index_id, idx_meta.name, entries,
+                            );
+
+                            // Write WAL_RECORD_INDEX_READY
+                            let payload = idx_meta.index_id.0.to_le_bytes();
+                            if let Err(e) = storage
+                                .append_wal(WAL_RECORD_INDEX_READY, &payload)
+                                .await
+                            {
+                                tracing::error!(
+                                    "failed to write INDEX_READY WAL for {:?}: {e}",
+                                    idx_meta.index_id,
+                                );
+                                continue;
+                            }
+
+                            // Transition Building → Ready.
+                            // 1. Write to durable B-tree (async, no guard held)
+                            let fh = storage.file_header().await;
+                            let id_btree = storage.open_btree(fh.catalog_root_page.get());
+                            if let Err(e) = CatalogPersistence::apply_index_ready_btree(
+                                &id_btree,
+                                &idx_meta,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    "failed to mark index {:?} as Ready in B-tree: {e}",
+                                    idx_meta.index_id,
+                                );
+                                continue;
+                            }
+                            // 2. Update in-memory cache (sync, guard dropped immediately)
+                            catalog.write().set_index_state(
+                                idx_meta.index_id,
+                                IndexState::Ready,
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "index build failed for {:?} ({}): {e}",
+                                idx_meta.index_id, idx_meta.name,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
 
     /// Close the database gracefully.
     pub async fn close(self) -> Result<()> {

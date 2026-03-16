@@ -156,11 +156,13 @@ fn CollectionDetail(name: String) -> Element {
     let mut state = use_context::<AppState>();
     let view = *state.collection_view.read();
 
+    // Full-bleed layout — no .main-content wrapper, fills the entire content area
     rsx! {
-        div { class: "main-content",
-            div { class: "collection-header",
+        div { class: "collection-detail",
+            // Compact header bar
+            div { class: "collection-bar",
                 button {
-                    class: "btn btn-small",
+                    class: "grid-btn",
                     onclick: move |_| {
                         state.selected_collection.set(None);
                         state.breadcrumb.set(vec![
@@ -168,25 +170,30 @@ fn CollectionDetail(name: String) -> Element {
                             "Collections".to_string(),
                         ]);
                     },
-                    "\u{2190} Back"
+                    "\u{2190}"
                 }
-                h3 { class: "collection-title", "{name}" }
+                span { class: "collection-bar-name", "{name}" }
+                div { class: "collection-bar-tabs",
+                    div {
+                        class: if view == CollectionView::Documents { "bar-tab active" } else { "bar-tab" },
+                        onclick: move |_| state.collection_view.set(CollectionView::Documents),
+                        "Data"
+                    }
+                    div {
+                        class: if view == CollectionView::Indexes { "bar-tab active" } else { "bar-tab" },
+                        onclick: move |_| state.collection_view.set(CollectionView::Indexes),
+                        "Indexes"
+                    }
+                }
             }
-            div { class: "tab-bar",
-                div {
-                    class: if view == CollectionView::Documents { "tab active" } else { "tab" },
-                    onclick: move |_| state.collection_view.set(CollectionView::Documents),
-                    "Documents"
-                }
-                div {
-                    class: if view == CollectionView::Indexes { "tab active" } else { "tab" },
-                    onclick: move |_| state.collection_view.set(CollectionView::Indexes),
-                    "Indexes"
-                }
-            }
+            // Content fills remaining space
             match view {
                 CollectionView::Documents => rsx! { DocumentExplorer { collection: name.clone() } },
-                CollectionView::Indexes => rsx! { IndexManager { collection: name.clone() } },
+                CollectionView::Indexes => rsx! {
+                    div { class: "main-content",
+                        IndexManager { collection: name.clone() }
+                    }
+                },
             }
         }
     }

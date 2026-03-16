@@ -137,6 +137,15 @@ impl CatalogCache {
             .collect()
     }
 
+    /// List all indexes across all collections that are in Building state.
+    pub fn building_indexes(&self) -> Vec<IndexMeta> {
+        self.indexes
+            .values()
+            .filter(|m| m.state == IndexState::Building)
+            .cloned()
+            .collect()
+    }
+
     // ─── Mutations ───
 
     /// Allocate a new collection ID.

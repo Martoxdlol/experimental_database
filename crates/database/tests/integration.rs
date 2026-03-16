@@ -712,3 +712,172 @@ async fn list_collections_in_transaction() {
     tx.rollback();
     db.close().await.unwrap();
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Index Building Lifecycle Tests
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Create an index on a populated collection: it should transition from
+/// Building to Ready in the background, then be queryable.
+#[tokio::test]
+async fn index_builder_completes() {
+    let db = open_test_db().await;
+    create_users_collection(&db).await;
+
+    // Insert documents first
+    let mut tx = db.begin(TransactionOptions::default()).unwrap();
+    for i in 0..5 {
+        tx.insert("users", json!({"name": format!("User{i}"), "age": 20 + i}))
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    // Create index — starts in Building state
+    let mut tx = db.begin(TransactionOptions::default()).unwrap();
+    tx.create_index("users", "age_idx", vec![FieldPath::single("age")])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Wait for the background builder to transition it to Ready.
+    // Poll up to 5 seconds.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut tx = db.begin(TransactionOptions::readonly()).unwrap();
+        let indexes = tx.list_indexes("users").unwrap();
+        tx.rollback();
+
+        let age_idx = indexes.iter().find(|i| i.name == "age_idx");
+        if let Some(idx) = age_idx {
+            if idx.state == exdb::IndexState::Ready {
+                break;
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!("index builder did not complete within 5 seconds");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    db.close().await.unwrap();
+}
+
+/// Query a Building index returns IndexNotReady.
+#[tokio::test]
+async fn query_building_index_returns_error() {
+    let db = open_test_db().await;
+    create_users_collection(&db).await;
+
+    // Create index
+    let mut tx = db.begin(TransactionOptions::default()).unwrap();
+    tx.create_index("users", "age_idx", vec![FieldPath::single("age")])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Immediately try to query — might still be Building
+    // (This test is best-effort: the builder could be very fast.
+    //  We just verify the error path exists.)
+    let mut tx = db.begin(TransactionOptions::readonly()).unwrap();
+    let result = tx
+        .query("users", "age_idx", &[], None, None, None)
+        .await;
+    // Either IndexNotReady (still building) or success (already built) is ok
+    match result {
+        Err(DatabaseError::IndexNotReady(_)) => { /* expected if builder hasn't finished */ }
+        Ok(_) => { /* builder already finished — also fine */ }
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+    tx.rollback();
+    db.close().await.unwrap();
+}
+
+/// Create index on empty collection — builds instantly, becomes Ready.
+#[tokio::test]
+async fn index_on_empty_collection_becomes_ready() {
+    let db = open_test_db().await;
+    create_users_collection(&db).await;
+
+    let mut tx = db.begin(TransactionOptions::default()).unwrap();
+    tx.create_index("users", "age_idx", vec![FieldPath::single("age")])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    // Wait for Ready
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let mut tx = db.begin(TransactionOptions::readonly()).unwrap();
+        let indexes = tx.list_indexes("users").unwrap();
+        tx.rollback();
+
+        if indexes.iter().any(|i| i.name == "age_idx" && i.state == exdb::IndexState::Ready) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("index builder did not complete within 5 seconds");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    // Now insert and verify the index works (doesn't error)
+    let mut tx = db.begin(TransactionOptions::default()).unwrap();
+    tx.insert("users", json!({"name": "Alice", "age": 30}))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    db.close().await.unwrap();
+}
+
+/// Building indexes are dropped on restart (D3 crash recovery policy).
+#[tokio::test]
+async fn building_index_dropped_on_restart() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("testdb");
+
+    // Create collection + index, then close BEFORE the builder finishes.
+    // We can't easily guarantee the builder hasn't finished, so we create
+    // the index and close immediately.
+    {
+        let db = Database::open(&path, DatabaseConfig::default(), None)
+            .await
+            .unwrap();
+        let mut tx = db.begin(TransactionOptions::default()).unwrap();
+        tx.create_collection("users").await.unwrap();
+        tx.commit().await.unwrap();
+
+        let mut tx = db.begin(TransactionOptions::default()).unwrap();
+        tx.create_index("users", "age_idx", vec![FieldPath::single("age")])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        db.close().await.unwrap();
+    }
+
+    // Reopen — the index should either be Ready (if builder finished before
+    // close) or gone (if it was still Building and got dropped per D3).
+    {
+        let db = Database::open(&path, DatabaseConfig::default(), None)
+            .await
+            .unwrap();
+        let mut tx = db.begin(TransactionOptions::readonly()).unwrap();
+        let indexes = tx.list_indexes("users").unwrap();
+        tx.rollback();
+
+        // No Building indexes should exist after restart
+        for idx in &indexes {
+            assert_ne!(
+                idx.state,
+                exdb::IndexState::Building,
+                "Building index '{}' should have been dropped on restart",
+                idx.name,
+            );
+        }
+
+        db.close().await.unwrap();
+    }
+}

@@ -45,7 +45,8 @@ use crate::subscriptions::{
 };
 use crate::timestamp::TsAllocator;
 use crate::write_set::{
-    compute_index_deltas, CatalogMutation, IndexDelta, IndexResolver, MutationOp, WriteSet,
+    compute_index_deltas, CatalogMutation, CatalogMutationHandler, IndexDelta, IndexResolver,
+    MutationOp, WriteSet,
 };
 
 use exdb_docstore::{PrimaryIndex, SecondaryIndex};
@@ -166,6 +167,7 @@ pub struct CommitCoordinator {
     primary_indexes: Arc<RwLock<HashMap<CollectionId, Arc<PrimaryIndex>>>>,
     secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
     index_resolver: Arc<dyn IndexResolver>,
+    catalog_handler: Arc<dyn CatalogMutationHandler>,
     commit_rx: mpsc::Receiver<(CommitRequest, oneshot::Sender<CommitResult>)>,
     replication_tx: mpsc::Sender<ReplicationEntry>,
     next_tx_id: Arc<AtomicU64>,
@@ -225,6 +227,7 @@ impl CommitCoordinator {
         secondary_indexes: Arc<RwLock<HashMap<IndexId, Arc<SecondaryIndex>>>>,
         replication: Box<dyn ReplicationHook>,
         index_resolver: Arc<dyn IndexResolver>,
+        catalog_handler: Arc<dyn CatalogMutationHandler>,
         channel_size: usize,
         replication_queue_size: usize,
     ) -> (Self, ReplicationRunner, CommitHandle) {
@@ -245,6 +248,7 @@ impl CommitCoordinator {
             primary_indexes,
             secondary_indexes,
             index_resolver,
+            catalog_handler,
             commit_rx,
             replication_tx,
             next_tx_id: Arc::clone(&next_tx_id),
@@ -355,7 +359,57 @@ impl CommitCoordinator {
                 }
             }
 
-            // ── Step 4: Apply Mutations + Compute Deltas ──
+            // ── Step 4a: Apply Catalog Mutations ──
+            // Process DDL before data mutations so that new B-trees exist
+            // when insert_version / index delta computation runs.
+            for cat_mut in &req.write_set.catalog_mutations {
+                let result = match cat_mut {
+                    CatalogMutation::CreateCollection {
+                        name,
+                        provisional_id,
+                    } => {
+                        self.catalog_handler
+                            .handle_create_collection(*provisional_id, name)
+                            .await
+                    }
+                    CatalogMutation::DropCollection {
+                        collection_id, ..
+                    } => {
+                        self.catalog_handler
+                            .handle_drop_collection(*collection_id)
+                            .await
+                    }
+                    CatalogMutation::CreateIndex {
+                        collection_id,
+                        name,
+                        field_paths,
+                        provisional_id,
+                    } => {
+                        self.catalog_handler
+                            .handle_create_index(
+                                *provisional_id,
+                                *collection_id,
+                                name,
+                                field_paths,
+                            )
+                            .await
+                    }
+                    CatalogMutation::DropIndex { index_id, .. } => {
+                        self.catalog_handler
+                            .handle_drop_index(*index_id)
+                            .await
+                    }
+                };
+                if let Err(e) = result {
+                    tracing::error!(
+                        "catalog mutation failed for commit_ts={commit_ts}: {e}"
+                    );
+                    let _ = response_tx.send(CommitResult::QuorumLost);
+                    return Err(());
+                }
+            }
+
+            // ── Step 4b: Apply Data Mutations + Compute Deltas ──
             // Clone Arc'd indexes and drop parking_lot read guards immediately.
             let primaries: HashMap<CollectionId, Arc<PrimaryIndex>> =
                 self.primary_indexes.read().clone();
@@ -811,6 +865,9 @@ mod tests {
         let secondaries = Arc::new(RwLock::new(HashMap::new()));
         let resolver: Arc<dyn IndexResolver> = Arc::new(EmptyResolver);
 
+        let catalog_handler: Arc<dyn CatalogMutationHandler> =
+            Arc::new(crate::write_set::NoOpCatalogHandler);
+
         CommitCoordinator::new(
             0,
             0,
@@ -819,6 +876,7 @@ mod tests {
             secondaries,
             Box::new(NoReplication),
             resolver,
+            catalog_handler,
             256,
             256,
         )

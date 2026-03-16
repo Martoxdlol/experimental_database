@@ -8,3 +8,19 @@ exdb-core = { workspace = true }
 exdb-storage = { workspace = true }
 exdb-docstore = { workspace = true }
 exdb-query = { workspace = true }
+exdb-tx = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+futures-core = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = { workspace = true }

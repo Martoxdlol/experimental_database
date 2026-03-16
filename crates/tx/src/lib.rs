@@ -60,6 +60,7 @@ pub use read_set::{
 pub use write_set::{
     WriteSet, MutationOp, MutationEntry, CatalogMutation,
     IndexDelta, IndexInfo, IndexResolver, compute_index_deltas,
+    CatalogMutationHandler, NoOpCatalogHandler,
 };
 
 // T4: Commit log

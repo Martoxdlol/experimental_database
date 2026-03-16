@@ -114,6 +114,79 @@ pub trait IndexResolver: Send + Sync {
     fn indexes_for_collection(&self, collection_id: CollectionId) -> Vec<IndexInfo>;
 }
 
+/// Trait for handling catalog DDL mutations during commit.
+///
+/// Defined in L5, implemented by L6. Called by the `CommitCoordinator`
+/// during step 4a (after WAL persist, before data mutations) to create
+/// B-trees, update the catalog cache, and register index handles.
+///
+/// Methods are `async` because B-tree creation requires I/O.
+///
+/// The coordinator calls these in the order they appear in
+/// `WriteSet::catalog_mutations`, which is the order L6 buffered them.
+/// This means `CreateCollection` is processed before `CreateIndex` for
+/// the `_created_at` auto-index, so the primary index exists when the
+/// secondary index is created.
+#[async_trait::async_trait]
+pub trait CatalogMutationHandler: Send + Sync {
+    /// Handle a CreateCollection mutation.
+    ///
+    /// Must: create primary B-tree, register PrimaryIndex handle, update catalog.
+    async fn handle_create_collection(
+        &self,
+        collection_id: CollectionId,
+        name: &str,
+    ) -> std::io::Result<()>;
+
+    /// Handle a DropCollection mutation.
+    ///
+    /// Must: remove PrimaryIndex + all SecondaryIndex handles, update catalog.
+    async fn handle_drop_collection(
+        &self,
+        collection_id: CollectionId,
+    ) -> std::io::Result<()>;
+
+    /// Handle a CreateIndex mutation.
+    ///
+    /// Must: create secondary B-tree, register SecondaryIndex handle, update catalog.
+    async fn handle_create_index(
+        &self,
+        index_id: IndexId,
+        collection_id: CollectionId,
+        name: &str,
+        field_paths: &[FieldPath],
+    ) -> std::io::Result<()>;
+
+    /// Handle a DropIndex mutation.
+    ///
+    /// Must: remove SecondaryIndex handle, update catalog.
+    async fn handle_drop_index(
+        &self,
+        index_id: IndexId,
+    ) -> std::io::Result<()>;
+}
+
+/// No-op catalog mutation handler (for tests without catalog support).
+pub struct NoOpCatalogHandler;
+
+#[async_trait::async_trait]
+impl CatalogMutationHandler for NoOpCatalogHandler {
+    async fn handle_create_collection(&self, _: CollectionId, _: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+    async fn handle_drop_collection(&self, _: CollectionId) -> std::io::Result<()> {
+        Ok(())
+    }
+    async fn handle_create_index(
+        &self, _: IndexId, _: CollectionId, _: &str, _: &[FieldPath],
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+    async fn handle_drop_index(&self, _: IndexId) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// All buffered mutations for a transaction.
 pub struct WriteSet {
     /// Document mutations keyed by `(collection_id, doc_id)`.

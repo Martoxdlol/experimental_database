@@ -278,7 +278,7 @@ pub fn QueryScanModule() -> Element {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_query(
-    db: Option<Arc<crate::engine::DbHandle>>,
+    db: Option<Arc<crate::engine::StorageHandle>>,
     collection: Option<(u64, String, u32)>,
     index: Option<(u64, String, u32, Vec<Vec<String>>)>,
     range_str: &str,

@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 
-use crate::engine::DbHandle;
-use crate::state::{AppState, LayerTab, OperationResult};
+use crate::engine::EngineHandle;
+use crate::state::{AppState, NavSection, OperationResult};
 
 #[component]
 pub fn Toolbar() -> Element {
@@ -13,17 +13,17 @@ pub fn Toolbar() -> Element {
     let write_enabled = *state.write_enabled.read();
     let dirty = *state.dirty_page_count.read();
 
-    // Db info line (async because read_file_header is async)
-    let db_for_info = state.db.read().clone();
+    // Db info line
+    let engine = state.engine.read().clone();
     let info_resource = use_resource(move || {
         let _rev = *state.revision.read();
-        let db = db_for_info.clone();
+        let engine = engine.clone();
         async move {
-            if let Some(db) = db {
-                let fh = db.read_file_header().await;
+            if let Some(engine) = engine {
+                let fh = engine.storage.read_file_header().await;
                 format!(
                     "{} ({} B pages, {} pages)",
-                    db.path,
+                    engine.path,
                     fh.page_size.get(),
                     fh.page_count.get()
                 )
@@ -32,7 +32,10 @@ pub fn Toolbar() -> Element {
             }
         }
     });
-    let info_text = info_resource.read().clone().unwrap_or_else(|| "No database open".to_string());
+    let info_text = info_resource
+        .read()
+        .clone()
+        .unwrap_or_else(|| "No database open".to_string());
 
     rsx! {
         div { class: "toolbar",
@@ -42,16 +45,26 @@ pub fn Toolbar() -> Element {
                     onclick: move |_| {
                         spawn(async move {
                             if let Some(path) = pick_database_dir().await {
-                                match DbHandle::open(&path).await {
+                                match EngineHandle::open(&path).await {
                                     Ok(handle) => {
-                                        state.db.set(Some(Arc::new(handle)));
-                                        state.active_tab.set(LayerTab::Overview);
-                                        state.breadcrumb.set(vec!["Database".to_string(), "Overview".to_string()]);
+                                        let storage = Arc::clone(&handle.storage);
+                                        let handle = Arc::new(handle);
+                                        state.engine.set(Some(handle));
+                                        state.db.set(Some(storage));
+                                        state.nav.set(NavSection::Dashboard);
+                                        state.breadcrumb.set(vec![
+                                            "Database".to_string(),
+                                            "Dashboard".to_string(),
+                                        ]);
                                         state.write_enabled.set(false);
-                                        state.last_result.set(Some(OperationResult::Success("Database opened".into())));
+                                        state.last_result.set(Some(OperationResult::Success(
+                                            "Database opened".into(),
+                                        )));
                                     }
                                     Err(e) => {
-                                        state.last_result.set(Some(OperationResult::Error(format!("Failed to open: {e}"))));
+                                        state.last_result.set(Some(OperationResult::Error(
+                                            format!("Failed to open: {e}"),
+                                        )));
                                     }
                                 }
                             }
@@ -64,16 +77,26 @@ pub fn Toolbar() -> Element {
                     onclick: move |_| {
                         spawn(async move {
                             if let Some(path) = pick_new_database_dir().await {
-                                match DbHandle::open(&path).await {
+                                match EngineHandle::open(&path).await {
                                     Ok(handle) => {
-                                        state.db.set(Some(Arc::new(handle)));
-                                        state.active_tab.set(LayerTab::Overview);
-                                        state.breadcrumb.set(vec!["Database".to_string(), "Overview".to_string()]);
+                                        let storage = Arc::clone(&handle.storage);
+                                        let handle = Arc::new(handle);
+                                        state.engine.set(Some(handle));
+                                        state.db.set(Some(storage));
+                                        state.nav.set(NavSection::Dashboard);
+                                        state.breadcrumb.set(vec![
+                                            "Database".to_string(),
+                                            "Dashboard".to_string(),
+                                        ]);
                                         state.write_enabled.set(true);
-                                        state.last_result.set(Some(OperationResult::Success("New database created".into())));
+                                        state.last_result.set(Some(OperationResult::Success(
+                                            "New database created".into(),
+                                        )));
                                     }
                                     Err(e) => {
-                                        state.last_result.set(Some(OperationResult::Error(format!("Failed to create: {e}"))));
+                                        state.last_result.set(Some(OperationResult::Error(
+                                            format!("Failed to create: {e}"),
+                                        )));
                                     }
                                 }
                             }
@@ -85,15 +108,14 @@ pub fn Toolbar() -> Element {
                     button {
                         class: "btn",
                         onclick: move |_| {
-                            let db = state.db.read().clone();
                             spawn(async move {
-                                if let Some(db) = db {
-                                    let _ = db.close().await;
-                                }
+                                state.engine.set(None);
                                 state.db.set(None);
                                 state.write_enabled.set(false);
                                 state.breadcrumb.set(vec!["Database".to_string()]);
-                                state.last_result.set(Some(OperationResult::Success("Database closed".into())));
+                                state.last_result.set(Some(OperationResult::Success(
+                                    "Database closed".into(),
+                                )));
                             });
                         },
                         "Close"
@@ -117,10 +139,14 @@ pub fn Toolbar() -> Element {
                                     match db.checkpoint().await {
                                         Ok(()) => {
                                             state.notify_mutation();
-                                            state.last_result.set(Some(OperationResult::Success("Checkpoint complete".into())));
+                                            state.last_result.set(Some(OperationResult::Success(
+                                                "Checkpoint complete".into(),
+                                            )));
                                         }
                                         Err(e) => {
-                                            state.last_result.set(Some(OperationResult::Error(format!("Checkpoint failed: {e}"))));
+                                            state.last_result.set(Some(OperationResult::Error(
+                                                format!("Checkpoint failed: {e}"),
+                                            )));
                                         }
                                     }
                                 }
@@ -128,29 +154,27 @@ pub fn Toolbar() -> Element {
                         },
                         "Checkpoint"
                     }
-                    span {
-                        class: "toolbar-info",
-                        "Dirty: {dirty}"
-                    }
+                    span { class: "toolbar-info", "Dirty: {dirty}" }
                 }
 
                 div { class: "toolbar-separator" }
 
-                // RW Lock badge
                 {
-                    let badge_class = if write_enabled { "rw-badge unlocked" } else { "rw-badge locked" };
-                    let badge_text = if write_enabled { "READ-WRITE" } else { "READ-ONLY" };
+                    let badge_class = if write_enabled {
+                        "rw-badge unlocked"
+                    } else {
+                        "rw-badge locked"
+                    };
+                    let badge_text = if write_enabled {
+                        "READ-WRITE"
+                    } else {
+                        "READ-ONLY"
+                    };
                     rsx! {
                         div {
                             class: "{badge_class}",
                             onclick: move |_| {
-                                if write_enabled {
-                                    // Lock immediately
-                                    state.write_enabled.set(false);
-                                } else {
-                                    // Unlock (should show confirm dialog; for now just toggle)
-                                    state.write_enabled.set(true);
-                                }
+                                state.write_enabled.set(!write_enabled);
                             },
                             "{badge_text}"
                         }
@@ -170,16 +194,12 @@ async fn pick_database_dir() -> Option<PathBuf> {
 }
 
 async fn pick_new_database_dir() -> Option<PathBuf> {
-    // User picks a parent folder, then we append a "new.exdb" subdir.
-    // If the picked folder is already empty, use it directly.
     let handle = rfd::AsyncFileDialog::new()
         .set_title("Choose Directory for New Database")
         .pick_folder()
         .await?;
     let path = handle.path().to_path_buf();
 
-    // If the directory is empty (or doesn't have data.db), use it directly as the DB dir.
-    // Otherwise create a "new.exdb" subdirectory.
     if !path.join("data.db").exists() {
         Some(path)
     } else {

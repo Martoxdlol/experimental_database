@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+exdb = { workspace = true }
 exdb-core = { workspace = true }
 exdb-docstore = { workspace = true }
 exdb-storage = { workspace = true }

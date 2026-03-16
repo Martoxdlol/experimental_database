@@ -93,22 +93,33 @@ pub struct FreeListInfo {
     pub chain: Vec<u32>,
 }
 
-// ─── DbHandle ───
+// ─── StorageHandle ───
 
-/// Full read-write handle to an open database.
-pub struct DbHandle {
+/// Low-level read-write handle to storage (L2-L4 operations).
+pub struct StorageHandle {
     engine: Arc<StorageEngine>,
+    #[allow(dead_code)]
     pub path: String,
     pub page_size: usize,
 }
 
-impl DbHandle {
+#[allow(dead_code)]
+impl StorageHandle {
     /// Access the underlying storage engine (for L4 query operations).
     pub fn engine(&self) -> &Arc<StorageEngine> {
         &self.engine
     }
 
-    /// Open a database directory with full read-write access.
+    /// Create from an existing storage engine (used by EngineHandle).
+    pub fn from_engine(engine: Arc<StorageEngine>, path: &str, page_size: usize) -> Self {
+        Self {
+            engine,
+            path: path.to_string(),
+            page_size,
+        }
+    }
+
+    /// Open a database directory with full read-write access (standalone).
     pub async fn open(path: &Path) -> io::Result<Self> {
         let config = StorageConfig::default();
         let page_size = config.page_size;

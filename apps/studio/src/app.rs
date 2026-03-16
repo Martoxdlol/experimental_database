@@ -1,16 +1,22 @@
 use dioxus::prelude::*;
 
-use crate::components::{Breadcrumb, LayerTabBar, Sidebar, Toast, Toolbar};
+use crate::components::{Breadcrumb, NavSidebar, Toast, Toolbar};
 use crate::modules::{
-    console::ConsoleModule,
-    docstore::{DocumentsModule, KeyToolsModule, SecondaryIndexModule, VacuumModule},
-    overview::OverviewModule,
-    query::{QueryScanModule, FilterTestModule, RangeToolsModule},
-    storage::{
-        BTreeModule, CatalogModule, FreeListModule, HeapModule, PagesModule, WalModule,
+    collections::CollectionsModule,
+    config_viewer::ConfigViewerModule,
+    dashboard::DashboardModule,
+    internals::{
+        console::ConsoleModule,
+        docstore::{DocumentsModule, KeyToolsModule, SecondaryIndexModule, VacuumModule},
+        query::{FilterTestModule, QueryScanModule, RangeToolsModule},
+        storage::{
+            BTreeModule, CatalogModule, FreeListModule, HeapModule, PagesModule, WalModule,
+        },
     },
+    query_workbench::QueryWorkbenchModule,
+    subscriptions::SubscriptionsModule,
 };
-use crate::state::{AppState, DocstoreTool, LayerTab, QueryTool, StorageTool};
+use crate::state::{AppState, InternalsTool, NavSection};
 use crate::theme::STYLESHEET;
 
 #[component]
@@ -22,9 +28,8 @@ pub fn App() -> Element {
         style { "{STYLESHEET}" }
         div { class: "app-container",
             Toolbar {}
-            LayerTabBar {}
             div { class: "main-layout",
-                Sidebar {}
+                NavSidebar {}
                 div { class: "content",
                     Breadcrumb {}
                     ModuleContent {}
@@ -38,7 +43,7 @@ pub fn App() -> Element {
 #[component]
 fn ModuleContent() -> Element {
     let state = use_context::<AppState>();
-    let active_tab = *state.active_tab.read();
+    let nav = *state.nav.read();
     let db_open = state.is_open();
 
     if !db_open {
@@ -55,36 +60,27 @@ fn ModuleContent() -> Element {
         };
     }
 
-    match active_tab {
-        LayerTab::Overview => rsx! { OverviewModule {} },
-        LayerTab::Console => rsx! { ConsoleModule {} },
-        LayerTab::Storage => {
-            let tool = *state.storage_tool.read();
-            match tool {
-                StorageTool::Pages => rsx! { PagesModule {} },
-                StorageTool::BTree => rsx! { BTreeModule {} },
-                StorageTool::Wal => rsx! { WalModule {} },
-                StorageTool::Heap => rsx! { HeapModule {} },
-                StorageTool::FreeList => rsx! { FreeListModule {} },
-                StorageTool::Catalog => rsx! { CatalogModule {} },
-            }
-        }
-        LayerTab::Docstore => {
-            let tool = *state.docstore_tool.read();
-            match tool {
-                DocstoreTool::Documents => rsx! { DocumentsModule {} },
-                DocstoreTool::SecondaryIndexes => rsx! { SecondaryIndexModule {} },
-                DocstoreTool::KeyTools => rsx! { KeyToolsModule {} },
-                DocstoreTool::Vacuum => rsx! { VacuumModule {} },
-            }
-        }
-        LayerTab::Query => {
-            let tool = *state.query_tool.read();
-            match tool {
-                QueryTool::Scan => rsx! { QueryScanModule {} },
-                QueryTool::FilterTest => rsx! { FilterTestModule {} },
-                QueryTool::RangeTools => rsx! { RangeToolsModule {} },
-            }
-        }
+    match nav {
+        NavSection::Dashboard => rsx! { DashboardModule {} },
+        NavSection::Collections => rsx! { CollectionsModule {} },
+        NavSection::QueryWorkbench => rsx! { QueryWorkbenchModule {} },
+        NavSection::Subscriptions => rsx! { SubscriptionsModule {} },
+        NavSection::Config => rsx! { ConfigViewerModule {} },
+        NavSection::Internals(tool) => match tool {
+            InternalsTool::StoragePages => rsx! { PagesModule {} },
+            InternalsTool::StorageBTree => rsx! { BTreeModule {} },
+            InternalsTool::StorageWal => rsx! { WalModule {} },
+            InternalsTool::StorageHeap => rsx! { HeapModule {} },
+            InternalsTool::StorageFreeList => rsx! { FreeListModule {} },
+            InternalsTool::StorageCatalog => rsx! { CatalogModule {} },
+            InternalsTool::DocstoreDocs => rsx! { DocumentsModule {} },
+            InternalsTool::DocstoreSecondary => rsx! { SecondaryIndexModule {} },
+            InternalsTool::DocstoreKeys => rsx! { KeyToolsModule {} },
+            InternalsTool::DocstoreVacuum => rsx! { VacuumModule {} },
+            InternalsTool::QueryScan => rsx! { QueryScanModule {} },
+            InternalsTool::QueryFilter => rsx! { FilterTestModule {} },
+            InternalsTool::QueryRange => rsx! { RangeToolsModule {} },
+            InternalsTool::Console => rsx! { ConsoleModule {} },
+        },
     }
 }

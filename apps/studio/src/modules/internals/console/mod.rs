@@ -166,7 +166,7 @@ pub fn ConsoleModule() -> Element {
 }
 
 async fn execute_command(
-    db: &crate::engine::DbHandle,
+    db: &crate::engine::StorageHandle,
     target: &str,
     method: &str,
     p1: &str,

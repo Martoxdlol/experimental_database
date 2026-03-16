@@ -470,6 +470,9 @@ impl StorageEngine {
         // Sync page storage.
         self.page_storage.sync().await?;
 
+        // Release exclusive file lock so the database can be reopened.
+        self.page_storage.unlock();
+
         Ok(())
     }
 

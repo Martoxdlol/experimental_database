@@ -11,10 +11,14 @@ The core integration point. `Database` owns all components (storage engine, inde
 - **B3 (`index_resolver.rs`)**: `IndexResolverImpl`
 - **B5 (`transaction.rs`)**: `Transaction`, `TransactionOptions`
 - **B7 (`subscription.rs`)**: `SubscriptionHandle`
+- **B9 (`catalog_persistence.rs`)**: `CatalogPersistence` — catalog B-tree read/write
+- **B10 (`catalog_recovery.rs`)**: `DatabaseRecoveryHandler` — WAL replay for crash recovery
 - **L2 (`exdb-storage`)**: `StorageEngine`, `StorageConfig`
 - **L3 (`exdb-docstore`)**: `PrimaryIndex`, `SecondaryIndex`
 - **L5 (`exdb-tx`)**: `CommitCoordinator`, `ReplicationRunner`, `CommitHandle`, `TsAllocator`, `SubscriptionRegistry`, `ReplicationHook`, `NoReplication`
 - **tokio**: `task::LocalSet`, `sync::CancellationToken`
+
+> **See also:** `10-durability.md` for the full durability design (crash scenarios, idempotency requirements, rollback vacuum) and `11-test-plan.md` for the exhaustive test matrix.
 
 ## Rust Types
 
@@ -279,21 +283,36 @@ async fn index_builder_task(
 
 When the CommitCoordinator applies a commit containing `CatalogMutation` entries
 (step 4a), the physical side effects (B-tree allocation, CatalogCache update,
-opening new index handles) must happen within the writer task. The mechanism:
+opening new index handles) must happen within the writer task. **All catalog
+B-tree writes go through `CatalogPersistence` (B9)** — see `10-durability.md`
+for the full design.
+
+The mechanism:
 
 1. CommitCoordinator detects `CatalogMutation` entries in the `WriteSet`.
-2. For each `CreateCollection`: call `storage.create_btree()` twice (primary + `_created_at`),
-   insert into both catalog B-trees (by-id and by-name), then call `catalog.write().add_collection()`
-   and `catalog.write().add_index()`. Create `PrimaryIndex` and `SecondaryIndex` handles,
-   insert into the shared index maps.
-3. For each `DropCollection`: call `catalog.write().remove_collection()` (cascades indexes),
-   remove handles from the shared index maps.
-4. For each `CreateIndex`: call `storage.create_btree()`, insert into catalog B-trees,
-   call `catalog.write().add_index()`, create `SecondaryIndex` handle.
-5. For each `DropIndex`: set index state to `Dropping`, remove from catalog.
+2. For each `CreateCollection`:
+   - `storage.create_btree()` twice (primary + `_created_at`)
+   - `CatalogPersistence::apply_create_collection(...)` → writes to both catalog B-trees + updates CatalogCache
+   - `CatalogPersistence::apply_create_index(...)` → for the `_created_at` auto-index
+   - Create `PrimaryIndex` and `SecondaryIndex` handles, insert into shared maps
+3. For each `DropCollection`:
+   - `CatalogPersistence::apply_drop_collection(...)` → removes from both B-trees, cascades indexes
+   - Remove handles from shared index maps
+4. For each `CreateIndex`:
+   - `storage.create_btree()`
+   - `CatalogPersistence::apply_create_index(...)` → writes to both B-trees + updates cache
+   - Create `SecondaryIndex` handle
+5. For each `DropIndex`:
+   - `CatalogPersistence::apply_drop_index(...)` → removes from both B-trees
+   - Remove handle from shared map
 
 The catalog cache, catalog B-trees, and index handle maps are all updated atomically
 within the same writer step — no intermediate state is visible to readers.
+
+**Idempotency**: All `CatalogPersistence::apply_*` methods are idempotent. This is
+essential because the same mutations may be replayed during WAL recovery if a crash
+occurs after the WAL write but before the B-tree pages are flushed to disk. See
+`10-durability.md` "Idempotency Requirement" for details.
 
 ## Active Transaction Tracking
 
@@ -310,29 +329,53 @@ individually cancel transactions. The counter is sufficient for graceful shutdow
 
 ### File-backed (`Database::open`)
 
+> **Full durability analysis:** See `10-durability.md` for crash scenario analysis and idempotency requirements for each step below.
+
 ```
-1. Create data directory if needed
-2. StorageEngine::open(path, StorageConfig::from(config))
-   → DWB restore (if data.dwb exists)
-   → WAL replay from checkpoint_lsn
-   → Returns (engine, recovered_ts, visible_ts)
-   Note: visible_ts is read from the last WAL_RECORD_VISIBLE_TS during replay.
-   On single-node (NoReplication), visible_ts == recovered_ts.
-3. Open catalog B-trees from file header root pages
-4. Scan both catalog B-trees → populate CatalogCache
-5. For each collection in catalog:
-   a. Open primary B-tree handle → PrimaryIndex
-   b. For each index: open secondary B-tree handle → SecondaryIndex
-   c. Drop any indexes in Building state (incomplete builds from prior crash)
-   d. Validate that every collection has `_created_at` index (invariant check)
-6. Rollback vacuum: if recovered_ts > visible_ts, clean unreplicated entries
-7. Create CommitCoordinator::new(recovered_ts, visible_ts, ...)
-   → (coordinator, runner, handle)
-8. Spawn coordinator on LocalSet (it is !Send)
-9. Spawn runner on tokio::spawn (it is Send)
-10. Spawn checkpoint_task
-11. Spawn vacuum_task
-12. Return Database
+1.  Create data directory if needed
+
+2.  StorageEngine::open(path, StorageConfig::from(config))
+    → Reads file header (page 0) for checkpoint_lsn, catalog root pages
+    → DWB recovery (S8): restore any torn pages in data.db
+    → Returns (engine, file_header)
+
+3.  Open catalog B-trees from file header root pages (by-ID and by-Name)
+
+4.  CatalogPersistence::load_catalog(id_btree, name_btree)      [B9]
+    → Scans both catalog B-trees → populates CatalogCache
+    → Sets next_collection_id = max(collection_ids) + 1
+    → Sets next_index_id = max(index_ids) + 1
+    → Opens primary B-tree handle → PrimaryIndex for each collection
+    → Opens secondary B-tree handle → SecondaryIndex for each index
+    → Drops indexes in Building state (incomplete builds from prior crash)
+    → Validates _created_at invariant for every collection
+
+5.  Create DatabaseRecoveryHandler with catalog + index handles    [B10]
+
+6.  Recovery::run(storage, wal, dwb_path, checkpoint_lsn, handler) [S10]
+    → WAL replay from checkpoint_lsn
+    → Handler applies TxCommit (catalog + data + index), IndexReady, Vacuum, VisibleTs
+    → All replay operations are IDEMPOTENT (critical for correctness)
+    → Returns (end_lsn, RecoveredState)
+
+7.  Extract RecoveredState: updated catalog, index handles, recovered_ts, visible_ts
+
+8.  Rollback vacuum: if recovered_ts > visible_ts                  [B10]
+    → Scan WAL backwards for un-replicated commits in (visible_ts, recovered_ts]
+    → Reverse their effects: data mutations, index deltas, catalog mutations
+    → Write RollbackVacuum WAL record (so this is not repeated on next restart)
+    → See 10-durability.md "Rollback Vacuum" section for full algorithm
+
+9.  Update file header: next_collection_id, next_index_id from catalog
+
+10. Create CommitCoordinator::new(recovered_ts, visible_ts, ...)
+    → (coordinator, runner, handle)
+
+11. Spawn coordinator on LocalSet (it is !Send)
+12. Spawn runner on tokio::spawn (it is Send)
+13. Spawn checkpoint_task
+14. Spawn vacuum_task
+15. Return Database
 ```
 
 ### In-memory (`Database::open_in_memory`)
@@ -346,6 +389,10 @@ individually cancel transactions. The counter is sufficient for graceful shutdow
 ```
 
 ## Tests
+
+The tests below are the B6 integration tests (in-memory). For the complete test matrix including durability, concurrency, and stress tests, see **`11-test-plan.md`** which specifies ~300 tests across all L6 modules.
+
+### B6 Integration Tests (In-Memory)
 
 | # | Test | Validates |
 |---|------|-----------|
@@ -375,3 +422,32 @@ individually cancel transactions. The counter is sufficient for graceful shutdow
 | 24 | `active_tx_count_tracks_lifecycle` | begin increments, drop/commit decrements |
 | 25 | `close_waits_for_active_transactions` | Close blocks until tx commits |
 | 26 | `transaction_timeout_self_check` | Operation after max_lifetime → TransactionTimeout |
+| 27 | `open_in_memory_then_insert_and_query` | Full CRUD cycle with in-memory storage |
+| 28 | `two_readers_one_writer_no_conflict` | Reader tx + writer tx on disjoint keys → both succeed |
+| 29 | `write_write_conflict_detected` | Two writers on same key → one gets Conflict |
+| 30 | `ddl_data_atomic_rollback` | Create collection + insert, rollback → neither visible |
+| 31 | `subscription_watch_fires_on_relevant_write` | Watch on range, write in range → event fired |
+| 32 | `subscription_watch_silent_on_irrelevant_write` | Watch on range [A,M], write in [N,Z] → no event |
+| 33 | `subscription_notify_fires_once` | Notify mode fires exactly once |
+| 34 | `begin_after_shutdown_returns_error` | close() then begin() → ShuttingDown |
+| 35 | `checkpoint_reduces_recovery_time` | Insert many, checkpoint, insert few, restart → only few replayed |
+| 36 | `vacuum_removes_old_versions` | Insert, replace 5x, vacuum → old versions cleaned |
+| 37 | `index_builder_completes` | Create index on populated collection → Building → Ready |
+| 38 | `query_building_index_returns_error` | Query on Building index → IndexNotReady |
+| 39 | `concurrent_index_build_and_writes` | Create index + concurrent inserts → all indexed |
+| 40 | `large_document_insert_and_retrieve` | Insert 1MB doc → get returns identical bytes |
+| 41 | `document_at_size_limit` | Insert at exactly max_doc_size → succeeds |
+| 42 | `document_over_size_limit` | Insert at max_doc_size + 1 → DocTooLarge |
+| 43 | `100_collections_in_one_tx` | Create 100 collections atomically |
+| 44 | `drop_collection_then_recreate_same_name` | Drop + recreate "users" → new CollectionId |
+| 45 | `query_created_at_ascending` | Insert A,B,C → _created_at ASC → A,B,C |
+| 46 | `query_created_at_descending` | Insert A,B,C → _created_at DESC → C,B,A |
+| 47 | `list_collections_includes_pending_creates` | In-tx: create, list → includes pending |
+| 48 | `list_indexes_includes_pending_creates` | In-tx: create index, list → includes pending |
+| 49 | `three_way_occ_conflict` | TX1+TX2+TX3 on same key → only one succeeds |
+| 50 | `snapshot_isolation_read_consistency` | TX1 reads, TX2 commits, TX1 re-reads → same result |
+| 51 | `reset_then_see_same_snapshot` | TX1.reset() → same begin_ts, same snapshot |
+| 52 | `active_tx_count_correct_after_drop` | Begin, drop without commit → count decrements |
+| 53 | `close_timeout_with_hung_transaction` | Abandoned tx, close with short timeout → completes |
+| 54 | `startup_drops_building_indexes` | Building index + crash → index gone after reopen |
+| 55 | `startup_validates_created_at_invariant` | Missing _created_at → startup error |

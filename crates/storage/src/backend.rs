@@ -51,6 +51,12 @@ pub trait PageStorage: Send + Sync {
 
     /// Whether this backend provides durable storage.
     fn is_durable(&self) -> bool;
+
+    /// Release any exclusive locks held on the underlying storage file.
+    ///
+    /// Called by `StorageEngine::close()` to allow reopening the same database.
+    /// Default implementation is a no-op (appropriate for in-memory backends).
+    fn unlock(&self) {}
 }
 
 // ─── WAL Storage Trait ───
@@ -106,6 +112,9 @@ pub trait WalStorage: Send + Sync {
 
 /// Durable page storage backed by a single data file.
 /// Uses pread/pwrite (`read_at`/`write_at`) for concurrent positional I/O.
+///
+/// Acquires an exclusive file lock (flock) on open to prevent concurrent
+/// access from multiple processes, which would cause data corruption.
 pub struct FilePageStorage {
     file: Arc<File>,
     page_size: usize,
@@ -114,8 +123,12 @@ pub struct FilePageStorage {
 
 impl FilePageStorage {
     /// Open an existing data file. Computes `page_count = file_size / page_size`.
+    ///
+    /// Acquires an exclusive lock (non-blocking). Returns an error if another
+    /// process already has the file open.
     pub fn open(path: &Path, page_size: usize) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
+        Self::try_lock(&file, path)?;
         let metadata = file.metadata()?;
         let file_size = metadata.len();
         let page_count = file_size / page_size as u64;
@@ -127,6 +140,9 @@ impl FilePageStorage {
     }
 
     /// Create a new data file. Sets `page_count = 0`.
+    ///
+    /// Acquires an exclusive lock (non-blocking). Returns an error if another
+    /// process already has the file open.
     pub fn create(path: &Path, page_size: usize) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
@@ -134,11 +150,53 @@ impl FilePageStorage {
             .create(true)
             .truncate(true)
             .open(path)?;
+        Self::try_lock(&file, path)?;
         Ok(Self {
             file: Arc::new(file),
             page_size,
             page_count: AtomicU64::new(0),
         })
+    }
+
+    /// Acquire an exclusive non-blocking flock on the data file.
+    ///
+    /// The lock is held until [`unlock`] is called or the file descriptor is
+    /// closed (whichever comes first).
+    fn try_lock(file: &File, path: &Path) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+            if ret != 0 {
+                let err = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "database file is locked by another process: {}: {}",
+                        path.display(),
+                        err
+                    ),
+                ));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (file, path); // suppress unused warnings on non-unix
+            // On non-unix platforms, skip file locking for now.
+            // TODO: implement LockFileEx for Windows.
+        }
+        Ok(())
+    }
+
+    /// Release the exclusive file lock. Called during engine close.
+    pub fn unlock(&self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = self.file.as_raw_fd();
+            unsafe { libc::flock(fd, libc::LOCK_UN) };
+        }
     }
 }
 
@@ -214,6 +272,10 @@ impl PageStorage for FilePageStorage {
 
     fn is_durable(&self) -> bool {
         true
+    }
+
+    fn unlock(&self) {
+        FilePageStorage::unlock(self);
     }
 }
 
@@ -1225,7 +1287,81 @@ mod tests {
         assert_eq!(storage.size(), 22);
     }
 
-    // ─── Test 11: is_durable ───
+    // ─── Test 11: file locking ───
+
+    #[tokio::test]
+    async fn file_lock_prevents_double_open() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.db");
+
+        // First open succeeds
+        let _fp1 = FilePageStorage::create(&path, PAGE_SIZE).unwrap();
+
+        // Second open of the same file should fail
+        let result = FilePageStorage::open(&path, PAGE_SIZE);
+        assert!(result.is_err());
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error, got Ok"),
+        };
+        assert!(
+            matches!(err.kind(), io::ErrorKind::WouldBlock),
+            "expected WouldBlock, got {:?}",
+            err.kind()
+        );
+        assert!(
+            err.to_string().contains("locked by another process"),
+            "error message: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn file_lock_released_on_unlock() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.db");
+
+        // Open and lock
+        let fp1 = FilePageStorage::create(&path, PAGE_SIZE).unwrap();
+        // Explicitly unlock
+        fp1.unlock();
+
+        // Should now be able to open again
+        let _fp2 = FilePageStorage::open(&path, PAGE_SIZE).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_lock_released_on_drop() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.db");
+
+        // Open, then drop
+        {
+            let _fp = FilePageStorage::create(&path, PAGE_SIZE).unwrap();
+            // _fp dropped here
+        }
+
+        // Should be able to reopen
+        let _fp2 = FilePageStorage::open(&path, PAGE_SIZE).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unlock_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("data.db");
+
+        let fp = FilePageStorage::create(&path, PAGE_SIZE).unwrap();
+        fp.unlock();
+        fp.unlock(); // Second unlock should not panic
+    }
+
+    #[tokio::test]
+    async fn memory_page_storage_unlock_is_noop() {
+        let mp = MemoryPageStorage::new(PAGE_SIZE);
+        mp.unlock(); // Should not panic (default no-op impl)
+    }
+
+    // ─── Test 12: is_durable ───
 
     #[tokio::test]
     async fn is_durable() {

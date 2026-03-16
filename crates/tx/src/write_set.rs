@@ -37,6 +37,19 @@ pub struct MutationEntry {
 /// Catalog DDL operations buffered in the write set.
 ///
 /// Applied atomically with document mutations at commit time.
+///
+/// # Root page IDs
+///
+/// `CreateCollection` and `CreateIndex` include `root_page` fields that are
+/// populated during commit step 3a (pre-allocation), **before** the WAL record
+/// is written. This ensures the WAL record contains the exact page IDs that
+/// were allocated, enabling deterministic WAL replay during crash recovery.
+///
+/// # Drop metadata for rollback
+///
+/// `DropCollection` and `DropIndex` include full original metadata (root pages,
+/// field paths, etc.) so that rollback vacuum can reconstruct dropped entries
+/// if un-replicated commits need to be reversed after a crash.
 #[derive(Debug, Clone)]
 pub enum CatalogMutation {
     /// Create a new collection.
@@ -45,13 +58,25 @@ pub enum CatalogMutation {
         name: String,
         /// Allocated eagerly from atomic counter in L6.
         provisional_id: CollectionId,
+        /// Root page of the primary B-tree (allocated at commit step 3a).
+        /// Set to 0 when buffered in the transaction; filled in by the commit
+        /// coordinator before WAL serialization.
+        primary_root_page: u32,
+        /// Root page of the `_created_at` secondary index B-tree.
+        /// Same lifecycle as `primary_root_page`.
+        created_at_root_page: u32,
     },
     /// Drop an existing collection.
     DropCollection {
         /// ID of the collection to drop.
         collection_id: CollectionId,
-        /// Collection name (for WAL record).
+        /// Collection name (for WAL record + rollback).
         name: String,
+        /// Root page of the primary B-tree (for rollback reconstruction).
+        primary_root_page: u32,
+        /// All indexes that will be cascade-dropped (for rollback reconstruction).
+        /// Populated by L6 when buffering the drop, from the CatalogCache.
+        dropped_indexes: Vec<DroppedIndexMeta>,
     },
     /// Create a new secondary index.
     CreateIndex {
@@ -63,6 +88,9 @@ pub enum CatalogMutation {
         field_paths: Vec<FieldPath>,
         /// Allocated eagerly from atomic counter in L6.
         provisional_id: IndexId,
+        /// Root page of the secondary B-tree (allocated at commit step 3a).
+        /// Set to 0 when buffered; filled in by commit coordinator.
+        root_page: u32,
     },
     /// Drop an existing secondary index.
     DropIndex {
@@ -70,9 +98,28 @@ pub enum CatalogMutation {
         collection_id: CollectionId,
         /// ID of the index to drop.
         index_id: IndexId,
-        /// Index name (for WAL record).
+        /// Index name (for WAL record + rollback).
         name: String,
+        /// Fields that were indexed (for rollback reconstruction).
+        field_paths: Vec<FieldPath>,
+        /// Root page of the secondary B-tree (for rollback reconstruction).
+        root_page: u32,
     },
+}
+
+/// Metadata for an index being cascade-dropped with its collection.
+///
+/// Stored in `DropCollection` so rollback vacuum can reconstruct the indexes.
+#[derive(Debug, Clone)]
+pub struct DroppedIndexMeta {
+    /// Index identifier.
+    pub index_id: IndexId,
+    /// Index name.
+    pub name: String,
+    /// Fields that were indexed.
+    pub field_paths: Vec<FieldPath>,
+    /// Root page of the secondary B-tree.
+    pub root_page: u32,
 }
 
 /// Index delta computed at commit time (DESIGN.md 5.5.1).
@@ -116,11 +163,18 @@ pub trait IndexResolver: Send + Sync {
 
 /// Trait for handling catalog DDL mutations during commit.
 ///
-/// Defined in L5, implemented by L6. Called by the `CommitCoordinator`
-/// during step 4a (after WAL persist, before data mutations) to create
-/// B-trees, update the catalog cache, and register index handles.
+/// Defined in L5, implemented by L6. The commit coordinator uses this trait
+/// in two phases:
 ///
-/// Methods are `async` because B-tree creation requires I/O.
+/// 1. **Step 3a (pre-allocation)**: `allocate_*` methods create B-tree pages
+///    and return root page IDs. These IDs are stored in `CatalogMutation`
+///    fields before the WAL record is serialized (step 3b).
+///
+/// 2. **Step 4a (apply)**: `apply_*` methods update catalog B-trees, the
+///    in-memory CatalogCache, and register index handles. Called after the
+///    WAL record is durably written.
+///
+/// Methods are `async` because B-tree creation/mutation requires I/O.
 ///
 /// The coordinator calls these in the order they appear in
 /// `WriteSet::catalog_mutations`, which is the order L6 buffered them.
@@ -129,38 +183,60 @@ pub trait IndexResolver: Send + Sync {
 /// secondary index is created.
 #[async_trait::async_trait(?Send)]
 pub trait CatalogMutationHandler: Send + Sync {
-    /// Handle a CreateCollection mutation.
+    /// Pre-allocate B-tree pages for a new collection.
     ///
-    /// Must: create primary B-tree, register PrimaryIndex handle, update catalog.
-    async fn handle_create_collection(
+    /// Creates the primary B-tree and `_created_at` secondary B-tree pages.
+    /// Returns `(primary_root_page, created_at_root_page)`.
+    ///
+    /// Called at step 3a, **before** the WAL record is written.
+    /// If crash occurs after this but before WAL write, the allocated pages
+    /// are harmless orphans (reclaimed by vacuum or ignored).
+    async fn allocate_collection_pages(&self) -> std::io::Result<(u32, u32)>;
+
+    /// Pre-allocate a B-tree page for a new secondary index.
+    ///
+    /// Returns the `root_page` for the new secondary B-tree.
+    ///
+    /// Called at step 3a, **before** the WAL record is written.
+    async fn allocate_index_page(&self) -> std::io::Result<u32>;
+
+    /// Apply a CreateCollection mutation (step 4a, after WAL persist).
+    ///
+    /// Must: register PrimaryIndex + SecondaryIndex handles, update catalog
+    /// B-trees and CatalogCache. The root pages are already allocated.
+    async fn apply_create_collection(
         &self,
         collection_id: CollectionId,
         name: &str,
+        primary_root_page: u32,
+        created_at_root_page: u32,
     ) -> std::io::Result<()>;
 
-    /// Handle a DropCollection mutation.
+    /// Apply a DropCollection mutation (step 4a, after WAL persist).
     ///
     /// Must: remove PrimaryIndex + all SecondaryIndex handles, update catalog.
-    async fn handle_drop_collection(
+    async fn apply_drop_collection(
         &self,
         collection_id: CollectionId,
     ) -> std::io::Result<()>;
 
-    /// Handle a CreateIndex mutation.
+    /// Apply a CreateIndex mutation (step 4a, after WAL persist).
     ///
-    /// Must: create secondary B-tree, register SecondaryIndex handle, update catalog.
-    async fn handle_create_index(
+    /// Must: register SecondaryIndex handle, update catalog B-trees and cache.
+    /// The root page is already allocated.
+    async fn apply_create_index(
         &self,
         index_id: IndexId,
         collection_id: CollectionId,
         name: &str,
         field_paths: &[FieldPath],
+        root_page: u32,
     ) -> std::io::Result<()>;
 
-    /// Handle a DropIndex mutation.
+    /// Apply a DropIndex mutation (step 4a, after WAL persist).
     ///
     /// Must: remove SecondaryIndex handle, update catalog.
-    async fn handle_drop_index(
+    async fn apply_drop_index(
         &self,
         index_id: IndexId,
     ) -> std::io::Result<()>;
@@ -171,18 +247,26 @@ pub struct NoOpCatalogHandler;
 
 #[async_trait::async_trait(?Send)]
 impl CatalogMutationHandler for NoOpCatalogHandler {
-    async fn handle_create_collection(&self, _: CollectionId, _: &str) -> std::io::Result<()> {
-        Ok(())
+    async fn allocate_collection_pages(&self) -> std::io::Result<(u32, u32)> {
+        Ok((0, 0))
     }
-    async fn handle_drop_collection(&self, _: CollectionId) -> std::io::Result<()> {
-        Ok(())
+    async fn allocate_index_page(&self) -> std::io::Result<u32> {
+        Ok(0)
     }
-    async fn handle_create_index(
-        &self, _: IndexId, _: CollectionId, _: &str, _: &[FieldPath],
+    async fn apply_create_collection(
+        &self, _: CollectionId, _: &str, _: u32, _: u32,
     ) -> std::io::Result<()> {
         Ok(())
     }
-    async fn handle_drop_index(&self, _: IndexId) -> std::io::Result<()> {
+    async fn apply_drop_collection(&self, _: CollectionId) -> std::io::Result<()> {
+        Ok(())
+    }
+    async fn apply_create_index(
+        &self, _: IndexId, _: CollectionId, _: &str, _: &[FieldPath], _: u32,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+    async fn apply_drop_index(&self, _: IndexId) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -267,6 +351,7 @@ impl WriteSet {
             CatalogMutation::CreateCollection {
                 name: n,
                 provisional_id,
+                ..
             } if n == name => Some(*provisional_id),
             _ => None,
         })
@@ -460,6 +545,8 @@ mod tests {
         ws.add_catalog_mutation(CatalogMutation::CreateCollection {
             name: "test".into(),
             provisional_id: CollectionId(100),
+            primary_root_page: 0,
+            created_at_root_page: 0,
         });
         assert!(!ws.is_empty());
     }
@@ -487,6 +574,8 @@ mod tests {
         ws.add_catalog_mutation(CatalogMutation::CreateCollection {
             name: "users".into(),
             provisional_id: CollectionId(42),
+            primary_root_page: 0,
+            created_at_root_page: 0,
         });
         assert_eq!(
             ws.resolve_pending_collection("users"),
@@ -500,6 +589,8 @@ mod tests {
         ws.add_catalog_mutation(CatalogMutation::DropCollection {
             collection_id: CollectionId(5),
             name: "users".into(),
+            primary_root_page: 0,
+            dropped_indexes: vec![],
         });
         assert!(ws.is_collection_dropped(CollectionId(5)));
         assert!(!ws.is_collection_dropped(CollectionId(6)));
@@ -520,5 +611,323 @@ mod tests {
         ws.replace(coll, doc, json!({"v": 2}), 5);
         let entry = ws.get(coll, &doc).unwrap();
         assert_eq!(entry.op, MutationOp::Replace);
+    }
+
+    // ─── CatalogMutation field tests ───
+
+    #[test]
+    fn create_collection_has_root_pages() {
+        let mut ws = WriteSet::new();
+        ws.add_catalog_mutation(CatalogMutation::CreateCollection {
+            name: "users".into(),
+            provisional_id: CollectionId(1),
+            primary_root_page: 10,
+            created_at_root_page: 11,
+        });
+        match &ws.catalog_mutations[0] {
+            CatalogMutation::CreateCollection {
+                primary_root_page,
+                created_at_root_page,
+                ..
+            } => {
+                assert_eq!(*primary_root_page, 10);
+                assert_eq!(*created_at_root_page, 11);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn create_collection_root_pages_default_zero() {
+        // When buffered in a transaction, root pages start at 0.
+        // They are filled in by the commit coordinator at step 3a.
+        let mut ws = WriteSet::new();
+        ws.add_catalog_mutation(CatalogMutation::CreateCollection {
+            name: "orders".into(),
+            provisional_id: CollectionId(5),
+            primary_root_page: 0,
+            created_at_root_page: 0,
+        });
+        match &ws.catalog_mutations[0] {
+            CatalogMutation::CreateCollection {
+                primary_root_page,
+                created_at_root_page,
+                ..
+            } => {
+                assert_eq!(*primary_root_page, 0);
+                assert_eq!(*created_at_root_page, 0);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn create_index_has_root_page() {
+        let mut ws = WriteSet::new();
+        ws.add_catalog_mutation(CatalogMutation::CreateIndex {
+            collection_id: CollectionId(1),
+            name: "by_email".into(),
+            field_paths: vec![FieldPath::single("email")],
+            provisional_id: IndexId(10),
+            root_page: 42,
+        });
+        match &ws.catalog_mutations[0] {
+            CatalogMutation::CreateIndex { root_page, .. } => {
+                assert_eq!(*root_page, 42);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn drop_collection_has_full_metadata() {
+        let dropped_idx = DroppedIndexMeta {
+            index_id: IndexId(20),
+            name: "_created_at".into(),
+            field_paths: vec![FieldPath::single("_created_at")],
+            root_page: 15,
+        };
+        let mut ws = WriteSet::new();
+        ws.add_catalog_mutation(CatalogMutation::DropCollection {
+            collection_id: CollectionId(1),
+            name: "users".into(),
+            primary_root_page: 10,
+            dropped_indexes: vec![dropped_idx],
+        });
+        match &ws.catalog_mutations[0] {
+            CatalogMutation::DropCollection {
+                primary_root_page,
+                dropped_indexes,
+                ..
+            } => {
+                assert_eq!(*primary_root_page, 10);
+                assert_eq!(dropped_indexes.len(), 1);
+                assert_eq!(dropped_indexes[0].index_id, IndexId(20));
+                assert_eq!(dropped_indexes[0].name, "_created_at");
+                assert_eq!(dropped_indexes[0].root_page, 15);
+                assert_eq!(dropped_indexes[0].field_paths.len(), 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn drop_collection_with_multiple_indexes() {
+        let idx1 = DroppedIndexMeta {
+            index_id: IndexId(20),
+            name: "_created_at".into(),
+            field_paths: vec![FieldPath::single("_created_at")],
+            root_page: 15,
+        };
+        let idx2 = DroppedIndexMeta {
+            index_id: IndexId(21),
+            name: "by_email".into(),
+            field_paths: vec![FieldPath::single("email")],
+            root_page: 16,
+        };
+        let idx3 = DroppedIndexMeta {
+            index_id: IndexId(22),
+            name: "by_city_zip".into(),
+            field_paths: vec![
+                FieldPath::new(vec!["address".into(), "city".into()]),
+                FieldPath::new(vec!["address".into(), "zip".into()]),
+            ],
+            root_page: 17,
+        };
+        let mut ws = WriteSet::new();
+        ws.add_catalog_mutation(CatalogMutation::DropCollection {
+            collection_id: CollectionId(1),
+            name: "users".into(),
+            primary_root_page: 10,
+            dropped_indexes: vec![idx1, idx2, idx3],
+        });
+        match &ws.catalog_mutations[0] {
+            CatalogMutation::DropCollection {
+                dropped_indexes, ..
+            } => {
+                assert_eq!(dropped_indexes.len(), 3);
+                assert_eq!(dropped_indexes[2].name, "by_city_zip");
+                assert_eq!(dropped_indexes[2].field_paths.len(), 2);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn drop_collection_empty_indexes() {
+        let mut ws = WriteSet::new();
+        ws.add_catalog_mutation(CatalogMutation::DropCollection {
+            collection_id: CollectionId(1),
+            name: "empty_coll".into(),
+            primary_root_page: 5,
+            dropped_indexes: vec![],
+        });
+        match &ws.catalog_mutations[0] {
+            CatalogMutation::DropCollection {
+                dropped_indexes, ..
+            } => {
+                assert!(dropped_indexes.is_empty());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn drop_index_has_full_metadata() {
+        let mut ws = WriteSet::new();
+        ws.add_catalog_mutation(CatalogMutation::DropIndex {
+            collection_id: CollectionId(1),
+            index_id: IndexId(10),
+            name: "by_age".into(),
+            field_paths: vec![FieldPath::single("age")],
+            root_page: 30,
+        });
+        match &ws.catalog_mutations[0] {
+            CatalogMutation::DropIndex {
+                field_paths,
+                root_page,
+                ..
+            } => {
+                assert_eq!(*root_page, 30);
+                assert_eq!(field_paths.len(), 1);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn drop_index_compound_fields() {
+        let mut ws = WriteSet::new();
+        ws.add_catalog_mutation(CatalogMutation::DropIndex {
+            collection_id: CollectionId(1),
+            index_id: IndexId(11),
+            name: "by_city_zip".into(),
+            field_paths: vec![
+                FieldPath::new(vec!["addr".into(), "city".into()]),
+                FieldPath::new(vec!["addr".into(), "zip".into()]),
+            ],
+            root_page: 31,
+        });
+        match &ws.catalog_mutations[0] {
+            CatalogMutation::DropIndex { field_paths, .. } => {
+                assert_eq!(field_paths.len(), 2);
+                assert_eq!(field_paths[0].segments(), &["addr", "city"]);
+                assert_eq!(field_paths[1].segments(), &["addr", "zip"]);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn resolve_pending_collection_ignores_root_pages() {
+        // resolve_pending_collection should work regardless of root page values
+        let mut ws = WriteSet::new();
+        ws.add_catalog_mutation(CatalogMutation::CreateCollection {
+            name: "test".into(),
+            provisional_id: CollectionId(99),
+            primary_root_page: 100,
+            created_at_root_page: 101,
+        });
+        assert_eq!(
+            ws.resolve_pending_collection("test"),
+            Some(CollectionId(99))
+        );
+    }
+
+    #[test]
+    fn is_collection_dropped_with_metadata() {
+        // is_collection_dropped should work with the new metadata fields
+        let mut ws = WriteSet::new();
+        ws.add_catalog_mutation(CatalogMutation::DropCollection {
+            collection_id: CollectionId(7),
+            name: "test".into(),
+            primary_root_page: 50,
+            dropped_indexes: vec![DroppedIndexMeta {
+                index_id: IndexId(1),
+                name: "idx".into(),
+                field_paths: vec![],
+                root_page: 51,
+            }],
+        });
+        assert!(ws.is_collection_dropped(CollectionId(7)));
+        assert!(!ws.is_collection_dropped(CollectionId(8)));
+    }
+
+    #[test]
+    fn dropped_index_meta_clone() {
+        let meta = DroppedIndexMeta {
+            index_id: IndexId(5),
+            name: "by_name".into(),
+            field_paths: vec![FieldPath::single("name")],
+            root_page: 20,
+        };
+        let cloned = meta.clone();
+        assert_eq!(cloned.index_id, IndexId(5));
+        assert_eq!(cloned.name, "by_name");
+        assert_eq!(cloned.root_page, 20);
+    }
+
+    #[test]
+    fn catalog_mutation_clone_preserves_all_fields() {
+        let original = CatalogMutation::CreateCollection {
+            name: "users".into(),
+            provisional_id: CollectionId(42),
+            primary_root_page: 10,
+            created_at_root_page: 11,
+        };
+        let cloned = original.clone();
+        match cloned {
+            CatalogMutation::CreateCollection {
+                name,
+                provisional_id,
+                primary_root_page,
+                created_at_root_page,
+            } => {
+                assert_eq!(name, "users");
+                assert_eq!(provisional_id, CollectionId(42));
+                assert_eq!(primary_root_page, 10);
+                assert_eq!(created_at_root_page, 11);
+            }
+            _ => panic!("wrong variant after clone"),
+        }
+    }
+
+    #[test]
+    fn multiple_catalog_mutations_ordering() {
+        let mut ws = WriteSet::new();
+        ws.add_catalog_mutation(CatalogMutation::CreateCollection {
+            name: "users".into(),
+            provisional_id: CollectionId(1),
+            primary_root_page: 10,
+            created_at_root_page: 11,
+        });
+        ws.add_catalog_mutation(CatalogMutation::CreateIndex {
+            collection_id: CollectionId(1),
+            name: "_created_at".into(),
+            field_paths: vec![FieldPath::single("_created_at")],
+            provisional_id: IndexId(1),
+            root_page: 12,
+        });
+        ws.add_catalog_mutation(CatalogMutation::CreateIndex {
+            collection_id: CollectionId(1),
+            name: "by_email".into(),
+            field_paths: vec![FieldPath::single("email")],
+            provisional_id: IndexId(2),
+            root_page: 13,
+        });
+        // Verify ordering is preserved (important for replay)
+        assert_eq!(ws.catalog_mutations.len(), 3);
+        assert!(matches!(
+            &ws.catalog_mutations[0],
+            CatalogMutation::CreateCollection { .. }
+        ));
+        assert!(matches!(
+            &ws.catalog_mutations[1],
+            CatalogMutation::CreateIndex { name, .. } if name == "_created_at"
+        ));
+        assert!(matches!(
+            &ws.catalog_mutations[2],
+            CatalogMutation::CreateIndex { name, .. } if name == "by_email"
+        ));
     }
 }

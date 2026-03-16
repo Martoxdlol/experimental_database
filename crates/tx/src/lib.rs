@@ -58,7 +58,7 @@ pub use read_set::{
 
 // T3: Write set
 pub use write_set::{
-    WriteSet, MutationOp, MutationEntry, CatalogMutation,
+    WriteSet, MutationOp, MutationEntry, CatalogMutation, DroppedIndexMeta,
     IndexDelta, IndexInfo, IndexResolver, compute_index_deltas,
     CatalogMutationHandler, NoOpCatalogHandler,
 };
@@ -81,5 +81,5 @@ pub use commit::{
     CommitCoordinator, ReplicationRunner, CommitHandle,
     CommitRequest, CommitResult, CommitError,
     ConflictRetry, ReplicationHook, NoReplication,
-    deserialize_wal_payload,
+    deserialize_wal_payload, WAL_PAYLOAD_VERSION,
 };

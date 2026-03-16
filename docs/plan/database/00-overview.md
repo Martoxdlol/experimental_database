@@ -17,11 +17,13 @@ Layer 6: Database Instance. Composes layers 1–5 into a fully functional embedd
 | B3 | Index Resolver | `index_resolver.rs` | B2, L5 (`IndexResolver` trait) | Yes |
 | B4 | Catalog Tracker | `catalog_tracker.rs` | B2, L5 (ReadSet, WriteSet) | Yes |
 | B5 | Transaction | `transaction.rs` | B2, B3, B4, L4, L5 | Yes (with mocks) |
-| B6 | Database | `database.rs` | B1–B5, L2, L3, L4, L5 | Yes (in-memory) |
+| B6 | Database | `database.rs` | B1–B5, B9, B10, L2, L3, L4, L5 | Yes (in-memory) |
 | B7 | Subscription Handle | `subscription.rs` | L5 (SubscriptionRegistry) | Yes |
 | B8 | System Database | `system_database.rs` | B6 | Yes |
+| B9 | Catalog Persistence | `catalog_persistence.rs` | B2, S6, S12 | Yes (with storage engine) |
+| B10 | WAL Recovery Handler | `catalog_recovery.rs` | B9, S5, S10, L3, L5 | Yes (with WAL records) |
 
-**B6 is the integration point** — it creates and wires all components. B5 (Transaction) is the primary user-facing type with the richest API surface.
+**B6 is the integration point** — it creates and wires all components. B5 (Transaction) is the primary user-facing type with the richest API surface. **B9 and B10 are the durability backbone** — they bridge runtime state with persistent storage and crash recovery.
 
 ## Implementation Phases
 
@@ -33,44 +35,61 @@ Build and fully test configuration, catalog cache (dual-indexed by name and ID),
 
 Build the catalog read tracker (encodes DDL operations into intervals on pseudo-collections) and the unified `Transaction` type. B5 is the largest module — it composes L4 (query execution) and L5 (read/write sets) into a coherent transaction API with read-your-writes, catalog name resolution, and `LimitBoundary` computation.
 
-### Phase C: Database + Subscription Handle (B6 + B7) — Depends on Phases A + B
+### Phase C: Catalog Persistence + WAL Recovery (B9 + B10) — Depends on Phases A + B
 
-Build the `Database` struct that owns all components, handles lifecycle (open/close), spawns background tasks, and implements `begin()`. Build the `SubscriptionHandle` RAII wrapper. Integration tests exercise the full stack with an in-memory storage engine.
+**This is the hardest phase.** Build catalog persistence (reading/writing catalog B-trees) and the WAL record handler for crash recovery. These modules bridge runtime state with durable storage. All operations must be idempotent (safe to replay multiple times). See `10-durability.md` for detailed design.
 
-### Phase D: System Database (B8) — Depends on Phase C
+### Phase D: Database + Subscription Handle (B6 + B7) — Depends on Phases A + B + C
+
+Build the `Database` struct that owns all components, handles lifecycle (open/close), spawns background tasks, and implements `begin()`. Build the `SubscriptionHandle` RAII wrapper. Integration tests exercise the full stack with both in-memory and file-backed storage.
+
+### Phase E: System Database (B8) — Depends on Phase D
 
 Build the multi-database registry. This is optional for the embedded use case but required for the server (L8).
+
+### Phase F: Durability Hardening — Depends on Phase D
+
+Exhaustive durability testing. Every CRUD operation, every DDL operation, and every crash scenario must be tested with file-backed storage. See `11-test-plan.md` for the full test matrix (~300 tests). **L6 is not complete until all durability tests pass.**
 
 ## File Map
 
 ```
 database/
-  lib.rs                — public facade, re-exports
-  config.rs             — B1: DatabaseConfig, TransactionConfig
-  catalog_cache.rs      — B2: dual-indexed catalog (by-name, by-id)
-  index_resolver.rs     — B3: IndexResolver implementation over CatalogCache
-  catalog_tracker.rs    — B4: catalog read/write encoding into pseudo-collections
-  transaction.rs        — B5: unified Transaction<'db> with reads, writes, DDL
-  database.rs           — B6: Database struct, open/close, begin, background tasks
-  subscription.rs       — B7: SubscriptionHandle RAII wrapper
-  system_database.rs    — B8: multi-database registry
-  error.rs              — shared error types
+  lib.rs                    — public facade, re-exports
+  config.rs                 — B1: DatabaseConfig, TransactionConfig
+  catalog_cache.rs          — B2: dual-indexed catalog (by-name, by-id)
+  index_resolver.rs         — B3: IndexResolver implementation over CatalogCache
+  catalog_tracker.rs        — B4: catalog read/write encoding into pseudo-collections
+  transaction.rs            — B5: unified Transaction<'db> with reads, writes, DDL
+  database.rs               — B6: Database struct, open/close, begin, background tasks
+  subscription.rs           — B7: SubscriptionHandle RAII wrapper
+  system_database.rs        — B8: multi-database registry
+  catalog_persistence.rs    — B9: catalog B-tree read/write, startup load, commit-time mutations
+  catalog_recovery.rs       — B10: WalRecordHandler impl, WAL replay, rollback vacuum
+  error.rs                  — shared error types
 ```
 
 ## Dependency Direction
 
 ```
-B8 (SystemDatabase) ──→ B6
-B7 (SubscriptionHandle) ──→ L5 (SubscriptionRegistry)
-B6 (Database) ──→ B1, B2, B3, B4, B5, B7, L2, L3, L5
-B5 (Transaction) ──→ B2, B3, B4, L4, L5
-B4 (CatalogTracker) ──→ B2, L5 (ReadSet, WriteSet)
-B3 (IndexResolver) ──→ B2, L5 (IndexResolver trait)
-B2 (CatalogCache) ──→ L1
-B1 (Config) ──→ L1
+B8  (SystemDatabase)       ──→ B6
+B7  (SubscriptionHandle)   ──→ L5 (SubscriptionRegistry)
+B6  (Database)             ──→ B1, B2, B3, B4, B5, B7, B9, B10, L2, L3, L4, L5
+B10 (WAL Recovery Handler) ──→ B9, L3, L5, S5, S10
+B9  (Catalog Persistence)  ──→ B2, S6, S12
+B5  (Transaction)          ──→ B2, B3, B4, L4, L5
+B4  (CatalogTracker)       ──→ B2, L5 (ReadSet, WriteSet)
+B3  (IndexResolver)        ──→ B2, L5 (IndexResolver trait)
+B2  (CatalogCache)         ──→ L1
+B1  (Config)               ──→ L1
 ```
 
 No circular dependencies. Each sub-layer depends only on sub-layers below it and on L1–L5.
+
+## Additional Design Documents
+
+- **`10-durability.md`** — Durability design: WAL recovery handler, catalog persistence, crash scenario analysis, rollback vacuum. **Must-read before implementing B6, B9, or B10.**
+- **`11-test-plan.md`** — Exhaustive test plan (~300 tests) covering unit, integration, durability, concurrency, and stress testing. **L6 is not complete until all tests pass.**
 
 ## Crate Configuration
 

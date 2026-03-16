@@ -153,9 +153,9 @@ This means:
 - The crab protocol is mostly about writer-reader coordination.
 - The writer can take a simpler approach: hold exclusive lock on the path from root to leaf, without worrying about concurrent writers.
 
-## Root Split Exception
+## Root Split (Stable Root)
 
-During a root split, a new root page is allocated (which may have a **higher** `page_id` than the old root). This is safe because the old root is already exclusively latched before the new root is allocated and latched. The new root's latch is acquired while holding the old root's latch, but since no other thread can see the new root yet (it is freshly allocated), there is no deadlock risk. This is the **one exception** to the ascending `page_id` rule (Rule 3).
+During a root split, the root page ID never changes. Instead, the root's current contents are evacuated to a freshly allocated page, and the root is rewritten in-place as the new internal node. The writer holds an exclusive latch on the root page throughout, and the evacuated page is freshly allocated (no other thread can see it). This means root splits no longer require an exception to the ascending `page_id` latch order rule — the root page is already latched, and the new evacuated page is invisible to other threads.
 
 ## Summary of Rules
 

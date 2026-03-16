@@ -26,8 +26,9 @@ pub enum ScanDirection {
 }
 
 /// A B+ tree instance. Manages a tree rooted at a specific page.
+/// The root page ID is stable — it never changes after creation.
 pub struct BTree {
-    root_page: AtomicU32,    // can change on root split
+    root_page: PageId,       // permanent, never changes
     buffer_pool: Arc<BufferPool>,
 }
 
@@ -39,7 +40,7 @@ impl BTree {
     /// Open an existing B-tree rooted at `root_page`.
     pub fn open(root_page: PageId, buffer_pool: Arc<BufferPool>) -> Self;
 
-    /// Root page ID (may change after splits).
+    /// Root page ID. Stable — never changes after creation.
     pub fn root_page(&self) -> PageId;
 
     /// Point lookup. Returns value bytes if found, None if not.
@@ -66,7 +67,7 @@ pub struct ScanStream {
     lower: Option<(Vec<u8>, bool)>,  // None = unbounded, Some((key, inclusive))
     upper: Option<(Vec<u8>, bool)>,  // None = unbounded, Some((key, inclusive))
     direction: ScanDirection,
-    root_page: PageId,  // needed for backward scan re-traversal
+    root_page: PageId,  // stable, needed for backward scan re-traversal
     done: bool,
 }
 
@@ -153,11 +154,13 @@ Insert key=K, value=V into tree:
    g. Fetch parent EXCLUSIVE
    h. If parent has space: insert promoted key + child pointer. Done.
    i. If parent full → split parent (same algorithm, recursive)
-   j. If parent is root and splits → create new root:
-      - Allocate new root page (Internal)
-      - Set prev_or_ptr = old_root
+   j. If parent is root and splits → evacuate root and rewrite:
+      - Allocate evacuated_page from free_list
+      - Copy root contents to evacuated_page (fix page_id in header)
+      - Rewrite root in-place as Internal node
+      - Set root.prev_or_ptr = evacuated_page
       - Insert one slot: (median_key, new_page)
-      - Update self.root_page
+      - Root page ID stays the same
 ```
 
 **Split Diagram**:
@@ -287,7 +290,7 @@ fn binary_search_slots(page: &SlottedPageRef, key: &[u8], is_leaf: bool) -> (boo
 4. **Insert 10K random keys**: Insert 10,000 random byte keys with random values. Get each back. All should match.
 5. **Insert sorted keys**: Insert keys in sorted order (append-only pattern). Verify all retrievable.
 6. **Insert reverse sorted**: Insert in reverse order. Verify all retrievable.
-7. **Leaf split**: Insert enough entries to force a leaf split. Verify all entries still accessible. Verify root_page changed (if root was the leaf).
+7. **Leaf split**: Insert enough entries to force a leaf split. Verify all entries still accessible. Verify root_page is unchanged (stable root).
 8. **Internal split**: Insert enough to force multiple leaf splits and an internal node split. Verify all entries.
 9. **Root split**: Force root to split. Verify new root is internal with 2 children.
 10. **Delete single**: Insert keys, delete one, verify get returns None, others still present.

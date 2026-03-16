@@ -16,7 +16,6 @@ use crate::page::{PageFullError, PageType, SlottedPage, SlottedPageRef};
 use futures_core::Stream;
 use std::ops::Bound;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::io;
 
@@ -212,8 +211,12 @@ fn delete_cell_at_pos(buf: &mut [u8], pos: u16) {
 // ─── BTree ───
 
 /// A B+ tree instance. Manages a tree rooted at a specific page.
+///
+/// The root page ID is permanent — it never changes after creation.
+/// When a root split occurs, the old root's contents are evacuated to a
+/// new page and the root page is rewritten in-place as the new internal node.
 pub struct BTree {
-    root_page: AtomicU32,
+    root_page: PageId,
     buffer_pool: Arc<BufferPool>,
 }
 
@@ -238,7 +241,7 @@ impl BTree {
         drop(guard);
 
         Ok(Self {
-            root_page: AtomicU32::new(page_id),
+            root_page: page_id,
             buffer_pool,
         })
     }
@@ -246,14 +249,14 @@ impl BTree {
     /// Open an existing B-tree rooted at `root_page`.
     pub fn open(root_page: PageId, buffer_pool: Arc<BufferPool>) -> Self {
         Self {
-            root_page: AtomicU32::new(root_page),
+            root_page,
             buffer_pool,
         }
     }
 
-    /// Root page ID (may change after splits).
+    /// Root page ID. Stable — never changes after creation.
     pub fn root_page(&self) -> PageId {
-        self.root_page.load(Ordering::Acquire)
+        self.root_page
     }
 
     /// Point lookup. Returns value bytes if found, None if not.
@@ -660,9 +663,9 @@ impl BTree {
             let this_page_id = parent_guard.page_id();
             drop(parent_guard);
 
-            // If this was the root, create a new root.
+            // If this was the root, evacuate and rewrite it.
             if path.is_empty() && this_page_id == self.root_page() {
-                self.create_new_root(this_page_id, &new_split, free_list).await?;
+                self.create_new_root(&new_split, free_list).await?;
                 return Ok(());
             }
 
@@ -670,8 +673,7 @@ impl BTree {
         }
 
         // If we get here, we split the root without a parent.
-        let old_root = self.root_page();
-        self.create_new_root(old_root, &split, free_list).await?;
+        self.create_new_root(&split, free_list).await?;
         Ok(())
     }
 
@@ -757,23 +759,45 @@ impl BTree {
         })
     }
 
-    /// Create a new root page after the old root splits.
+    /// Handle a root split by evacuating the root's current contents to a
+    /// new page and rewriting the root in-place as the new internal node.
+    ///
+    /// This keeps the root page ID stable — it never changes after creation.
     async fn create_new_root(
         &self,
-        old_root: PageId,
         split: &SplitResult,
         free_list: &mut FreeList,
     ) -> io::Result<()> {
-        let new_root_id = free_list.allocate().await?;
-        let mut guard = self.buffer_pool.new_page(new_root_id)?;
+        let root_id = self.root_page;
+
+        // 1. Allocate a page to evacuate the root's current contents into.
+        let evacuated_id = free_list.allocate().await?;
+
+        // 2. Copy root page data to the evacuated page.
+        let mut root_guard = self.buffer_pool.fetch_page_exclusive(root_id).await?;
+        let root_data = root_guard.data().to_vec();
+
+        let mut evac_guard = self.buffer_pool.new_page(evacuated_id)?;
+        evac_guard.data_mut().copy_from_slice(&root_data);
+
+        // 3. Fix the page_id in the evacuated page's header.
         {
-            let buf = guard.data_mut();
-            let mut page = SlottedPage::init(buf, new_root_id, PageType::BTreeInternal);
-            // Leftmost child = old root.
-            page.set_prev_or_ptr(old_root);
+            let mut page = SlottedPage::from_buf(evac_guard.data_mut())?;
+            let mut h = page.header();
+            h.page_id = zerocopy::byteorder::U32::<zerocopy::byteorder::LittleEndian>::new(evacuated_id);
+            page.set_header(&h);
+        }
+        drop(evac_guard);
+
+        // 4. Rewrite the root page as a new internal node.
+        {
+            let buf = root_guard.data_mut();
+            let mut page = SlottedPage::init(buf, root_id, PageType::BTreeInternal);
+            // Leftmost child = evacuated page (old root contents).
+            page.set_prev_or_ptr(evacuated_id);
             drop(page);
 
-            // Insert one slot: (median_key, new_page_id).
+            // Insert one slot: (median_key, split's new sibling page).
             let cell = encode_internal_cell(&split.median_key, split.new_page_id);
             insert_cell_at_pos(buf, &cell, 0).map_err(|_| {
                 io::Error::other(crate::error::StorageError::InternalBug(
@@ -781,9 +805,8 @@ impl BTree {
                 ))
             })?;
         }
-        drop(guard);
+        drop(root_guard);
 
-        self.root_page.store(new_root_id, Ordering::Release);
         Ok(())
     }
 }
@@ -1345,8 +1368,8 @@ mod tests {
             tree.insert(&key, &value, &mut fl).await.unwrap();
         }
 
-        // Root should have changed (original root was a leaf that split).
-        assert_ne!(tree.root_page(), initial_root);
+        // Root page ID should be stable (never changes).
+        assert_eq!(tree.root_page(), initial_root);
 
         // Verify all entries are still retrievable.
         for i in 0..200u32 {

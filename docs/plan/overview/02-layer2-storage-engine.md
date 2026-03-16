@@ -220,7 +220,7 @@ impl Stream for ScanStream {
 }
 
 pub struct BTree {
-    root_page: AtomicU32,
+    root_page: PageId,       // permanent, never changes after creation
     buffer_pool: Arc<BufferPool>,
 }
 

@@ -331,7 +331,8 @@ impl BTreeHandle {
 
 - File header is on page 0, read at startup.
 - Updated via `update_file_header()` which acquires the file header lock, applies the update, and writes page 0 through the buffer pool.
-- Updated after: checkpoint (checkpoint_lsn, visible_ts), transactional catalog mutations at commit time (catalog roots, ID allocators), free list changes (free_list_head).
+- Updated after: checkpoint (checkpoint_lsn, visible_ts), transactional catalog mutations at commit time (ID allocators), free list changes (free_list_head).
+- Catalog root pages are stable (B-tree root page IDs never change after creation), so they only need to be written once during database initialization.
 
 Both `checkpoint_lsn` and `visible_ts` are read from the FileHeader (page 0) on startup. No sidecar files are needed.
 
@@ -357,7 +358,7 @@ Both `checkpoint_lsn` and `visible_ts` are read from the FileHeader (page 0) on 
 6. **WAL append + read**: Append record, read back via read_wal_from.
 7. **Checkpoint persists data**: Insert data, checkpoint, close, reopen, data still there.
 8. **Recovery**: Insert data, DON'T checkpoint, simulate crash (just close without clean shutdown), reopen with recovery, data still there (WAL replay).
-9. **File header updates**: Create collection (updates catalog root), checkpoint (updates checkpoint_lsn), verify header reflects changes.
+9. **File header updates**: Checkpoint (updates checkpoint_lsn), verify header reflects changes. Catalog root pages are stable and written once at initialization.
 
 ### Integration Tests
 

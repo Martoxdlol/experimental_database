@@ -143,13 +143,15 @@ insert(key=M, value=...)
                  │ (if root splits)
                  ▼
 ┌──────────────────────────────────────────────────┐
-│ ROOT SPLIT                                        │
+│ ROOT SPLIT (stable root — page ID never changes) │
 │                                                   │
-│ 1. Old root becomes regular internal node        │
-│ 2. Allocate new_root_page from free_list         │
-│ 3. new_root: leftmost_child = old_root           │
-│              slot[0] = (median, new_sibling)     │
-│ 4. Update self.root_page = new_root_page         │
+│ 1. Allocate evacuated_page from free_list        │
+│ 2. Copy root contents → evacuated_page           │
+│    (fix page_id in evacuated page header)        │
+│ 3. Rewrite root in-place as Internal node:       │
+│    leftmost_child = evacuated_page               │
+│    slot[0] = (median, new_sibling)               │
+│ 4. Root page ID unchanged                        │
 │ 5. Tree height increased by 1                    │
 └──────────────────────────────────────────────────┘
 ```

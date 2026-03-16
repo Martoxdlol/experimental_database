@@ -71,7 +71,7 @@ pub async fn execute_scan<'a>(
             let row = match (body, version_ts) {
                 (Some(body_bytes), Some(ts)) => {
                     let doc = decode_document(&body_bytes)
-                        .map_err(|e| std::io::Error::other(e))?;
+                        .map_err(std::io::Error::other)?;
                     Some(ScanRow {
                         doc_id: *doc_id,
                         version_ts: ts,
@@ -150,6 +150,7 @@ pub async fn execute_scan<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_secondary_scan_stream<'a>(
     sec_index: &'a SecondaryIndex,
     lower: Bound<&'a [u8]>,
@@ -167,11 +168,10 @@ fn make_secondary_scan_stream<'a>(
         let mut returned = 0usize;
 
         while let Some(result) = scanner.next().await {
-            if let Some(limit) = limit {
-                if returned >= limit {
+            if let Some(limit) = limit
+                && returned >= limit {
                     break;
                 }
-            }
 
             let (doc_id, version_ts) = result?;
 
@@ -182,14 +182,13 @@ fn make_secondary_scan_stream<'a>(
             };
 
             let doc = decode_document(&body_bytes)
-                .map_err(|e| std::io::Error::other(e))?;
+                .map_err(std::io::Error::other)?;
 
             // Apply post-filter
-            if let Some(ref filter) = post_filter {
-                if !filter_matches(&doc, filter) {
+            if let Some(ref filter) = post_filter
+                && !filter_matches(&doc, filter) {
                     continue;
                 }
-            }
 
             returned += 1;
             yield ScanRow {
@@ -218,7 +217,7 @@ fn compute_read_interval(method: &AccessMethod) -> ReadIntervalInfo {
             // Point interval: [doc_id || 0x00..00, successor(doc_id) || 0x00..00)
             let mut lower = doc_id.as_bytes().to_vec();
             lower.extend_from_slice(&[0u8; 8]);
-            let upper_prefix = successor_key(&doc_id.as_bytes().to_vec());
+            let upper_prefix = successor_key(doc_id.as_bytes().as_ref());
             let mut upper = upper_prefix;
             upper.extend_from_slice(&[0u8; 8]);
             ReadIntervalInfo {

@@ -64,7 +64,7 @@ impl CommitLog {
         debug_assert!(
             self.entries
                 .last()
-                .map_or(true, |e| e.commit_ts < entry.commit_ts),
+                .is_none_or(|e| e.commit_ts < entry.commit_ts),
             "commit log entries must be monotonically ordered"
         );
         self.entries.push(entry);

@@ -163,6 +163,7 @@ impl Database {
     }
 
     /// Internal initialization with pre-built catalog state.
+    #[allow(clippy::too_many_arguments)]
     async fn init_with_state(
         name: String,
         config: DatabaseConfig,

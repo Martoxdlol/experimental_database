@@ -475,12 +475,7 @@ impl BTree {
                     let (mut current_page, mut current_slot) =
                         find_scan_start_async(&buffer_pool, &lower_bound, root_page).await;
 
-                    loop {
-                        let page_id = match current_page {
-                            Some(p) => p,
-                            None => break,
-                        };
-
+                    while let Some(page_id) = current_page {
                         match forward_step(&buffer_pool, page_id, current_slot, &upper_bound).await? {
                             ForwardStep::Yield(k, v) => {
                                 current_slot += 1;
@@ -503,12 +498,7 @@ impl BTree {
                     let (mut current_page, mut current_slot) =
                         find_scan_start_backward_async(&buffer_pool, &upper_bound, root_page).await;
 
-                    loop {
-                        let page_id = match current_page {
-                            Some(p) => p,
-                            None => break,
-                        };
-
+                    while let Some(page_id) = current_page {
                         match backward_step(&buffer_pool, page_id, current_slot, &lower_bound).await? {
                             BackwardStep::Yield(k, v) => {
                                 if current_slot == 0 {

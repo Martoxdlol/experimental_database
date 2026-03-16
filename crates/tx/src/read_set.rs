@@ -281,8 +281,8 @@ impl ReadSet {
 
             let mut merged: Vec<ReadInterval> = Vec::new();
             for interval in intervals.drain(..) {
-                if let Some(last) = merged.last_mut() {
-                    if bounds_overlap_or_adjacent(&last.lower, &last.upper, &interval.lower) {
+                if let Some(last) = merged.last_mut()
+                    && bounds_overlap_or_adjacent(&last.lower, &last.upper, &interval.lower) {
                         // Merge: take wider bounds
                         last.upper = bound_max_upper(&last.upper, &interval.upper);
                         last.query_id = last.query_id.min(interval.query_id);
@@ -290,7 +290,6 @@ impl ReadSet {
                             merge_limit_boundaries(&last.limit_boundary, &interval.limit_boundary);
                         continue;
                     }
-                }
                 merged.push(interval);
             }
             *intervals = merged;

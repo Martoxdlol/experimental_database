@@ -219,6 +219,7 @@ impl CommitCoordinator {
     /// - Coordinator must be `.run()` on a `LocalSet` (owns page guards).
     /// - `ReplicationRunner` must be `.run()` on any tokio task.
     /// - Handle is distributed to application code.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         initial_ts: Ts,
         visible_ts: Ts,
@@ -422,7 +423,7 @@ impl CommitCoordinator {
                     let body_bytes = entry
                         .body
                         .as_ref()
-                        .map(|v| encode_document(v));
+                        .map(encode_document);
                     if let Err(e) = primary
                         .insert_version(&doc_id, commit_ts, body_bytes.as_deref())
                         .await
@@ -456,20 +457,18 @@ impl CommitCoordinator {
             // Apply secondary index mutations
             for delta in &index_deltas {
                 if let Some(secondary) = secondaries.get(&delta.index_id) {
-                    if let Some(old_key) = &delta.old_key {
-                        if let Err(e) = secondary.remove_entry(old_key).await {
+                    if let Some(old_key) = &delta.old_key
+                        && let Err(e) = secondary.remove_entry(old_key).await {
                             tracing::error!("secondary index remove failed: {e}");
                             let _ = response_tx.send(CommitResult::QuorumLost);
                             return Err(());
                         }
-                    }
-                    if let Some(new_key) = &delta.new_key {
-                        if let Err(e) = secondary.insert_entry(new_key).await {
+                    if let Some(new_key) = &delta.new_key
+                        && let Err(e) = secondary.insert_entry(new_key).await {
                             tracing::error!("secondary index insert failed: {e}");
                             let _ = response_tx.send(CommitResult::QuorumLost);
                             return Err(());
                         }
-                    }
                 }
             }
 
@@ -792,6 +791,7 @@ fn serialize_wal_payload(commit_ts: Ts, write_set: &WriteSet) -> Vec<u8> {
 /// Deserialize a WAL payload back into commit data.
 ///
 /// Returns `(commit_ts, mutations, catalog_mutations)`.
+#[allow(clippy::type_complexity)]
 pub fn deserialize_wal_payload(
     data: &[u8],
 ) -> Result<(Ts, Vec<(CollectionId, DocId, u8, Option<Vec<u8>>)>, Vec<u8>), String> {

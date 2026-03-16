@@ -211,6 +211,7 @@ impl PrimaryIndex {
             }
 
             // Check finish() for backward mode
+            #[allow(clippy::collapsible_if)]
             if let Some((doc_id, ts)) = resolver.finish() {
                 if let Some(item) = load_and_check(btree, &engine, &doc_id, ts).await? {
                     yield item;

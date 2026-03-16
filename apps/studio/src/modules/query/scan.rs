@@ -35,7 +35,9 @@ pub fn QueryScanModule() -> Element {
         return rsx! { div { class: "empty-state", "No database open" } };
     };
 
+    #[allow(clippy::type_complexity)]
     let mut selected_collection: Signal<Option<(u64, String, u32)>> = use_signal(|| None);
+    #[allow(clippy::type_complexity)]
     let mut selected_index: Signal<Option<(u64, String, u32, Vec<Vec<String>>)>> = use_signal(|| None);
     let mut range_json: Signal<String> = use_signal(|| "[]".to_string());
     let mut filter_json: Signal<String> = use_signal(String::new);
@@ -71,12 +73,11 @@ pub fn QueryScanModule() -> Element {
                                         if val.is_empty() {
                                             selected_collection.set(None);
                                             selected_index.set(None);
-                                        } else if let Some(Some(cols)) = collections.read().as_ref() {
-                                            if let Some(col) = cols.iter().find(|c| c.id.to_string() == val) {
+                                        } else if let Some(Some(cols)) = collections.read().as_ref()
+                                            && let Some(col) = cols.iter().find(|c| c.id.to_string() == val) {
                                                 selected_collection.set(Some((col.id, col.name.clone(), col.data_root_page)));
                                                 selected_index.set(None);
                                             }
-                                        }
                                     },
                                     option { value: "", "-- select --" }
                                     if let Some(Some(cols)) = collections.read().as_ref() {
@@ -96,17 +97,14 @@ pub fn QueryScanModule() -> Element {
                                         let val = e.value();
                                         if val.is_empty() || val == "table_scan" {
                                             selected_index.set(None);
-                                        } else if let Some(Some(cols)) = collections.read().as_ref() {
-                                            if let Some((col_id, _, _)) = selected_collection.read().as_ref() {
-                                                if let Some(col) = cols.iter().find(|c| c.id == *col_id) {
-                                                    if let Some(idx) = col.indexes.iter().find(|i| i.id.to_string() == val) {
+                                        } else if let Some(Some(cols)) = collections.read().as_ref()
+                                            && let Some((col_id, _, _)) = selected_collection.read().as_ref()
+                                                && let Some(col) = cols.iter().find(|c| c.id == *col_id)
+                                                    && let Some(idx) = col.indexes.iter().find(|i| i.id.to_string() == val) {
                                                         selected_index.set(Some((
                                                             idx.id, idx.name.clone(), idx.root_page, idx.field_paths.clone(),
                                                         )));
                                                     }
-                                                }
-                                            }
-                                        }
                                     },
                                     option { value: "table_scan", "Table Scan (no index)" }
                                     if let Some((col_id, _, _)) = selected_collection.read().as_ref() {
@@ -278,6 +276,7 @@ pub fn QueryScanModule() -> Element {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_query(
     db: Option<Arc<crate::engine::DbHandle>>,
     collection: Option<(u64, String, u32)>,
@@ -467,12 +466,12 @@ fn parse_filter_value(v: &serde_json::Value) -> Result<Filter, String> {
     }
     let (op, args) = obj.iter().next().expect("len == 1 checked above");
     match op.as_str() {
-        "Eq" | "eq" => parse_comparison_filter(args, |fp, s| Filter::Eq(fp, s)),
-        "Ne" | "ne" => parse_comparison_filter(args, |fp, s| Filter::Ne(fp, s)),
-        "Gt" | "gt" => parse_comparison_filter(args, |fp, s| Filter::Gt(fp, s)),
-        "Gte" | "gte" => parse_comparison_filter(args, |fp, s| Filter::Gte(fp, s)),
-        "Lt" | "lt" => parse_comparison_filter(args, |fp, s| Filter::Lt(fp, s)),
-        "Lte" | "lte" => parse_comparison_filter(args, |fp, s| Filter::Lte(fp, s)),
+        "Eq" | "eq" => parse_comparison_filter(args, Filter::Eq),
+        "Ne" | "ne" => parse_comparison_filter(args, Filter::Ne),
+        "Gt" | "gt" => parse_comparison_filter(args, Filter::Gt),
+        "Gte" | "gte" => parse_comparison_filter(args, Filter::Gte),
+        "Lt" | "lt" => parse_comparison_filter(args, Filter::Lt),
+        "Lte" | "lte" => parse_comparison_filter(args, Filter::Lte),
         "In" | "in" => {
             let arr = args.as_array().ok_or("In value must be [field, [values]]")?;
             if arr.len() != 2 {

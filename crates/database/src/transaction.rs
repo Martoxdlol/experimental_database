@@ -156,69 +156,42 @@ impl<'db> Transaction<'db> {
         }
 
         // Fall through to primary index I/O
-        let (doc_opt, read_interval_info) = {
+        // Clone the Arc to release the lock before awaiting
+        let primary = {
             let primary_indexes = self.ctx.primary_indexes.read();
-            let primary = match primary_indexes.get(&collection_id) {
-                Some(p) => p,
-                None => {
-                    // Collection exists only in write set (pending create),
-                    // and doc_id is not in write set → definitively not found.
-                    // Or the collection is committed but has no primary index yet.
-                    // Either way, the doc doesn't exist.
-                    let ri = {
-                        let mut lower = doc_id.as_bytes().to_vec();
-                        lower.extend_from_slice(&[0u8; 8]);
-                        let upper_prefix = exdb_docstore::successor_key(&doc_id.as_bytes().to_vec());
-                        let mut upper = upper_prefix;
-                        upper.extend_from_slice(&[0u8; 8]);
-                        ReadIntervalInfo {
-                            collection_id,
-                            index_id: IndexId(0),
-                            lower,
-                            upper: Bound::Excluded(upper),
-                        }
-                    };
-                    let interval = ReadInterval {
-                        query_id,
-                        lower: Bound::Included(ri.lower.clone()),
-                        upper: ri.upper.clone(),
-                        limit_boundary: None,
-                    };
-                    self.read_set.add_interval(ri.collection_id, ri.index_id, interval);
-                    return Ok(None);
-                }
-            };
-
-            // Compute read interval info for point lookup
-            let ri = {
-                let mut lower = doc_id.as_bytes().to_vec();
-                lower.extend_from_slice(&[0u8; 8]);
-                let upper_prefix = exdb_docstore::successor_key(&doc_id.as_bytes().to_vec());
-                let mut upper = upper_prefix;
-                upper.extend_from_slice(&[0u8; 8]);
-                ReadIntervalInfo {
-                    collection_id,
-                    index_id: IndexId(0), // PRIMARY_INDEX_SENTINEL
-                    lower,
-                    upper: Bound::Excluded(upper),
-                }
-            };
-
-            // Do the primary get
-            let body = primary.get_at_ts(doc_id, self.begin_ts)
-                .await
-                .map_err(DatabaseError::Storage)?;
-
-            let doc = match body {
-                Some(bytes) => {
-                    Some(decode_document(&bytes)
-                        .map_err(|e| DatabaseError::Storage(std::io::Error::other(e)))?)
-                }
-                None => None,
-            };
-
-            (doc, ri)
+            primary_indexes.get(&collection_id).cloned()
         };
+
+        let ri = make_point_read_interval(collection_id, doc_id);
+
+        let primary = match primary {
+            Some(p) => p,
+            None => {
+                // Collection only in write set (pending create) — doc doesn't exist
+                let interval = ReadInterval {
+                    query_id,
+                    lower: Bound::Included(ri.lower.clone()),
+                    upper: ri.upper.clone(),
+                    limit_boundary: None,
+                };
+                self.read_set.add_interval(ri.collection_id, ri.index_id, interval);
+                return Ok(None);
+            }
+        };
+
+        let body = primary.get_at_ts(doc_id, self.begin_ts)
+            .await
+            .map_err(DatabaseError::Storage)?;
+
+        let doc_opt = match body {
+            Some(bytes) => {
+                Some(decode_document(&bytes)
+                    .map_err(|e| DatabaseError::Storage(std::io::Error::other(e)))?)
+            }
+            None => None,
+        };
+
+        let read_interval_info = ri;
 
         // Record read interval
         let interval = ReadInterval {
@@ -362,22 +335,36 @@ impl<'db> Transaction<'db> {
         collection_name: &str,
         index_name: &str,
     ) -> Result<(Vec<ScanRow>, ReadIntervalInfo)> {
-        let primary_indexes = self.ctx.primary_indexes.read();
-        let secondary_indexes = self.ctx.secondary_indexes.read();
-
         let collection_id = match method {
             AccessMethod::PrimaryGet { collection_id, .. }
             | AccessMethod::IndexScan { collection_id, .. }
             | AccessMethod::TableScan { collection_id, .. } => *collection_id,
         };
 
-        let primary = match primary_indexes.get(&collection_id) {
-            Some(p) => p,
-            None => {
-                // Pending collection with no physical index yet — return empty results
-                let ri = compute_read_interval_for_method(method);
-                return Ok((Vec::new(), ri));
+        // Clone Arcs out of locks before any .await
+        let primary = {
+            let guard = self.ctx.primary_indexes.read();
+            match guard.get(&collection_id) {
+                Some(p) => Arc::clone(p),
+                None => {
+                    let ri = compute_read_interval_for_method(method);
+                    return Ok((Vec::new(), ri));
+                }
             }
+        };
+
+        let sec_index = match method {
+            AccessMethod::IndexScan { index_id, .. }
+            | AccessMethod::TableScan { index_id, .. } => {
+                let guard = self.ctx.secondary_indexes.read();
+                Some(guard.get(index_id).cloned().ok_or_else(|| {
+                    DatabaseError::IndexNotFound {
+                        collection: collection_name.to_string(),
+                        index: index_name.to_string(),
+                    }
+                })?)
+            }
+            _ => None,
         };
 
         let ri = compute_read_interval_for_method(method);
@@ -400,13 +387,8 @@ impl<'db> Transaction<'db> {
                     }
                 }
             }
-            AccessMethod::IndexScan { index_id, lower, upper, post_filter, limit, direction, .. } => {
-                let sec = secondary_indexes.get(index_id).ok_or_else(|| {
-                    DatabaseError::IndexNotFound {
-                        collection: collection_name.to_string(),
-                        index: index_name.to_string(),
-                    }
-                })?;
+            AccessMethod::IndexScan { lower, upper, post_filter, limit, direction, .. } => {
+                let sec = sec_index.as_ref().unwrap();
                 let mut scanner = sec.scan_at_ts(
                     bound_as_ref(lower),
                     bound_as_ref(upper),
@@ -415,9 +397,8 @@ impl<'db> Transaction<'db> {
                 );
                 let mut returned = 0usize;
                 while let Some(result) = scanner.next().await {
-                    if let Some(lim) = limit {
-                        if returned >= *lim { break; }
-                    }
+                    if let Some(lim) = limit
+                        && returned >= *lim { break; }
                     let (doc_id, version_ts) = result.map_err(DatabaseError::Storage)?;
                     let body_bytes = match primary.get_at_ts(&doc_id, self.begin_ts).await
                         .map_err(DatabaseError::Storage)? {
@@ -426,20 +407,14 @@ impl<'db> Transaction<'db> {
                     };
                     let doc = decode_document(&body_bytes)
                         .map_err(|e| DatabaseError::Storage(std::io::Error::other(e)))?;
-                    if let Some(f) = post_filter {
-                        if !exdb_query::filter_matches(&doc, f) { continue; }
-                    }
+                    if let Some(f) = post_filter
+                        && !exdb_query::filter_matches(&doc, f) { continue; }
                     returned += 1;
                     rows.push(ScanRow { doc_id, version_ts, doc });
                 }
             }
-            AccessMethod::TableScan { index_id, direction, post_filter, limit, .. } => {
-                let sec = secondary_indexes.get(index_id).ok_or_else(|| {
-                    DatabaseError::IndexNotFound {
-                        collection: collection_name.to_string(),
-                        index: index_name.to_string(),
-                    }
-                })?;
+            AccessMethod::TableScan { direction, post_filter, limit, .. } => {
+                let sec = sec_index.as_ref().unwrap();
                 let mut scanner = sec.scan_at_ts(
                     Bound::Unbounded,
                     Bound::Unbounded,
@@ -448,9 +423,8 @@ impl<'db> Transaction<'db> {
                 );
                 let mut returned = 0usize;
                 while let Some(result) = scanner.next().await {
-                    if let Some(lim) = limit {
-                        if returned >= *lim { break; }
-                    }
+                    if let Some(lim) = limit
+                        && returned >= *lim { break; }
                     let (doc_id, version_ts) = result.map_err(DatabaseError::Storage)?;
                     let body_bytes = match primary.get_at_ts(&doc_id, self.begin_ts).await
                         .map_err(DatabaseError::Storage)? {
@@ -459,9 +433,8 @@ impl<'db> Transaction<'db> {
                     };
                     let doc = decode_document(&body_bytes)
                         .map_err(|e| DatabaseError::Storage(std::io::Error::other(e)))?;
-                    if let Some(f) = post_filter {
-                        if !exdb_query::filter_matches(&doc, f) { continue; }
-                    }
+                    if let Some(f) = post_filter
+                        && !exdb_query::filter_matches(&doc, f) { continue; }
                     returned += 1;
                     rows.push(ScanRow { doc_id, version_ts, doc });
                 }
@@ -507,8 +480,8 @@ impl<'db> Transaction<'db> {
         drop(catalog);
 
         for m in &self.write_set.catalog_mutations {
-            if let CatalogMutation::CreateIndex { collection_id: cid, name, field_paths, provisional_id } = m {
-                if *cid == collection_id {
+            if let CatalogMutation::CreateIndex { collection_id: cid, name, field_paths, provisional_id } = m
+                && *cid == collection_id {
                     result.push(IndexMeta {
                         index_id: *provisional_id,
                         collection_id: *cid,
@@ -518,7 +491,6 @@ impl<'db> Transaction<'db> {
                         state: IndexState::Ready,
                     });
                 }
-            }
         }
         Ok(result)
     }
@@ -621,25 +593,20 @@ impl<'db> Transaction<'db> {
                     .filter_map(|v| {
                         if let Some(s) = v.as_str() {
                             Some(vec![s.to_string()])
-                        } else if let Some(arr) = v.as_array() {
-                            Some(arr.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
-                        } else {
-                            None
-                        }
+                        } else { v.as_array().map(|arr| arr.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect()) }
                     })
                     .collect()
             })
             .unwrap_or_default();
 
         // Shallow merge
-        if let Some(patch_obj) = patch.as_object() {
-            if let Some(doc_obj) = current_doc.as_object_mut() {
+        if let Some(patch_obj) = patch.as_object()
+            && let Some(doc_obj) = current_doc.as_object_mut() {
                 for (key, value) in patch_obj {
                     if key == "_meta" { continue; }
                     doc_obj.insert(key.clone(), value.clone());
                 }
             }
-        }
 
         // Apply _meta.unset
         for path in &unset_fields {
@@ -759,14 +726,13 @@ impl<'db> Transaction<'db> {
         drop(catalog);
 
         for m in &self.write_set.catalog_mutations {
-            if let CatalogMutation::CreateIndex { collection_id: cid, name: n, .. } = m {
-                if *cid == collection_id && n == name {
+            if let CatalogMutation::CreateIndex { collection_id: cid, name: n, .. } = m
+                && *cid == collection_id && n == name {
                     return Err(DatabaseError::IndexAlreadyExists {
                         collection: collection.to_string(),
                         index: name.to_string(),
                     });
                 }
-            }
         }
 
         self.write_set.add_catalog_mutation(CatalogMutation::CreateIndex {
@@ -914,8 +880,8 @@ impl<'db> Transaction<'db> {
         CatalogTracker::record_index_name_lookup(&mut self.read_set, query_id, collection_id, name);
 
         for m in &self.write_set.catalog_mutations {
-            if let CatalogMutation::CreateIndex { collection_id: cid, name: n, field_paths, provisional_id } = m {
-                if *cid == collection_id && n == name {
+            if let CatalogMutation::CreateIndex { collection_id: cid, name: n, field_paths, provisional_id } = m
+                && *cid == collection_id && n == name {
                     return Ok(IndexMeta {
                         index_id: *provisional_id,
                         collection_id: *cid,
@@ -925,7 +891,6 @@ impl<'db> Transaction<'db> {
                         state: IndexState::Ready,
                     });
                 }
-            }
         }
 
         let catalog = self.ctx.catalog.read();
@@ -949,10 +914,12 @@ impl<'db> Transaction<'db> {
             };
         }
 
-        let primary_indexes = self.ctx.primary_indexes.read();
-        let primary = match primary_indexes.get(&collection_id) {
-            Some(p) => p,
-            None => return Err(DatabaseError::DocNotFound), // Pending collection, no primary index
+        let primary = {
+            let guard = self.ctx.primary_indexes.read();
+            match guard.get(&collection_id) {
+                Some(p) => Arc::clone(p),
+                None => return Err(DatabaseError::DocNotFound),
+            }
         };
 
         let body_bytes = primary.get_at_ts(doc_id, self.begin_ts).await
@@ -969,8 +936,7 @@ impl<'db> Transaction<'db> {
         Ok((doc, version_ts))
     }
 
-    fn decompose_write_set(&self, collection_id: CollectionId)
-        -> (Vec<(DocId, serde_json::Value)>, Vec<DocId>, Vec<(DocId, serde_json::Value)>)
+    fn decompose_write_set(&self, collection_id: CollectionId) -> MergeComponents
     {
         let mut inserts = Vec::new();
         let mut deletes = Vec::new();
@@ -1023,7 +989,30 @@ impl Drop for Transaction<'_> {
     }
 }
 
+// ── Types ──
+
+/// Decomposed write set for merge: (inserts, deletes, replaces).
+type MergeComponents = (
+    Vec<(DocId, serde_json::Value)>,
+    Vec<DocId>,
+    Vec<(DocId, serde_json::Value)>,
+);
+
 // ── Helper Functions ──
+
+fn make_point_read_interval(collection_id: CollectionId, doc_id: &DocId) -> ReadIntervalInfo {
+    let mut lower = doc_id.as_bytes().to_vec();
+    lower.extend_from_slice(&[0u8; 8]);
+    let upper_prefix = exdb_docstore::successor_key(doc_id.as_bytes().as_ref());
+    let mut upper = upper_prefix;
+    upper.extend_from_slice(&[0u8; 8]);
+    ReadIntervalInfo {
+        collection_id,
+        index_id: IndexId(0),
+        lower,
+        upper: Bound::Excluded(upper),
+    }
+}
 
 fn remove_nested_field(doc: &mut serde_json::Value, parent_path: &[String], last_key: &str) {
     let mut current = doc;
@@ -1056,7 +1045,7 @@ fn compute_read_interval_for_method(method: &AccessMethod) -> ReadIntervalInfo {
         AccessMethod::PrimaryGet { collection_id, doc_id } => {
             let mut lower = doc_id.as_bytes().to_vec();
             lower.extend_from_slice(&[0u8; 8]);
-            let upper_prefix = exdb_docstore::successor_key(&doc_id.as_bytes().to_vec());
+            let upper_prefix = exdb_docstore::successor_key(doc_id.as_bytes().as_ref());
             let mut upper = upper_prefix;
             upper.extend_from_slice(&[0u8; 8]);
             ReadIntervalInfo {

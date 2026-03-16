@@ -159,7 +159,7 @@ impl PageStorage for FilePageStorage {
             let mut tmp = vec![0u8; len];
             file.read_at(&mut tmp, offset)?;
             Ok::<_, io::Error>(tmp)
-        }).await.map_err(|e| io::Error::other(e))??;
+        }).await.map_err(io::Error::other)??;
         buf.copy_from_slice(&data);
         Ok(())
     }
@@ -178,7 +178,7 @@ impl PageStorage for FilePageStorage {
         tokio::task::spawn_blocking(move || {
             file.write_at(&data, offset)?;
             Ok::<_, io::Error>(())
-        }).await.map_err(|e| io::Error::other(e))??;
+        }).await.map_err(io::Error::other)??;
         Ok(())
     }
 
@@ -186,7 +186,7 @@ impl PageStorage for FilePageStorage {
         let file = self.file.clone();
         tokio::task::spawn_blocking(move || {
             file.sync_data()
-        }).await.map_err(|e| io::Error::other(e))?
+        }).await.map_err(io::Error::other)?
     }
 
     fn page_count(&self) -> u64 {
@@ -203,7 +203,7 @@ impl PageStorage for FilePageStorage {
         tokio::task::spawn_blocking(move || {
             file.set_len(new_len)?;
             file.sync_data()
-        }).await.map_err(|e| io::Error::other(e))??;
+        }).await.map_err(io::Error::other)??;
         self.page_count.store(new_count, Ordering::Release);
         Ok(())
     }
@@ -473,7 +473,7 @@ impl WalStorage for FileWalStorage {
                 }
 
             Ok(offset)
-        }).await.map_err(|e| io::Error::other(e))?
+        }).await.map_err(io::Error::other)?
     }
 
     async fn sync(&self) -> io::Result<()> {
@@ -481,7 +481,7 @@ impl WalStorage for FileWalStorage {
         tokio::task::spawn_blocking(move || {
             let inner = inner.lock();
             inner.active_segment.sync_data()
-        }).await.map_err(|e| io::Error::other(e))?
+        }).await.map_err(io::Error::other)?
     }
 
     async fn read_from(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
@@ -550,7 +550,7 @@ impl WalStorage for FileWalStorage {
 
             result.truncate(total_read);
             Ok::<_, io::Error>(result)
-        }).await.map_err(|e| io::Error::other(e))??;
+        }).await.map_err(io::Error::other)??;
 
         let n = data.len();
         buf[..n].copy_from_slice(&data);
@@ -579,7 +579,7 @@ impl WalStorage for FileWalStorage {
             }
 
             Ok(())
-        }).await.map_err(|e| io::Error::other(e))?
+        }).await.map_err(io::Error::other)?
     }
 
     fn oldest_lsn(&self) -> Option<u64> {

@@ -23,11 +23,10 @@ pub fn HeapModule() -> Element {
             let pages = db.scan_page_types().await.ok()?;
             let mut heap_pages = Vec::new();
             for (id, pt, _) in pages {
-                if pt == Some(PageType::Heap) {
-                    if let Ok(info) = db.read_page(id).await {
+                if pt == Some(PageType::Heap)
+                    && let Ok(info) = db.read_page(id).await {
                         heap_pages.push((id, info.num_slots, info.free_space));
                     }
-                }
             }
             Some(heap_pages)
         }

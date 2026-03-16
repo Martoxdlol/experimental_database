@@ -153,7 +153,7 @@ impl DoubleWriteBuffer {
             Ok(())
         })
         .await
-        .map_err(|e| io::Error::other(e))??;
+        .map_err(io::Error::other)??;
 
         // Step 3: Scatter-write each page to page_storage (async).
         for (page_id, page_data) in pages {
@@ -172,7 +172,7 @@ impl DoubleWriteBuffer {
             Ok(())
         })
         .await
-        .map_err(|e| io::Error::other(e))??;
+        .map_err(io::Error::other)??;
 
         Ok(())
     }
@@ -198,6 +198,7 @@ impl DoubleWriteBuffer {
         // Returns: Ok(None) if empty/corrupt header, Ok(Some((header, entries))) otherwise.
         let parsed = {
             let dwb_path = dwb_path.clone();
+            #[allow(clippy::type_complexity)]
             tokio::task::spawn_blocking(move || -> io::Result<Option<(DwbHeader, Vec<(PageId, Vec<u8>)>)>> {
                 let mut file = File::open(&dwb_path)?;
                 let mut header_buf = [0u8; DWB_HEADER_SIZE];
@@ -241,7 +242,7 @@ impl DoubleWriteBuffer {
                 Ok(Some((header, entries)))
             })
             .await
-            .map_err(|e| io::Error::other(e))??
+            .map_err(io::Error::other)??
         };
 
         let (header, entries) = match parsed {

@@ -29,6 +29,7 @@ pub struct MergeView<'a> {
 /// Accepts a Stream of scan results (from execute_scan) and merges with
 /// buffered writes. Collects everything into a Vec since merge-sort requires
 /// both sides to be fully materialized.
+#[allow(clippy::too_many_arguments)]
 pub async fn merge_with_writes<S>(
     mut snapshot: S,
     merge_view: &MergeView<'_>,
@@ -55,11 +56,10 @@ where
         }
         if let Some(new_body) = replace_map.get(&row.doc_id) {
             let doc = (*new_body).clone();
-            if let Some(f) = post_filter {
-                if !filter_matches(&doc, f) {
+            if let Some(f) = post_filter
+                && !filter_matches(&doc, f) {
                     continue;
                 }
-            }
             snapshot_rows.push(ScanRow {
                 doc_id: row.doc_id,
                 version_ts: row.version_ts,
@@ -77,11 +77,10 @@ where
         if !key_in_range(&sort_key, range_lower, range_upper) {
             continue;
         }
-        if let Some(f) = post_filter {
-            if !filter_matches(doc, f) {
+        if let Some(f) = post_filter
+            && !filter_matches(doc, f) {
                 continue;
             }
-        }
         insert_rows.push((*doc_id, doc.clone(), sort_key));
     }
 

@@ -98,14 +98,13 @@ pub fn validate_range(
             current_position = field_pos + 1;
             eq_count += 1;
         } else if expr.is_lower_bound() {
-            if let Some(rf) = range_field {
-                if rf != field_pos {
+            if let Some(rf) = range_field
+                && rf != field_pos {
                     return Err(RangeError::FieldOutOfOrder {
                         field: field.clone(),
                         expected_position: rf,
                     });
                 }
-            }
             if field_pos < current_position {
                 return Err(RangeError::FieldOutOfOrder {
                     field: field.clone(),
@@ -122,14 +121,13 @@ pub fn validate_range(
             has_lower = true;
         } else {
             // Upper bound
-            if let Some(rf) = range_field {
-                if rf != field_pos {
+            if let Some(rf) = range_field
+                && rf != field_pos {
                     return Err(RangeError::FieldOutOfOrder {
                         field: field.clone(),
                         expected_position: rf,
                     });
                 }
-            }
             if field_pos < current_position {
                 return Err(RangeError::FieldOutOfOrder {
                     field: field.clone(),
@@ -159,6 +157,7 @@ pub fn validate_range(
 ///
 /// Returns `(lower_bound, upper_bound)` where bounds are on the VALUE PREFIX
 /// (without doc_id/inv_ts suffix). Calls `validate_range` internally.
+#[allow(clippy::type_complexity)]
 pub fn encode_range(
     index_fields: &[FieldPath],
     range: &[RangeExpr],

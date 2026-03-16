@@ -103,6 +103,7 @@ impl SecondaryIndex {
             }
 
             // Check finish() for backward mode
+            #[allow(clippy::collapsible_if)]
             if let Some((doc_id, ts)) = resolver.finish() {
                 if let Some(pair) = verify(&primary, &doc_id, ts, read_ts).await? {
                     yield pair;

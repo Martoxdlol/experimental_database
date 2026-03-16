@@ -27,6 +27,7 @@ pub(crate) enum RecoveredCatalogMutation {
     },
     DropCollection {
         collection_id: CollectionId,
+        #[allow(dead_code)]
         name: String,
     },
     CreateIndex {
@@ -36,8 +37,10 @@ pub(crate) enum RecoveredCatalogMutation {
         provisional_id: IndexId,
     },
     DropIndex {
+        #[allow(dead_code)]
         collection_id: CollectionId,
         index_id: IndexId,
+        #[allow(dead_code)]
         name: String,
     },
 }

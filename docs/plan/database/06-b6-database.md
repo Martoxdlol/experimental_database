@@ -22,12 +22,13 @@ The core integration point. `Database` owns all components (storage engine, inde
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use exdb_core::types::{CollectionId, IndexId};
 use exdb_storage::engine::StorageEngine;
 use exdb_docstore::{PrimaryIndex, SecondaryIndex};
 use exdb_tx::{CommitHandle, TsAllocator, SubscriptionRegistry, ReplicationHook};
 use parking_lot::RwLock;
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::CancellationToken;  // add tokio-util to [dependencies]
 
 use crate::catalog_cache::CatalogCache;
 use crate::config::DatabaseConfig;

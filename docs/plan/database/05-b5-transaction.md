@@ -18,7 +18,7 @@ The unified user-facing transaction type. Composes L4 (query execution) and L5 (
 ## Rust Types
 
 ```rust
-use exdb_core::types::{CollectionId, DocId, IndexId, Ts};
+use exdb_core::types::{CollectionId, DocId, IndexId, Ts, TxId};
 use exdb_core::field_path::FieldPath;
 use exdb_core::filter::{Filter, RangeExpr};
 use exdb_storage::btree::ScanDirection;
@@ -153,9 +153,22 @@ impl<'db> Transaction<'db> {
     ) -> Result<Vec<serde_json::Value>, DatabaseError>;
 
     /// List all collections (with catalog read tracking).
-    pub fn list_collections(&mut self) -> Vec<CollectionMeta>;
+    ///
+    /// 1. Check timeout.
+    /// 2. Assign query_id.
+    /// 3. Record full-range catalog read on CATALOG_COLLECTIONS.
+    /// 4. Read from CatalogCache + pending creates in write_set.
+    /// 5. Return merged list.
+    pub fn list_collections(&mut self) -> Result<Vec<CollectionMeta>, DatabaseError>;
 
     /// List all indexes for a collection (with catalog read tracking).
+    ///
+    /// 1. Check timeout.
+    /// 2. Assign query_id.
+    /// 3. Resolve collection name (+ catalog read).
+    /// 4. Record prefix-range catalog read on CATALOG_INDEXES.
+    /// 5. Read from CatalogCache + pending creates in write_set.
+    /// 6. Return merged list.
     pub fn list_indexes(
         &mut self,
         collection: &str,
@@ -325,7 +338,7 @@ impl<'db> Transaction<'db> {
 
     // ── Introspection ──
 
-    pub fn tx_id(&self) -> u64;
+    pub fn tx_id(&self) -> TxId;
     pub fn begin_ts(&self) -> Ts;
     pub fn is_readonly(&self) -> bool;
     pub fn subscription_mode(&self) -> SubscriptionMode;

@@ -92,6 +92,7 @@ serde_json    = { workspace = true }
 thiserror     = { workspace = true }
 tracing       = { workspace = true }
 parking_lot   = { workspace = true }
+tokio-util    = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
 tokio    = { version = "1", features = ["full", "test-util"] }

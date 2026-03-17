@@ -24,6 +24,7 @@ Please see [DEVELOPMENT.md](docs/DEVELOPMENT.md) for development guidelines.
    2. Buffer pool - manages in-memory pages
    3. B+ tree - manages indexes on disk
    4. Write-ahead log - manages durability and crash recovery
-   5. Storage engine - encapsulates above components and provides an interface for higher layers
+   5. Heap - manages big unsorted data on disk
+   6. Storage engine - encapsulates above components and provides an interface for higher layers
 2. Document Store
    1. (wip)

@@ -1,16 +1,17 @@
 use async_trait::async_trait;
 
-use crate::{btree::BTree, engine::error::EngineError};
+use crate::{
+    btree::{traits::BTreeHandle, types::BTreeId},
+    engine::{error::EngineError, types::HeapRef},
+};
 
 #[async_trait]
 pub trait StorageEngine: Send + Sync {
-    // B-tree lifecycle
+    /// Allocate a new B-tree and return its opaque identifier.
+    async fn create_btree(&self) -> Result<BTreeId, EngineError>;
 
-    async fn create_btree(&self, name: &str) -> Result<BTree, EngineError>;
-
-    async fn get_btree(&self, name: &str) -> Result<BTree, EngineError>;
-
-    async fn delete_btree(&self, name: &str) -> Result<(), EngineError>;
+    /// Open a B-tree by its identifier and return a handle to operate on it.
+    async fn open_btree(&self, id: BTreeId) -> Result<Box<dyn BTreeHandle>, EngineError>;
 
     // Checkpoint & recovery
 
@@ -27,11 +28,4 @@ pub trait StorageEngine: Send + Sync {
 
     /// Free a heap-allocated blob.
     async fn heap_free(&self, href: HeapRef) -> Result<(), EngineError>;
-}
-
-/// Opaque reference to a heap-allocated blob (page_id + slot).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeapRef {
-    pub page_id: u64,
-    pub slot_id: u16,
 }

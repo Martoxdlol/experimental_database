@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 
-use crate::pager::{error::PagerError, types::PageId};
-
-pub struct PageBuffer(pub Box<[u8]>);
+use crate::pager::{
+    error::PagerError,
+    types::{PageBuffer, PageId},
+};
 
 #[async_trait]
 pub trait Pager: Send + Sync {

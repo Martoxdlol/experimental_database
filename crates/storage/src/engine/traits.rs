@@ -2,7 +2,8 @@ use async_trait::async_trait;
 
 use crate::{
     btree::{traits::BTreeHandle, types::BTreeId},
-    engine::{error::EngineError, types::HeapRef},
+    engine::error::EngineError,
+    heap::types::HeapRef,
 };
 
 #[async_trait]

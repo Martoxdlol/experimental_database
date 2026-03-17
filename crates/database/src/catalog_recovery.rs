@@ -219,8 +219,33 @@ impl DatabaseRecoveryHandler {
 
                     let cid = CollectionId(provisional_id);
 
-                    // Idempotency: skip if already loaded from checkpoint B-trees
+                    // Idempotency: skip catalog mutation if already loaded from
+                    // checkpoint B-trees, but still ensure in-memory handles exist
+                    // so that subsequent data mutations in this WAL replay succeed.
                     if self.catalog.get_collection(cid).is_some() {
+                        if !self.primary_indexes.contains_key(&cid) {
+                            let coll = self.catalog.get_collection(cid).unwrap();
+                            let external_threshold = self.storage.config().page_size / 4;
+                            let btree = self.storage.open_btree(coll.primary_root_page);
+                            let primary = Arc::new(PrimaryIndex::new(
+                                btree,
+                                Arc::clone(&self.storage),
+                                external_threshold,
+                            ));
+                            self.primary_indexes.insert(cid, Arc::clone(&primary));
+
+                            // Also ensure secondary index handles exist
+                            for idx in self.catalog.list_indexes(cid) {
+                                if !self.secondary_indexes.contains_key(&idx.index_id) {
+                                    let idx_btree = self.storage.open_btree(idx.root_page);
+                                    let secondary = Arc::new(SecondaryIndex::new(
+                                        idx_btree,
+                                        Arc::clone(&primary),
+                                    ));
+                                    self.secondary_indexes.insert(idx.index_id, secondary);
+                                }
+                            }
+                        }
                         continue;
                     }
 
@@ -262,7 +287,7 @@ impl DatabaseRecoveryHandler {
                         name: "_created_at".to_string(),
                         field_paths: vec![FieldPath::single("_created_at")],
                         root_page: actual_cat_root,
-                        state: IndexState::Ready,
+                        state: IndexState::Building,
                     };
                     CatalogPersistence::apply_create_index(
                         &self.catalog_id_btree,
@@ -382,8 +407,21 @@ impl DatabaseRecoveryHandler {
                     let cid = CollectionId(collection_id);
                     let iid = IndexId(provisional_id);
 
-                    // Idempotency: skip if already loaded from checkpoint B-trees
+                    // Idempotency: skip catalog mutation if already loaded from
+                    // checkpoint B-trees, but ensure in-memory handle exists.
                     if self.catalog.get_index(iid).is_some() {
+                        if !self.secondary_indexes.contains_key(&iid) {
+                            if let Some(idx) = self.catalog.get_index(iid) {
+                                if let Some(primary) = self.primary_indexes.get(&cid) {
+                                    let idx_btree = self.storage.open_btree(idx.root_page);
+                                    let secondary = Arc::new(SecondaryIndex::new(
+                                        idx_btree,
+                                        Arc::clone(primary),
+                                    ));
+                                    self.secondary_indexes.insert(iid, secondary);
+                                }
+                            }
+                        }
                         continue;
                     }
 
@@ -512,25 +550,27 @@ impl DatabaseRecoveryHandler {
 
 fn parse_field_paths(data: &[u8], mut offset: usize) -> (Vec<FieldPath>, usize) {
     let mut result = Vec::new();
-    if offset + 1 > data.len() {
+    if offset + 4 > data.len() {
         return (result, offset);
     }
-    let count = data[offset] as usize;
-    offset += 1;
+    let count =
+        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
     for _ in 0..count {
-        if offset + 1 > data.len() {
+        if offset + 4 > data.len() {
             break;
         }
-        let seg_count = data[offset] as usize;
-        offset += 1;
+        let seg_count =
+            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
         let mut segments = Vec::new();
         for _ in 0..seg_count {
-            if offset + 2 > data.len() {
+            if offset + 4 > data.len() {
                 break;
             }
             let seg_len =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-            offset += 2;
+                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
             if offset + seg_len > data.len() {
                 break;
             }
@@ -544,24 +584,26 @@ fn parse_field_paths(data: &[u8], mut offset: usize) -> (Vec<FieldPath>, usize) 
 }
 
 fn skip_field_paths(data: &[u8], mut offset: usize) -> usize {
-    if offset + 1 > data.len() {
+    if offset + 4 > data.len() {
         return offset;
     }
-    let count = data[offset] as usize;
-    offset += 1;
+    let count =
+        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
     for _ in 0..count {
-        if offset + 1 > data.len() {
+        if offset + 4 > data.len() {
             break;
         }
-        let seg_count = data[offset] as usize;
-        offset += 1;
+        let seg_count =
+            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
         for _ in 0..seg_count {
-            if offset + 2 > data.len() {
+            if offset + 4 > data.len() {
                 break;
             }
             let seg_len =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
-            offset += 2;
+                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
             offset += seg_len;
         }
     }
@@ -652,20 +694,20 @@ mod tests {
 
     #[test]
     fn parse_field_paths_empty() {
-        let data = [0u8];
+        let data = 0u32.to_le_bytes();
         let (paths, offset) = parse_field_paths(&data, 0);
         assert!(paths.is_empty());
-        assert_eq!(offset, 1);
+        assert_eq!(offset, 4);
     }
 
     #[test]
     fn parse_field_paths_single() {
-        let data = [
-            1u8,
-            1,
-            3, 0,
-            b'a', b'b', b'c',
-        ];
+        // Format: count(u32) || seg_count(u32) || seg_len(u32) || seg_bytes
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes()); // 1 field path
+        data.extend_from_slice(&1u32.to_le_bytes()); // 1 segment
+        data.extend_from_slice(&3u32.to_le_bytes()); // segment length 3
+        data.extend_from_slice(b"abc");
         let (paths, offset) = parse_field_paths(&data, 0);
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0].segments(), &["abc"]);
@@ -674,11 +716,19 @@ mod tests {
 
     #[test]
     fn skip_field_paths_matches_parse() {
-        let data = [
-            2u8,
-            1, 3, 0, b'a', b'b', b'c',
-            2, 1, 0, b'x', 2, 0, b'y', b'z',
-        ];
+        // 2 field paths: ["abc"] and ["x", "yz"]
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u32.to_le_bytes()); // 2 field paths
+        // First: 1 segment "abc"
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(b"abc");
+        // Second: 2 segments "x", "yz"
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(b"x");
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(b"yz");
         let (paths, parse_offset) = parse_field_paths(&data, 0);
         let skip_offset = skip_field_paths(&data, 0);
         assert_eq!(parse_offset, skip_offset);

@@ -476,6 +476,15 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Release the exclusive file lock without closing the engine.
+    ///
+    /// Used by crash simulation in tests: releases the lock so the database
+    /// can be reopened in the same process, without performing a final
+    /// checkpoint (which would defeat the purpose of crash testing).
+    pub fn unlock(&self) {
+        self.page_storage.unlock();
+    }
+
     /// Whether this engine uses durable storage.
     pub fn is_durable(&self) -> bool {
         self.is_durable

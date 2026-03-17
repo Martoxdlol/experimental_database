@@ -536,7 +536,11 @@ impl CommitCoordinator {
             }
 
             // ── Step 5: Append to Commit Log ──
-            let log_entry = build_commit_log_entry(commit_ts, &index_deltas);
+            let log_entry = build_commit_log_entry(
+                commit_ts,
+                &index_deltas,
+                &write_set.catalog_mutations,
+            );
             self.commit_log.write().append(log_entry);
         }
 
@@ -710,8 +714,14 @@ impl CommitHandle {
 
 // ─── Helper: build_commit_log_entry ───
 
-/// Convert index deltas into a [`CommitLogEntry`] for the commit log.
-fn build_commit_log_entry(commit_ts: Ts, index_deltas: &[IndexDelta]) -> CommitLogEntry {
+/// Convert index deltas and catalog mutations into a [`CommitLogEntry`] for
+/// the commit log. Catalog mutations are encoded as `IndexKeyWrite` entries
+/// on the pseudo-collections so that OCC can detect DDL conflicts.
+fn build_commit_log_entry(
+    commit_ts: Ts,
+    index_deltas: &[IndexDelta],
+    catalog_mutations: &[CatalogMutation],
+) -> CommitLogEntry {
     let mut index_writes: BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>> = BTreeMap::new();
     for delta in index_deltas {
         index_writes
@@ -723,6 +733,72 @@ fn build_commit_log_entry(commit_ts: Ts, index_deltas: &[IndexDelta]) -> CommitL
                 new_key: delta.new_key.clone(),
             });
     }
+
+    // Encode catalog mutations as writes on pseudo-collections so OCC
+    // detects conflicts between concurrent DDL operations.
+    use crate::read_set::{
+        CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX, CATALOG_INDEXES,
+        CATALOG_INDEXES_NAME_IDX,
+    };
+    for cat_mut in catalog_mutations {
+        match cat_mut {
+            CatalogMutation::CreateCollection { name, .. } => {
+                let key = name.as_bytes().to_vec();
+                index_writes
+                    .entry((CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX))
+                    .or_default()
+                    .push(IndexKeyWrite {
+                        doc_id: DocId([0; 16]),
+                        old_key: None,
+                        new_key: Some(key),
+                    });
+            }
+            CatalogMutation::DropCollection { name, .. } => {
+                let key = name.as_bytes().to_vec();
+                index_writes
+                    .entry((CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX))
+                    .or_default()
+                    .push(IndexKeyWrite {
+                        doc_id: DocId([0; 16]),
+                        old_key: Some(key),
+                        new_key: None,
+                    });
+            }
+            CatalogMutation::CreateIndex {
+                collection_id,
+                name,
+                ..
+            } => {
+                let mut key = collection_id.0.to_be_bytes().to_vec();
+                key.extend_from_slice(name.as_bytes());
+                index_writes
+                    .entry((CATALOG_INDEXES, CATALOG_INDEXES_NAME_IDX))
+                    .or_default()
+                    .push(IndexKeyWrite {
+                        doc_id: DocId([0; 16]),
+                        old_key: None,
+                        new_key: Some(key),
+                    });
+            }
+            CatalogMutation::DropIndex {
+                collection_id,
+                name,
+                ..
+            } => {
+                let mut key = collection_id.0.to_be_bytes().to_vec();
+                key.extend_from_slice(name.as_bytes());
+                index_writes
+                    .entry((CATALOG_INDEXES, CATALOG_INDEXES_NAME_IDX))
+                    .or_default()
+                    .push(IndexKeyWrite {
+                        doc_id: DocId([0; 16]),
+                        old_key: Some(key),
+                        new_key: None,
+                    });
+            }
+        }
+    }
+
     CommitLogEntry {
         commit_ts,
         index_writes,
@@ -1408,7 +1484,7 @@ mod tests {
             },
         ];
 
-        let entry = build_commit_log_entry(5, &deltas);
+        let entry = build_commit_log_entry(5, &deltas, &[]);
         assert_eq!(entry.commit_ts, 5);
         assert_eq!(entry.index_writes.len(), 2); // Two (coll, idx) groups
         assert_eq!(

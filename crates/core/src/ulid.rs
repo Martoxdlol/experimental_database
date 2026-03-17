@@ -117,34 +117,62 @@ pub fn decode_ulid(s: &str) -> Result<DocId, String> {
 }
 
 /// Generate a new ULID with current timestamp and random component.
+///
+/// Uses an atomic counter to guarantee uniqueness within the same
+/// millisecond. The random bits are seeded once per millisecond from
+/// system time + thread ID, then incremented monotonically.
 pub fn generate_ulid() -> DocId {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
+
+    // Persistent state: last timestamp and counter.
+    // The counter occupies the low 80 bits of the ULID random section.
+    // We split it into two AtomicU64s for the high 16 bits and low 64 bits.
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    static COUNTER_HI: AtomicU64 = AtomicU64::new(0);
+    static COUNTER_LO: AtomicU64 = AtomicU64::new(0);
 
     let millis = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
 
-    // ULID: 48-bit timestamp (ms) || 80-bit random
-    let timestamp_bits = (millis as u128) << 80;
+    let prev_ms = LAST_MS.load(Ordering::Relaxed);
 
-    // Simple random: use std to get some entropy
-    let random: u128 = {
-        let mut buf = [0u8; 10];
-        // Use a simple source of randomness
-        let addr = &buf as *const _ as u64;
-        let seed = millis.wrapping_mul(6364136223846793005).wrapping_add(addr);
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = (seed.wrapping_mul((i as u64).wrapping_add(1)) >> (i * 3)) as u8;
+    let (hi, lo) = if millis != prev_ms {
+        // New millisecond — reseed the random component.
+        // Use a simple but unique seed: timestamp mixed with thread ID.
+        let thread_id = std::thread::current().id();
+        // Extract a numeric value from the thread ID debug representation.
+        let tid: u64 = {
+            let s = format!("{:?}", thread_id);
+            s.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
+        };
+        let seed = millis
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(tid)
+            .wrapping_add(1442695040888963407);
+        let lo = seed;
+        let hi = seed.wrapping_mul(2862933555777941757) & 0xFFFF;
+        LAST_MS.store(millis, Ordering::Relaxed);
+        COUNTER_HI.store(hi, Ordering::Relaxed);
+        COUNTER_LO.store(lo, Ordering::Relaxed);
+        (hi, lo)
+    } else {
+        // Same millisecond — increment the counter monotonically.
+        let lo = COUNTER_LO.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let mut hi = COUNTER_HI.load(Ordering::Relaxed);
+        if lo == 0 {
+            // Carry
+            hi = COUNTER_HI.fetch_add(1, Ordering::Relaxed).wrapping_add(1) & 0xFFFF;
         }
-        let mut val: u128 = 0;
-        for &b in &buf {
-            val = (val << 8) | b as u128;
-        }
-        val
+        (hi, lo)
     };
 
-    let ulid = timestamp_bits | (random & ((1u128 << 80) - 1));
+    // ULID: 48-bit timestamp (ms) || 16-bit random_hi || 64-bit random_lo
+    let timestamp_bits = (millis as u128) << 80;
+    let random_bits = ((hi as u128) << 64) | (lo as u128);
+    let ulid = timestamp_bits | (random_bits & ((1u128 << 80) - 1));
     DocId(ulid.to_be_bytes())
 }
 

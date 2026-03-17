@@ -52,21 +52,42 @@ pub struct Database {
 
 impl Database {
     /// Open a file-backed database at the given path.
+    ///
+    /// Performs two-phase recovery:
+    /// 1. L2 physical recovery (DWB torn page restoration) via `StorageEngine::open`
+    /// 2. L6 logical recovery: replay WAL records from `checkpoint_lsn` to rebuild
+    ///    catalog, primary/secondary indexes, and timestamp state.
     pub async fn open(
         path: impl AsRef<Path>,
         config: DatabaseConfig,
         replication: Option<Box<dyn ReplicationHook>>,
     ) -> Result<Self> {
+        use tokio_stream::StreamExt;
+
         let path = path.as_ref().to_path_buf();
         let storage_config = config.to_storage_config();
 
+        // Phase 1: L2 physical recovery (DWB, page-level redo).
+        // We pass NoOpHandler because L6 recovery is done separately below
+        // (DatabaseRecoveryHandler is !Send and can't implement WalRecordHandler).
         let storage = Arc::new(
             StorageEngine::open(&path, storage_config, &mut exdb_storage::recovery::NoOpHandler)
                 .await?,
         );
 
-        let recovery_handler =
+        // Phase 2: L6 logical recovery.
+        // Load initial state from catalog B-trees (checkpointed state).
+        let mut recovery_handler =
             DatabaseRecoveryHandler::new(Arc::clone(&storage)).await?;
+
+        // Replay WAL records from checkpoint_lsn to rebuild any mutations
+        // that were committed after the last checkpoint but before the crash.
+        let checkpoint_lsn = storage.file_header().await.checkpoint_lsn.get();
+        let mut wal_stream = storage.read_wal_from(checkpoint_lsn);
+        while let Some(result) = wal_stream.next().await {
+            let record = result?;
+            recovery_handler.handle_record(&record).await?;
+        }
 
         let state = recovery_handler.into_state();
 
@@ -491,5 +512,21 @@ impl Database {
     /// Database config.
     pub fn config(&self) -> &DatabaseConfig {
         &self.config
+    }
+
+    /// Simulate a crash: cancel background tasks, release the file lock,
+    /// and drop without final checkpoint.
+    ///
+    /// This is intended for durability tests that need to verify recovery
+    /// after an unclean shutdown.
+    pub async fn crash(self) {
+        // Signal all background tasks to stop
+        self.shutdown.cancel();
+        // Give tasks a moment to observe cancellation and exit
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Release the file lock WITHOUT doing a final checkpoint.
+        // This allows reopening the database in the same process.
+        self.storage.unlock();
+        // Drop everything — no final checkpoint
     }
 }

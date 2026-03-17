@@ -650,6 +650,11 @@ impl<'db> Transaction<'db> {
             return Err(DatabaseError::InvalidName(name.to_string()));
         }
 
+        // Record a read interval on the catalog name index so that OCC
+        // detects concurrent creates of the same collection name.
+        let qid = self.read_set.next_query_id();
+        CatalogTracker::record_collection_name_lookup(&mut self.read_set, qid, name);
+
         // Check if already exists — guard scoped to block
         {
             let cache = self.catalog.read();

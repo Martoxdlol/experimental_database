@@ -24,3 +24,9 @@ async-trait = { workspace = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 tempfile = { workspace = true }
+criterion = { version = "0.5", features = ["async_tokio"] }
+serde_json = { workspace = true }
+
+[[bench]]
+name = "database"
+harness = false

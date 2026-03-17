@@ -952,3 +952,32 @@ async fn building_index_dropped_on_restart() {
         db.close().await.unwrap();
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Bug Reproduction: Delete after insert in same tx
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn delete_pending_insert_same_tx() {
+    let db = open_test_db().await;
+    create_users_collection(&db).await;
+
+    let mut tx = db.begin(TransactionOptions::default()).unwrap();
+    let id_a = tx.insert("users", json!({"name": "keep"})).await.unwrap();
+    let id_b = tx.insert("users", json!({"name": "delete_me"})).await.unwrap();
+
+    // Both visible before delete
+    assert!(tx.get("users", &id_a).await.unwrap().is_some(), "id_a before delete");
+    assert!(tx.get("users", &id_b).await.unwrap().is_some(), "id_b before delete");
+
+    tx.delete("users", &id_b).await.unwrap();
+
+    // After delete: id_a still visible, id_b gone
+    let got_a = tx.get("users", &id_a).await;
+    assert!(got_a.as_ref().unwrap().is_some(), "id_a after delete: {got_a:?}");
+    assert!(tx.get("users", &id_b).await.unwrap().is_none(), "id_b after delete");
+
+    assert_success(tx.commit().await.unwrap());
+    db.close().await.unwrap();
+}
+

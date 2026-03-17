@@ -208,39 +208,51 @@ impl DatabaseRecoveryHandler {
                     if offset + 8 > data.len() {
                         break;
                     }
-                    let primary_root_page = u32::from_le_bytes(
+                    let _primary_root_page = u32::from_le_bytes(
                         data[offset..offset + 4].try_into().unwrap(),
                     );
                     offset += 4;
-                    let created_at_root_page = u32::from_le_bytes(
+                    let _created_at_root_page = u32::from_le_bytes(
                         data[offset..offset + 4].try_into().unwrap(),
                     );
                     offset += 4;
 
                     let cid = CollectionId(provisional_id);
+
+                    // Idempotency: skip if already loaded from checkpoint B-trees
+                    if self.catalog.get_collection(cid).is_some() {
+                        continue;
+                    }
+
+                    // During WAL replay, the pre-allocated root pages from the
+                    // original commit may not exist on disk (crash before flush).
+                    // Create fresh B-trees instead.
+                    let primary_btree = self.storage.create_btree().await?;
+                    let actual_primary_root = primary_btree.root_page();
+
                     CatalogPersistence::apply_create_collection(
                         &self.catalog_id_btree,
                         &self.catalog_name_btree,
                         &mut self.catalog,
                         cid,
                         &name,
-                        primary_root_page,
+                        actual_primary_root,
                     )
                     .await?;
 
-                    // Open primary index handle
+                    // Open primary index handle with the fresh B-tree
                     let external_threshold = self.storage.config().page_size / 4;
-                    let btree = self.storage.open_btree(primary_root_page);
                     let primary = Arc::new(PrimaryIndex::new(
-                        btree,
+                        primary_btree,
                         Arc::clone(&self.storage),
                         external_threshold,
                     ));
                     self.primary_indexes.insert(cid, Arc::clone(&primary));
 
-                    // Create _created_at index
+                    // Create _created_at index with a fresh B-tree
                     let idx_id = self.catalog.allocate_index_id();
-                    let cat_btree = self.storage.open_btree(created_at_root_page);
+                    let cat_btree = self.storage.create_btree().await?;
+                    let actual_cat_root = cat_btree.root_page();
                     let secondary = Arc::new(SecondaryIndex::new(cat_btree, primary));
                     self.secondary_indexes.insert(idx_id, secondary);
 
@@ -249,7 +261,7 @@ impl DatabaseRecoveryHandler {
                         collection_id: cid,
                         name: "_created_at".to_string(),
                         field_paths: vec![FieldPath::single("_created_at")],
-                        root_page: created_at_root_page,
+                        root_page: actual_cat_root,
                         state: IndexState::Ready,
                     };
                     CatalogPersistence::apply_create_index(
@@ -362,19 +374,29 @@ impl DatabaseRecoveryHandler {
                     if offset + 4 > data.len() {
                         break;
                     }
-                    let root_page = u32::from_le_bytes(
+                    let _root_page = u32::from_le_bytes(
                         data[offset..offset + 4].try_into().unwrap(),
                     );
                     offset += 4;
 
                     let cid = CollectionId(collection_id);
                     let iid = IndexId(provisional_id);
+
+                    // Idempotency: skip if already loaded from checkpoint B-trees
+                    if self.catalog.get_index(iid).is_some() {
+                        continue;
+                    }
+
+                    // Create fresh B-tree (original pages may not have been flushed)
+                    let idx_btree = self.storage.create_btree().await?;
+                    let actual_root = idx_btree.root_page();
+
                     let meta = IndexMeta {
                         index_id: iid,
                         collection_id: cid,
                         name,
                         field_paths,
-                        root_page,
+                        root_page: actual_root,
                         state: IndexState::Building,
                     };
                     CatalogPersistence::apply_create_index(
@@ -386,9 +408,8 @@ impl DatabaseRecoveryHandler {
                     .await?;
 
                     if let Some(primary) = self.primary_indexes.get(&cid) {
-                        let btree = self.storage.open_btree(root_page);
                         let secondary =
-                            Arc::new(SecondaryIndex::new(btree, Arc::clone(primary)));
+                            Arc::new(SecondaryIndex::new(idx_btree, Arc::clone(primary)));
                         self.secondary_indexes.insert(iid, secondary);
                     }
                 }

@@ -12,13 +12,15 @@ pub trait PageHandle: Deref<Target = [u8]> + DerefMut + Send + Sync {
     fn mark_dirty(&mut self);
 }
 
+// TODO: Document page header with, page id, page type, checksum and maybe lsn?
+
 #[async_trait]
 pub trait BufferPool: Send + Sync {
     /// Retrieves a page. If not in memory, the Pager is used to load it.
     /// Increments the pin count of the page.
     async fn fetch_page(&self, id: PageId) -> Result<Box<dyn PageHandle + '_>, BufferError>;
 
-    /// Requests a new page from the Pager and pins it in the pool.
+    /// Allocates a new page.
     async fn new_page(&self) -> Result<Box<dyn PageHandle + '_>, BufferError>;
 
     /// Forces a specific page to disk if it is dirty.
@@ -27,6 +29,6 @@ pub trait BufferPool: Send + Sync {
     /// Flushes all dirty pages to disk (Checkpoint).
     async fn flush_all(&self) -> Result<(), BufferError>;
 
-    /// Deletes a page from the cache and tells the Pager to deallocate it.
+    /// Deletes a page from the cache and marks it as free.
     async fn delete_page(&self, id: PageId) -> Result<(), BufferError>;
 }

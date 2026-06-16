@@ -10,7 +10,7 @@ use std::sync::Arc;
 use exdb_core::encoding::decode_document;
 use exdb_core::field_path::FieldPath;
 use exdb_core::types::{CollectionId, DocId, IndexId, Ts};
-use exdb_docstore::{compute_index_entries, make_secondary_key_from_prefix, PrimaryIndex};
+use exdb_docstore::{PrimaryIndex, compute_index_entries, make_secondary_key_from_prefix};
 
 /// Mutation operation type.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,10 +215,7 @@ pub trait CatalogMutationHandler: Send + Sync {
     /// Apply a DropCollection mutation (step 4a, after WAL persist).
     ///
     /// Must: remove PrimaryIndex + all SecondaryIndex handles, update catalog.
-    async fn apply_drop_collection(
-        &self,
-        collection_id: CollectionId,
-    ) -> std::io::Result<()>;
+    async fn apply_drop_collection(&self, collection_id: CollectionId) -> std::io::Result<()>;
 
     /// Apply a CreateIndex mutation (step 4a, after WAL persist).
     ///
@@ -236,10 +233,7 @@ pub trait CatalogMutationHandler: Send + Sync {
     /// Apply a DropIndex mutation (step 4a, after WAL persist).
     ///
     /// Must: remove SecondaryIndex handle, update catalog.
-    async fn apply_drop_index(
-        &self,
-        index_id: IndexId,
-    ) -> std::io::Result<()>;
+    async fn apply_drop_index(&self, index_id: IndexId) -> std::io::Result<()>;
 }
 
 /// No-op catalog mutation handler (for tests without catalog support).
@@ -254,7 +248,11 @@ impl CatalogMutationHandler for NoOpCatalogHandler {
         Ok(0)
     }
     async fn apply_create_collection(
-        &self, _: CollectionId, _: &str, _: u32, _: u32,
+        &self,
+        _: CollectionId,
+        _: &str,
+        _: u32,
+        _: u32,
     ) -> std::io::Result<()> {
         Ok(())
     }
@@ -262,7 +260,12 @@ impl CatalogMutationHandler for NoOpCatalogHandler {
         Ok(())
     }
     async fn apply_create_index(
-        &self, _: IndexId, _: CollectionId, _: &str, _: &[FieldPath], _: u32,
+        &self,
+        _: IndexId,
+        _: CollectionId,
+        _: &str,
+        _: &[FieldPath],
+        _: u32,
     ) -> std::io::Result<()> {
         Ok(())
     }
@@ -289,12 +292,7 @@ impl WriteSet {
     }
 
     /// Buffer an insert mutation.
-    pub fn insert(
-        &mut self,
-        collection_id: CollectionId,
-        doc_id: DocId,
-        body: serde_json::Value,
-    ) {
+    pub fn insert(&mut self, collection_id: CollectionId, doc_id: DocId, body: serde_json::Value) {
         self.mutations.insert(
             (collection_id, doc_id),
             MutationEntry {
@@ -418,7 +416,9 @@ pub async fn compute_index_deltas(
         let old_doc: Option<serde_json::Value> = match entry.op {
             MutationOp::Insert => None,
             MutationOp::Replace | MutationOp::Delete => {
-                let previous_ts = entry.previous_ts.expect("Replace/Delete must have previous_ts");
+                let previous_ts = entry
+                    .previous_ts
+                    .expect("Replace/Delete must have previous_ts");
                 if let Some(primary) = primary_indexes.get(&collection_id) {
                     match primary.get_at_ts(&doc_id, previous_ts).await? {
                         Some(bytes) => Some(decode_document(&bytes).map_err(|e| {
@@ -455,11 +455,7 @@ pub async fn compute_index_deltas(
                     index_id: index_info.index_id,
                     collection_id,
                     doc_id,
-                    old_key: Some(make_secondary_key_from_prefix(
-                        prefix,
-                        &doc_id,
-                        previous_ts,
-                    )),
+                    old_key: Some(make_secondary_key_from_prefix(prefix, &doc_id, previous_ts)),
                     new_key: None,
                 });
             }

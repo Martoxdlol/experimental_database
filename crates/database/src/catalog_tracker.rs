@@ -7,8 +7,8 @@
 use exdb_core::types::CollectionId;
 use exdb_docstore::successor_key;
 use exdb_tx::{
-    QueryId, ReadInterval, ReadSet, CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX,
-    CATALOG_INDEXES, CATALOG_INDEXES_NAME_IDX,
+    CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX, CATALOG_INDEXES, CATALOG_INDEXES_NAME_IDX,
+    QueryId, ReadInterval, ReadSet,
 };
 use std::ops::Bound;
 
@@ -17,11 +17,7 @@ pub struct CatalogTracker;
 
 impl CatalogTracker {
     /// Record a collection name lookup (e.g., resolving "users" to CollectionId).
-    pub fn record_collection_name_lookup(
-        read_set: &mut ReadSet,
-        query_id: QueryId,
-        name: &str,
-    ) {
+    pub fn record_collection_name_lookup(read_set: &mut ReadSet, query_id: QueryId, name: &str) {
         let key = Self::encode_collection_name_key(name);
         let upper = successor_key(&key);
         read_set.add_interval(

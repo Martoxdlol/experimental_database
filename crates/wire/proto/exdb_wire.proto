@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package exdb.wire.v1;
+
+// Payload schema used when the binary frame header has encoding = 0x03.
+// The frame header carries protocol version, message type, message id, and
+// payload length; this object carries only the message-specific fields.
+message WireObject {
+  repeated WireField fields = 1;
+}
+
+message WireField {
+  string key = 1;
+  WireValue value = 2;
+}
+
+message WireList {
+  repeated WireValue values = 1;
+}
+
+message WireValue {
+  oneof kind {
+    bool bool_value = 1;
+    string string_value = 2;
+    uint64 uint64_value = 3;
+    sint64 int64_value = 4;
+    double double_value = 5;
+    WireObject object_value = 6;
+    WireList list_value = 7;
+    bool null_value = 8;
+  }
+}

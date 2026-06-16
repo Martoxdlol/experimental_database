@@ -93,11 +93,7 @@ impl InternalsTool {
         Self::DocstoreVacuum,
     ];
 
-    pub const QUERY: &[InternalsTool] = &[
-        Self::QueryScan,
-        Self::QueryFilter,
-        Self::QueryRange,
-    ];
+    pub const QUERY: &[InternalsTool] = &[Self::QueryScan, Self::QueryFilter, Self::QueryRange];
 }
 
 /// Sub-view within a collection.

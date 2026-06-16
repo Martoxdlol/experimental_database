@@ -3,14 +3,12 @@
 //! Measures insert throughput, read throughput, query performance,
 //! transaction lifecycle overhead, and concurrent access patterns.
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use serde_json::json;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-use exdb::{
-    Database, DatabaseConfig, FieldPath, Scalar, TransactionOptions,
-};
+use exdb::{Database, DatabaseConfig, FieldPath, Scalar, TransactionOptions};
 
 fn rt() -> Runtime {
     tokio::runtime::Builder::new_multi_thread()
@@ -72,9 +70,12 @@ fn bench_single_insert(c: &mut Criterion) {
     c.bench_function("insert_single_doc", |b| {
         b.to_async(&rt).iter(|| async {
             let mut tx = db.begin(TransactionOptions::default()).unwrap();
-            tx.insert("users", json!({"name": "Alice", "age": 30, "email": "alice@test.com"}))
-                .await
-                .unwrap();
+            tx.insert(
+                "users",
+                json!({"name": "Alice", "age": 30, "email": "alice@test.com"}),
+            )
+            .await
+            .unwrap();
             tx.commit().await.unwrap();
         });
     });
@@ -160,9 +161,12 @@ fn bench_index_point_query(c: &mut Criterion) {
         for batch in 0..10 {
             let mut tx = db.begin(TransactionOptions::default()).unwrap();
             for i in 0..100 {
-                tx.insert("users", json!({"name": format!("User{}", batch * 100 + i), "age": i}))
-                    .await
-                    .unwrap();
+                tx.insert(
+                    "users",
+                    json!({"name": format!("User{}", batch * 100 + i), "age": i}),
+                )
+                .await
+                .unwrap();
             }
             tx.commit().await.unwrap();
         }
@@ -175,7 +179,10 @@ fn bench_index_point_query(c: &mut Criterion) {
             tx.query(
                 "users",
                 "age_idx",
-                &[exdb::RangeExpr::Eq(FieldPath::single("age"), Scalar::Int64(42))],
+                &[exdb::RangeExpr::Eq(
+                    FieldPath::single("age"),
+                    Scalar::Int64(42),
+                )],
                 None,
                 None,
                 None,
@@ -196,9 +203,12 @@ fn bench_index_range_query(c: &mut Criterion) {
         for batch in 0..10 {
             let mut tx = db.begin(TransactionOptions::default()).unwrap();
             for i in 0..100 {
-                tx.insert("users", json!({"name": format!("User{}", batch * 100 + i), "age": i}))
-                    .await
-                    .unwrap();
+                tx.insert(
+                    "users",
+                    json!({"name": format!("User{}", batch * 100 + i), "age": i}),
+                )
+                .await
+                .unwrap();
             }
             tx.commit().await.unwrap();
         }
@@ -368,7 +378,10 @@ fn bench_patch(c: &mut Criterion) {
     let doc_id = rt.block_on(async {
         let mut tx = db.begin(TransactionOptions::default()).unwrap();
         let id = tx
-            .insert("users", json!({"name": "Alice", "age": 30, "email": "a@b.com"}))
+            .insert(
+                "users",
+                json!({"name": "Alice", "age": 30, "email": "a@b.com"}),
+            )
             .await
             .unwrap();
         tx.commit().await.unwrap();

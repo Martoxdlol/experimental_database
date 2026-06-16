@@ -22,7 +22,7 @@ pub fn QueryWorkbenchModule() -> Element {
         .map(|e| e.l6.list_collections())
         .unwrap_or_default();
 
-    let mut collection = use_signal(|| String::new());
+    let mut collection = use_signal(String::new);
     let mut index = use_signal(|| "_created_at".to_string());
     let mut direction = use_signal(|| ScanDirection::Forward);
     let mut limit = use_signal(|| 50usize);
@@ -82,7 +82,7 @@ pub fn QueryWorkbenchModule() -> Element {
                             value: "{limit.read()}",
                             oninput: move |e| {
                                 if let Ok(n) = e.value().parse::<usize>() {
-                                    limit.set(n.max(1).min(10000));
+                                    limit.set(n.clamp(1, 10000));
                                 }
                             },
                         }

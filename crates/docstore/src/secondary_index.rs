@@ -18,7 +18,20 @@ use std::sync::Arc;
 use tokio_stream::StreamExt;
 
 /// Stream type for secondary index scans.
-pub type SecondaryScanStream<'a> = Pin<Box<dyn Stream<Item = std::io::Result<(DocId, Ts)>> + Send + 'a>>;
+pub type SecondaryScanStream<'a> =
+    Pin<Box<dyn Stream<Item = std::io::Result<(DocId, Ts)>> + Send + 'a>>;
+
+/// A visible secondary index entry with its sortable key prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecondaryScanEntry {
+    pub key_prefix: Vec<u8>,
+    pub doc_id: DocId,
+    pub version_ts: Ts,
+}
+
+/// Stream type for secondary index scans that expose sortable key prefixes.
+pub type SecondaryScanEntryStream<'a> =
+    Pin<Box<dyn Stream<Item = std::io::Result<SecondaryScanEntry>> + Send + 'a>>;
 
 /// A secondary index backed by a B-tree.
 ///
@@ -55,6 +68,24 @@ impl SecondaryIndex {
         read_ts: Ts,
         direction: ScanDirection,
     ) -> SecondaryScanStream<'_> {
+        Box::pin(
+            self.scan_entries_at_ts(lower, upper, read_ts, direction)
+                .map(|entry| entry.map(|entry| (entry.doc_id, entry.version_ts))),
+        )
+    }
+
+    /// Scan with MVCC version resolution, primary verification, and key prefixes.
+    ///
+    /// Yields verified entries in index order. `key_prefix` is the secondary key
+    /// without the `doc_id || inv_ts` suffix, suitable for comparing against
+    /// encoded pending write-set rows.
+    pub fn scan_entries_at_ts(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        read_ts: Ts,
+        direction: ScanDirection,
+    ) -> SecondaryScanEntryStream<'_> {
         let primary = self.primary.clone();
         let btree = &self.btree;
         // Convert bounds to owned for the stream closure
@@ -81,22 +112,44 @@ impl SecondaryIndex {
             };
             let mut inner = btree.scan(lower_ref, upper_ref, direction);
             let mut resolver = VersionResolver::new(read_ts, direction);
+            let mut backward_best_key_prefix: Option<Vec<u8>> = None;
 
             while let Some(result) = inner.next().await {
                 let (key, _value) = result?;
                 let (doc_id, ts) = parse_secondary_key_suffix(&key)
                     .map_err(std::io::Error::other)?;
+                let key_prefix = secondary_key_prefix(&key)
+                    .map_err(std::io::Error::other)?;
 
                 match resolver.process(&doc_id, ts) {
-                    Verdict::Skip => continue,
+                    Verdict::Skip => {
+                        if direction == ScanDirection::Backward && ts <= read_ts {
+                            backward_best_key_prefix = Some(key_prefix);
+                        }
+                    }
                     Verdict::Visible => {
                         if let Some(pair) = verify(&primary, &doc_id, ts, read_ts).await? {
-                            yield pair;
+                            yield SecondaryScanEntry {
+                                key_prefix,
+                                doc_id: pair.0,
+                                version_ts: pair.1,
+                            };
                         }
                     }
                     Verdict::EmitPrevious(prev_id, prev_ts) => {
-                        if let Some(pair) = verify(&primary, &prev_id, prev_ts, read_ts).await? {
-                            yield pair;
+                        let prev_key_prefix = backward_best_key_prefix.take();
+                        if ts <= read_ts {
+                            backward_best_key_prefix = Some(key_prefix);
+                        }
+                        if let (Some(pair), Some(key_prefix)) = (
+                            verify(&primary, &prev_id, prev_ts, read_ts).await?,
+                            prev_key_prefix,
+                        ) {
+                            yield SecondaryScanEntry {
+                                key_prefix,
+                                doc_id: pair.0,
+                                version_ts: pair.1,
+                            };
                         }
                     }
                 }
@@ -106,7 +159,13 @@ impl SecondaryIndex {
             #[allow(clippy::collapsible_if)]
             if let Some((doc_id, ts)) = resolver.finish() {
                 if let Some(pair) = verify(&primary, &doc_id, ts, read_ts).await? {
-                    yield pair;
+                    if let Some(key_prefix) = backward_best_key_prefix.take() {
+                        yield SecondaryScanEntry {
+                            key_prefix,
+                            doc_id: pair.0,
+                            version_ts: pair.1,
+                        };
+                    }
                 }
             }
         })
@@ -116,6 +175,13 @@ impl SecondaryIndex {
     pub fn btree(&self) -> &BTreeHandle {
         &self.btree
     }
+}
+
+fn secondary_key_prefix(key: &[u8]) -> Result<Vec<u8>, String> {
+    if key.len() < 24 {
+        return Err(format!("secondary key too short: {} bytes", key.len()));
+    }
+    Ok(key[..key.len() - 24].to_vec())
 }
 
 /// Free async function for primary verification — usable inside streams.
@@ -134,12 +200,16 @@ async fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key_encoding::{make_secondary_key, encode_key_prefix, successor_key};
+    use crate::key_encoding::{encode_key_prefix, make_secondary_key, successor_key};
     use exdb_core::types::Scalar;
     use exdb_storage::engine::{StorageConfig, StorageEngine};
 
     async fn setup() -> (Arc<StorageEngine>, Arc<PrimaryIndex>, SecondaryIndex) {
-        let engine = Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap());
+        let engine = Arc::new(
+            StorageEngine::open_in_memory(StorageConfig::default())
+                .await
+                .unwrap(),
+        );
         let primary_btree = engine.create_btree().await.unwrap();
         let primary = Arc::new(PrimaryIndex::new(primary_btree, engine.clone(), 4096));
         let sec_btree = engine.create_btree().await.unwrap();
@@ -162,8 +232,14 @@ mod tests {
         sec.insert_entry(&key).await.unwrap();
 
         let results: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                10,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -190,12 +266,68 @@ mod tests {
                 10,
                 ScanDirection::Forward,
             )
-            .collect::<Vec<_>>().await
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, doc(1));
+    }
+
+    #[tokio::test]
+    async fn keyed_scan_reports_sort_prefix_in_scan_order() {
+        let (_engine, primary, sec) = setup().await;
+        for (i, val) in [10, 20].iter().enumerate() {
+            let d = doc(i as u8);
+            primary.insert_version(&d, 5, Some(b"body")).await.unwrap();
+            let key = make_secondary_key(&[Scalar::Int64(*val)], &d, 5);
+            sec.insert_entry(&key).await.unwrap();
+        }
+
+        let forward: Vec<_> = sec
+            .scan_entries_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                10,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let backward: Vec<_> = sec
+            .scan_entries_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                10,
+                ScanDirection::Backward,
+            )
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(forward.len(), 2);
+        assert_eq!(backward.len(), 2);
+        assert_eq!(
+            forward[0].key_prefix,
+            encode_key_prefix(&[Scalar::Int64(10)])
+        );
+        assert_eq!(
+            forward[1].key_prefix,
+            encode_key_prefix(&[Scalar::Int64(20)])
+        );
+        assert_eq!(
+            backward[0].key_prefix,
+            encode_key_prefix(&[Scalar::Int64(20)])
+        );
+        assert_eq!(
+            backward[1].key_prefix,
+            encode_key_prefix(&[Scalar::Int64(10)])
+        );
     }
 
     #[tokio::test]
@@ -212,8 +344,14 @@ mod tests {
 
         // At read_ts=7, only ts=5 is visible, and primary confirms ts=5 is latest
         let results: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 7, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                7,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -235,8 +373,14 @@ mod tests {
 
         // At read_ts=15, version resolution picks ts=5, but primary says latest is ts=10 != 5 → stale
         let results: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 15, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                15,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -254,8 +398,14 @@ mod tests {
         sec.insert_entry(&key).await.unwrap();
 
         let results: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 15, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                15,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -272,8 +422,14 @@ mod tests {
         sec.remove_entry(&key).await.unwrap();
 
         let results: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                10,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -284,8 +440,14 @@ mod tests {
     async fn empty_scan() {
         let (_engine, _primary, sec) = setup().await;
         let results: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                10,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -303,8 +465,14 @@ mod tests {
         }
 
         let results: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                10,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -324,15 +492,29 @@ mod tests {
         }
 
         let forward: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                10,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         let backward: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Backward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                10,
+                ScanDirection::Backward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
 
         assert_eq!(forward.len(), 3);
         assert_eq!(backward.len(), 3);
@@ -349,19 +531,23 @@ mod tests {
         let (_engine, primary, sec) = setup().await;
         let d = doc(1);
         primary.insert_version(&d, 5, Some(b"body")).await.unwrap();
-        let key = make_secondary_key(
-            &[Scalar::String("hello".into()), Scalar::Int64(42)],
-            &d, 5,
-        );
+        let key = make_secondary_key(&[Scalar::String("hello".into()), Scalar::Int64(42)], &d, 5);
         sec.insert_entry(&key).await.unwrap();
 
         let prefix = encode_key_prefix(&[Scalar::String("hello".into()), Scalar::Int64(42)]);
         let upper = successor_key(&prefix);
         let results: Vec<_> = sec
-            .scan_at_ts(Bound::Included(&prefix), Bound::Excluded(&upper), 10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Included(&prefix),
+                Bound::Excluded(&upper),
+                10,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -380,10 +566,17 @@ mod tests {
         let prefix = encode_key_prefix(&[Scalar::String("shared".into())]);
         let upper = successor_key(&prefix);
         let results: Vec<_> = sec
-            .scan_at_ts(Bound::Included(&prefix), Bound::Excluded(&upper), 10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Included(&prefix),
+                Bound::Excluded(&upper),
+                10,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(results.len(), 10);
     }
 
@@ -403,10 +596,17 @@ mod tests {
 
         // At ts=15: secondary sees ts=5 but primary latest is ts=10 → stale
         let results: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 15, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                15,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -426,19 +626,33 @@ mod tests {
 
         // At ts=7: only ts=5 visible, matches primary
         let r: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 7, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                7,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].1, 5);
 
         // At ts=15: ts=10 visible, matches primary
         let r: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 15, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                15,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].1, 10);
     }
@@ -457,20 +671,34 @@ mod tests {
 
         // Unbounded, Unbounded → all 5
         let r: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                10,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(r.len(), 5);
 
         // Exact range for value=2
         let lower = encode_key_prefix(&[Scalar::Int64(2)]);
         let upper = successor_key(&lower);
         let r: Vec<_> = sec
-            .scan_at_ts(Bound::Included(&lower), Bound::Excluded(&upper), 10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Included(&lower),
+                Bound::Excluded(&upper),
+                10,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].0, doc(2));
     }
@@ -487,10 +715,17 @@ mod tests {
 
         // read_ts=5: entry at ts=10 invisible
         let r: Vec<_> = sec
-            .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 5, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .scan_at_ts(
+                Bound::Unbounded,
+                Bound::Unbounded,
+                5,
+                ScanDirection::Forward,
+            )
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert!(r.is_empty());
     }
 }

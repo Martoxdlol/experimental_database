@@ -2,10 +2,7 @@ use dioxus::prelude::*;
 
 /// Hex dump display component. Renders bytes in `OFFSET: HH HH ... | ASCII` format.
 #[component]
-pub fn HexDump(
-    data: Vec<u8>,
-    #[props(default = 16)] bytes_per_line: usize,
-) -> Element {
+pub fn HexDump(data: Vec<u8>, #[props(default = 16)] bytes_per_line: usize) -> Element {
     let lines: Vec<String> = data
         .chunks(bytes_per_line)
         .enumerate()
@@ -18,7 +15,13 @@ pub fn HexDump(
                 .join(" ");
             let ascii: String = chunk
                 .iter()
-                .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+                .map(|&b| {
+                    if b.is_ascii_graphic() || b == b' ' {
+                        b as char
+                    } else {
+                        '.'
+                    }
+                })
                 .collect();
             let padding = " ".repeat((bytes_per_line - chunk.len()) * 3);
             format!("{offset:08X}  {hex}{padding}  |{ascii}|")

@@ -4,6 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-exdb = { workspace = true }
+async-trait = { workspace = true }
+exdb-core = { workspace = true }
+exdb-tx = { workspace = true }
 exdb-storage = { workspace = true }
+futures-util = { workspace = true }
+parking_lot = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

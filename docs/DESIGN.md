@@ -52,6 +52,9 @@ Documents are schema-less but the system recognizes the following value types:
   - BSON has native binary data subtype support (no base64 overhead).
   - BSON has a native datetime type (used for `_created_at` — see 1.11).
   - Rust: `bson` crate. JavaScript: `bson` (official MongoDB package).
+- The Rust embedded API supports both JSON-facing document methods and native
+  BSON document methods. BSON embedded callers can pass and receive native
+  binary values directly instead of using JSON `_meta.types` sidecar hints.
 - JSON is supported as an alternative wire format for debugging and human-readable tooling, with the caveat that bytes must be base64-encoded and int64/float64 distinction relies on the presence of a decimal point.
 - Maximum document size: **16 MB** binary-encoded (configurable per database).
 
@@ -557,29 +560,29 @@ All WAL record payloads use a compact binary encoding. Multi-byte integers are *
 
 | Code | Name | Scope | Description |
 |------|------|-------|-------------|
-| `0x01` | `TxCommit` | per-database | Transaction commit with mutations, index deltas, and catalog mutations (DDL) |
+| `0x01` | `TxCommit` | per-database | Transaction commit with document mutations and catalog mutations (DDL) |
 | `0x02` | `Checkpoint` | per-database | Marks a successful checkpoint |
 | `0x03`–`0x06` | *(reserved)* | — | Formerly separate DDL records; now part of `TxCommit` |
 | `0x07` | `IndexReady` | per-database | Index build completed (`Building` → `Ready`) |
-| `0x08` | `Vacuum` | per-database | Old document versions removed |
+| `0x08` | `Vacuum` | per-database | Reserved for persisted vacuum/removal records; current replay treats it as informational |
+| `0x09` | `VisibleTs` | per-database | Advances the durable read-visible timestamp |
+| `0x0A` | `RollbackVacuum` | per-database | Reserved for explicit rollback-vacuum summaries; current replay treats it as informational |
 | `0x10` | `CreateDatabase` | system | New database created (`_system` WAL only) |
 | `0x11` | `DropDatabase` | system | Database dropped (`_system` WAL only) |
 
-Types `0x10`–`0x11` are only written to the `_system` database WAL. Types `0x01`–`0x08` are written to per-database WALs. Codes `0x09`–`0x0F` and `0x12`–`0xFF` are reserved for future use. Catalog DDL (create/drop collection/index) is embedded in the `TxCommit` record to ensure atomicity with data mutations within the same transaction.
+Types `0x10`–`0x11` are only written to the `_system` database WAL. Types `0x01`–`0x0A` are per-database record codes, though `0x08` and `0x0A` are currently informational/reserved in replay. Codes `0x0B`–`0x0F` and `0x12`–`0xFF` are reserved for future use. Catalog DDL (create/drop collection/index) is embedded in the `TxCommit` record to ensure atomicity with data mutations within the same transaction.
 
 ---
 
 **`TxCommit` (0x01)**
 
 ```
-tx_id:                    u64
-commit_ts:                u64
-catalog_mutation_count:   u32
-catalog_mutations:        CatalogMutation[catalog_mutation_count]
-mutation_count:            u32
-mutations:                 Mutation[mutation_count]
-index_delta_count:         u32
-index_deltas:              IndexDelta[index_delta_count]
+version:                 u8
+commit_ts:               u64
+mutation_count:          u32
+mutations:               Mutation[mutation_count]
+catalog_mutation_count:  u32
+catalog_mutations:       CatalogMutation[catalog_mutation_count]
 ```
 
 **CatalogMutation** (variable length):
@@ -589,23 +592,50 @@ op_type:         u8       (0x01 = CreateCollection, 0x02 = DropCollection,
                             0x03 = CreateIndex, 0x04 = DropIndex)
 
 [if CreateCollection]:
-  collection_id: u64
-  name_len:      u16
+  collection_id:         u64
+  name_len:              u32
   name:          [u8; name_len]   (UTF-8)
+  primary_root_page:     u32
+  created_at_root_page:  u32
 
 [if DropCollection]:
-  collection_id: u64
+  collection_id:         u64
+  name_len:              u32
+  name:          [u8; name_len]   (UTF-8)
+  primary_root_page:     u32
+  dropped_index_count:   u32
+  dropped_indexes:       DroppedIndexMeta[dropped_index_count]
 
 [if CreateIndex]:
   index_id:       u64
   collection_id:  u64
-  name_len:       u16
+  name_len:       u32
   name:           [u8; name_len]   (UTF-8)
-  field_count:    u8
-  field_paths:    FieldPath[field_count]
+  field_paths:    FieldPath[]
+  root_page:      u32
 
 [if DropIndex]:
   index_id:       u64
+  collection_id:  u64
+  name_len:       u32
+  name:           [u8; name_len]   (UTF-8)
+  field_paths:    FieldPath[]
+  root_page:      u32
+```
+
+Within TxCommit catalog mutations, `field_paths` are encoded as `u32 path_count`
+followed by each path as `u32 segment_count` and `segment_count` entries of
+`u32 segment_len || segment_bytes`.
+
+**DroppedIndexMeta** stores the full metadata needed to reverse an unreplicated
+drop during startup rollback vacuum:
+
+```
+index_id:       u64
+name_len:       u32
+name:           [u8; name_len]   (UTF-8)
+field_paths:    FieldPath[]
+root_page:      u32
 ```
 
 Catalog mutations are applied **before** data mutations during both commit and WAL replay, so that newly created collections exist before documents are inserted into them.
@@ -628,33 +658,7 @@ body:           [u8; body_len]   (BSON-encoded document; empty for Delete)
 
 The WAL stores the final document state, never the delta. This simplifies replay — each mutation is self-contained. Patches never appear in the WAL; they are always resolved to a Replace with the fully merged body.
 
-**IndexDelta**:
-
-```
-index_id:       u64
-collection_id:  u64
-doc_id:         u128
-has_old_key:    u8      (0 = no, 1 = yes)
-[if has_old_key = 1]:
-  old_key_len:  u16
-  old_key:      [u8; old_key_len]
-has_new_key:    u8      (0 = no, 1 = yes)
-[if has_new_key = 1]:
-  new_key_len:  u16
-  new_key:      [u8; new_key_len]
-```
-
-- **Insert**: `has_old_key = 0`, `has_new_key = 1`.
-- **Delete**: `has_old_key = 1`, `has_new_key = 0`.
-- **Update** (value changed): both present.
-- **Update** (indexed value unchanged): both present, keys are identical. Emitted for correctness; can be deduplicated by the reader.
-
-Array-indexed fields produce one `IndexDelta` per array element affected. A single mutation on a document with a 5-element array index produces up to 10 deltas (5 old + 5 new).
-
-Index deltas are computed at commit time from the write set (see 5.5.1) and stored in the WAL to enable:
-- **Fast replay**: page store and secondary indexes can be updated directly from the deltas without recomputing keys from document bodies.
-- **Replication**: replicas apply index updates without needing to resolve index definitions.
-- **Subscription invalidation**: replicas use the encoded keys for interval overlap checks (see 5.8).
+Secondary index deltas are computed at commit time from the write set (see 5.5.1) and kept in the in-memory commit log for OCC and subscription invalidation. They are not serialized into the current TxCommit payload. Recovery and replica WAL apply first replay primary document versions and catalog mutations, then rebuild every Ready secondary index from the recovered primary versions at the durable `visible_ts`. This makes replay independent of which dirty secondary-index pages reached the page store before a crash. Building indexes are dropped on startup and must be rebuilt.
 
 ---
 
@@ -684,6 +688,10 @@ Written when background index building (section 3.7) completes successfully. On 
 
 **`Vacuum` (0x08)**
 
+`Vacuum` is reserved for a future persisted physical-vacuum log. Current recovery treats this record type as informational and relies on idempotent MVCC visibility plus later vacuum/repair passes rather than replaying vacuum removals from WAL.
+
+The reserved payload shape is:
+
 ```
 collection_id:    u64
 entry_count:      u32
@@ -707,7 +715,23 @@ key_len:    u16
 key:        [u8; key_len]
 ```
 
-On replay: for each entry, remove the primary B-tree cell keyed by `doc_id || inv_ts(removed_ts)` and all listed secondary index key entries. The operation is idempotent — if a cell or key is already absent, it is a no-op.
+If activated in a future format version, replay would remove the primary B-tree cell keyed by `doc_id || inv_ts(removed_ts)` and all listed secondary index key entries. The operation must be idempotent — if a cell or key is already absent, it is a no-op.
+
+---
+
+**`VisibleTs` (0x09)**
+
+```
+visible_ts: u64
+```
+
+Records the highest commit timestamp that is durable and visible to new transactions. On replay, the database tracks the maximum visible timestamp. If TxCommit replay recovers commits with `commit_ts > visible_ts`, startup rollback vacuum removes the unreplicated/unacknowledged effects before opening the database.
+
+---
+
+**`RollbackVacuum` (0x0A)**
+
+`RollbackVacuum` is reserved for a future persisted summary of startup rollback cleanup. The current implementation keeps rollback idempotent instead: it replays TxCommit records, removes effects with `commit_ts > visible_ts`, and checkpoints the repaired page/free-list/header state. During replay, `RollbackVacuum` records are informational no-ops.
 
 ---
 
@@ -926,6 +950,11 @@ The `_system/` directory is itself a database instance, opened first on startup.
 | `config` | `DatabaseConfig` | Page size, memory budget, max doc size, resource limits |
 | `state` | `u8` | `Active`, `Dropping`, `Creating` |
 
+`DatabaseConfig` is validated before a registry entry is persisted or a
+database is opened/restored. Unusable resource settings, such as memory budgets
+below page size or zero transaction work budgets, are rejected as configuration
+errors instead of becoming partially-created database entries.
+
 **Catalog B-tree key** (in `_system`):
 
 ```
@@ -1071,16 +1100,45 @@ Page 0 of every `data.db` file is reserved as the **file header**. It uses a fix
 │   page_size:          u32               │  Page size in bytes (e.g. 8192)
 │   page_count:         u64               │  Total pages in data file
 │   free_list_head:     u32               │  First free page (0 = none)
-│   catalog_root_page:  u32               │  Root page of catalog B-tree
+│   catalog_root_page:  u32               │  Root page of catalog by-ID B-tree
+│   catalog_name_root:  u32               │  Root page of catalog by-name B-tree
 │   next_collection_id: u64               │  Monotonic ID allocator
 │   next_index_id:      u64               │  Monotonic ID allocator
 │   checkpoint_lsn:     u64               │  LSN of last checkpoint
+│   visible_ts:         u64               │  Latest timestamp visible to readers
+│   replication_lsn:    u64               │  Highest primary WAL LSN applied by replica
+│   generation:         u64               │  Cluster generation for replacement detection
 │   created_at:         u64               │  Database creation timestamp
 │   reserved:           [u8; ...]         │  Remainder of page (zeroed)
 └──────────────────────────────────────────┘
 ```
 
-The file header is updated during checkpointing (page count, free list head, checkpoint LSN) and during transactional catalog mutations at commit time (catalog root page, ID allocators). Updates go through the buffer pool like any other page — the header page is pinned, modified, marked dirty, and flushed during checkpoint.
+The file header is updated during checkpointing (page count, free list head, checkpoint LSN), during transactional catalog mutations at commit time (catalog roots, ID allocators), when local visibility advances (`visible_ts`), and when a replica durably applies primary WAL (`replication_applied_lsn` in code, shortened to `replication_lsn` above for layout fit). Updates go through the buffer pool like any other page — the header page is pinned, modified, marked dirty, and flushed during checkpoint. Replicas use this value as the durable restart position for incremental catch-up and primary WAL retention decisions.
+
+#### 2.12.3.1 File Format Compatibility Policy
+
+The current durable data-file format version is `1`.
+
+- On open, the storage engine verifies the primary file header magic, checksum,
+  page type, page ID, and version.
+- If the primary header is corrupt, the engine verifies the shadow header at the
+  reserved final page and restores the primary header only when the shadow is
+  valid and has the supported version.
+- A data file whose primary and shadow headers both contain an unsupported
+  version is rejected. The engine does not silently downgrade, upgrade, or
+  reinterpret unknown page formats.
+- Forward migrations require an explicit migration path that reads the old
+  version, writes the new version, and preserves crash recovery invariants.
+
+The current `TxCommit` WAL payload format version is `3`.
+
+- Version `3` stores document bodies as BSON.
+- Version `2` is accepted for recovery and converts legacy JSON document bodies
+  to BSON during replay.
+- Version `1` was unversioned. It is accepted only as a best-effort legacy
+  format for payloads that do not collide with the explicit version namespace.
+- Explicit WAL payload versions greater than the current version are rejected
+  during recovery instead of being guessed as legacy data.
 
 #### 2.12.4 In-Memory Catalog Cache
 
@@ -1256,6 +1314,13 @@ Phase 1 — File-level checks:
 1. Verify file header (page 0) checksum. Verify shadow header matches.
 2. Verify `meta.json` is readable and consistent with file header (`checkpoint_lsn`, `page_size`).
 3. Verify file size is consistent with `page_count * page_size`.
+
+WAL-level checks:
+
+- Scan retained WAL frames from the oldest retained LSN to the logical WAL end.
+- Verify each frame header, payload length, and record CRC.
+- Report truncated, zero-length, oversized, or checksum-mismatched WAL frames
+  and record WAL scan counters.
 
 Phase 2 — Page-level checks:
 
@@ -2004,6 +2069,7 @@ To prevent unbounded read set growth in long-running transactions:
 | Limit | Default | Description |
 |-------|---------|-------------|
 | `max_intervals` | 4,096 | Maximum number of intervals across all indexes |
+| `max_operations` | 100,000 | Maximum coarse transaction work units, including public operations and scanned index rows |
 | `max_scanned_bytes` | 64 MB | Maximum total bytes read from index + primary B-trees |
 | `max_scanned_docs` | 100,000 | Maximum documents scanned (including those filtered out) |
 
@@ -2437,6 +2503,13 @@ When a write transaction on a replica reaches commit:
 
 If OCC fails and `subscribe: true`: the originating replica starts a new write transaction at the current timestamp and notifies the client with the new `tx_id`.
 
+Management DDL issued to a replica follows the same primary-routing principle:
+database create/drop, collection create/drop, and index create/drop requests are
+forwarded to the primary as typed management intents. The primary applies them
+through the normal system catalog or database management path, then returns the
+management response payload to the originating replica. Replicas do not mutate
+local catalogs directly for promoted management writes.
+
 ### 6.5 Replication Consistency
 
 **Quorum-based synchronous replication** — the primary sends each WAL record to all online replicas and waits for acknowledgements. On timeout (`primary_ack_timeout`, default 5s):
@@ -2532,7 +2605,7 @@ All transports carry the same frame format and message semantics. The choice of 
 | TCP | None | Development and trusted networks |
 | TLS | TLS 1.3 (over TCP) | Production default |
 | QUIC | TLS 1.3 (built-in) | Lower latency, connection migration, native multiplexing |
-| WebSocket | Optional (ws:// or wss://) | Browser clients, HTTP infrastructure compatibility |
+| WebSocket | Optional (`ws://` or `wss://`) | Browser clients, HTTP infrastructure compatibility |
 
 ### 7.2 Frame Format
 
@@ -3005,10 +3078,46 @@ Response: `ok`. Error `unknown_database` if not found.
 {"id":22, "type":"list_databases"}
 ```
 
-Response: `ok` with array of database metadata.
+Response: `ok` with array of database metadata, including point-in-time
+resource usage for each visible database.
 
 ```json
-{"id":22, "type":"ok", "databases":[{"name":"myapp","state":"active","created_at":100},{"name":"analytics","state":"active","created_at":200}]}
+{
+  "id": 22,
+  "type": "ok",
+  "databases": [
+    {
+      "name": "myapp",
+      "state": "active",
+      "created_at": 100,
+      "usage": {
+        "disk_usage_bytes": 1048576,
+        "page_store_bytes": 786432,
+        "wal_retained_bytes": 262144,
+        "memory_budget_bytes": 67108864,
+        "buffer_pool_used_frames": 12,
+        "active_transactions": 0,
+        "page_count": 192,
+        "page_size": 4096
+      }
+    },
+    {
+      "name": "analytics",
+      "state": "active",
+      "created_at": 200,
+      "usage": {
+        "disk_usage_bytes": 2097152,
+        "page_store_bytes": 1835008,
+        "wal_retained_bytes": 262144,
+        "memory_budget_bytes": 134217728,
+        "buffer_pool_used_frames": 24,
+        "active_transactions": 0,
+        "page_count": 448,
+        "page_size": 4096
+      }
+    }
+  ]
+}
 ```
 
 #### 7.6.5 Collection Management
@@ -3287,6 +3396,35 @@ Type matching follows section 1.6: comparisons are type-strict. An `int64` value
 
 This applies to both index range expressions and post-filter expressions.
 
+For `query` messages, `_meta.types` mirrors the query predicate tree:
+
+```json
+{
+  "type": "query",
+  "tx": 1,
+  "collection": "users",
+  "index": "avatar_idx",
+  "range": [{"eq": ["avatar", "AQID"]}],
+  "filter": {"eq": ["owner_id", "00000000000000000000000000"]},
+  "_meta": {
+    "types": {
+      "range": [{"eq": "bytes"}],
+      "filter": {"eq": "id"}
+    }
+  }
+}
+```
+
+For `in`, a single type string applies to every listed value; an array of type
+strings may type values position-by-position:
+
+```json
+{
+  "filter": {"in": ["avatar", ["AQID", "BAUG"]]},
+  "_meta": {"types": {"filter": {"in": "bytes"}}}
+}
+```
+
 ### 7.8 Authentication
 
 Authentication uses **JWT** (JSON Web Tokens). The server validates tokens using parameters from the server configuration file.
@@ -3347,7 +3485,8 @@ The server reads a JSON configuration file on startup. All fields are optional w
     "tcp":       "0.0.0.0:5200",
     "tls":       "0.0.0.0:5201",
     "quic":      "0.0.0.0:5201",
-    "websocket": "0.0.0.0:5202"
+    "websocket": "0.0.0.0:5202",
+    "websocket_tls": "0.0.0.0:5203"
   },
   "tls": {
     "cert_file": "/path/to/cert.pem",
@@ -3362,6 +3501,8 @@ The server reads a JSON configuration file on startup. All fields are optional w
   },
   "data_root": "/var/lib/exdb/data",
   "max_message_size": 16777216,
+  "request_queue_capacity": 1024,
+  "response_write_timeout_ms": 30000,
   "default_database_config": {
     "page_size": 8192,
     "memory_budget": 268435456,
@@ -3380,8 +3521,9 @@ The server reads a JSON configuration file on startup. All fields are optional w
 | `listen` | `tcp` | string | `"0.0.0.0:5200"` | TCP listen address |
 | `listen` | `tls` | string | (disabled) | TLS listen address |
 | `listen` | `quic` | string | (disabled) | QUIC listen address (shares TLS config) |
-| `listen` | `websocket` | string | (disabled) | WebSocket listen address |
-| `tls` | `cert_file` | string | | TLS certificate (PEM). Required if TLS or QUIC enabled. |
+| `listen` | `websocket` | string | (disabled) | Plain WebSocket (`ws://`) listen address |
+| `listen` | `websocket_tls` | string | (disabled) | Secure WebSocket (`wss://`) listen address (uses TLS config) |
+| `tls` | `cert_file` | string | | TLS certificate (PEM). Required if TLS, QUIC, or secure WebSocket enabled. |
 | `tls` | `key_file` | string | | TLS private key (PEM). |
 | `auth` | `enabled` | bool | `false` | Require authentication |
 | `auth` | `jwt_algorithm` | string | `"HS256"` | JWT algorithm: `HS256`, `HS384`, `HS512`, `RS256`, `RS384`, `RS512`, `ES256`, `ES384` |
@@ -3390,12 +3532,22 @@ The server reads a JSON configuration file on startup. All fields are optional w
 | `auth` | `jwt_issuer` | string | (no check) | Expected `iss` claim. Reject tokens with different issuer. |
 | `data_root` | | string | `"./data"` | Root directory for all database storage |
 | `max_message_size` | | integer | `16777216` | Maximum message size in bytes (16 MB) |
+| `request_queue_capacity` | | integer | `1024` | Per-connection capacity used for parsed requests, spawned response delivery, push notifications, and scheduler backpressure |
+| `response_write_timeout_ms` | | integer | `30000` | Maximum time allowed for one response or notification frame write before closing a slow client connection |
 | `default_database_config` | | object | | Defaults for new databases (see `DatabaseConfig` in 2.12.1) |
 | `replication` | `mode` | string | `"strict"` | `"strict"` (all replicas) or `"primary_plus_one"` |
 | `replication` | `wal_retention_max_size` | integer | `1073741824` | Max WAL retention for replication (1 GB) |
 | `replication` | `wal_retention_max_age` | string | `"24h"` | Max age of retained WAL segments |
 | `transactions` | `idle_timeout` | string | `"30s"` | Max time a transaction can be open without client activity (see 5.6.6) |
 | `transactions` | `max_lifetime` | string | `"5m"` | Max total time a transaction can remain open (see 5.6.6) |
+
+Transport limits must be greater than zero. Invalid server or database config
+values are rejected during config loading or create-database parsing before the
+server starts or any new database registry entry is persisted. TLS-over-TCP,
+QUIC, and secure WebSocket listeners are rejected unless TLS certificate and
+private-key material is configured and parses successfully. Enabled JWT auth
+configuration is rejected unless the selected algorithm has usable key material:
+a non-empty HMAC secret or a parseable RSA/EC public key.
 
 **Symmetric (HMAC) vs asymmetric (RSA/EC) JWT**: for single-server deployments, HMAC (`HS256`) with a shared secret is simplest. For multi-service architectures where an external auth server issues tokens, asymmetric algorithms (`RS256`, `ES256`) allow the database server to verify tokens without knowing the signing key.
 

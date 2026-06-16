@@ -26,18 +26,33 @@ pub fn ConsoleModule() -> Element {
     let mut history: Signal<Vec<ConsoleLine>> = use_signal(Vec::new);
 
     let methods_for_target = match target.read().as_str() {
-        "storage" => vec![
-            "file_header",
-            "page_count",
-            "create_btree",
-            "checkpoint",
-        ],
+        "storage" => vec!["file_header", "page_count", "create_btree", "checkpoint"],
         "btree" => vec!["scan", "get", "insert", "delete"],
-        "page" => vec!["read", "init", "insert_slot", "update_slot", "delete_slot", "compact", "stamp_checksum"],
+        "page" => vec![
+            "read",
+            "init",
+            "insert_slot",
+            "update_slot",
+            "delete_slot",
+            "compact",
+            "stamp_checksum",
+        ],
         "freelist" => vec!["walk", "allocate", "deallocate"],
         "heap" => vec!["load", "store", "free"],
-        "catalog" => vec!["list", "create_collection", "drop_collection", "create_index", "drop_index"],
-        "docstore" => vec!["scan", "versions", "decode_key", "encode_key", "secondary_scan"],
+        "catalog" => vec![
+            "list",
+            "create_collection",
+            "drop_collection",
+            "create_index",
+            "drop_index",
+        ],
+        "docstore" => vec![
+            "scan",
+            "versions",
+            "decode_key",
+            "encode_key",
+            "secondary_scan",
+        ],
         "query" => vec!["resolve", "filter", "range_validate", "range_encode"],
         _ => vec![],
     };
@@ -189,16 +204,21 @@ async fn execute_command(
             ))
         }
         ("storage", "page_count") => Ok(format!("{}", db.page_count())),
-        ("storage", "create_btree") => {
-            db.create_btree().await
-                .map(|root| format!("BTreeHandle {{ root_page: {root} }}"))
-                .map_err(|e| e.to_string())
-        }
+        ("storage", "create_btree") => db
+            .create_btree()
+            .await
+            .map(|root| format!("BTreeHandle {{ root_page: {root} }}"))
+            .map_err(|e| e.to_string()),
         ("storage", "checkpoint") => Err("Use async checkpoint from toolbar".into()),
         ("btree", "scan") => {
-            let root = p1.parse::<u32>().map_err(|_| "Invalid root page".to_string())?;
+            let root = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid root page".to_string())?;
             let limit = p2.parse::<usize>().unwrap_or(20);
-            let entries = db.btree_scan(root, limit).await.map_err(|e| e.to_string())?;
+            let entries = db
+                .btree_scan(root, limit)
+                .await
+                .map_err(|e| e.to_string())?;
             let lines: Vec<String> = entries
                 .iter()
                 .map(|(k, v)| format!("  {} -> {} bytes", hex_short(k), v.len()))
@@ -206,7 +226,9 @@ async fn execute_command(
             Ok(format!("{} entries:\n{}", entries.len(), lines.join("\n")))
         }
         ("btree", "get") => {
-            let root = p1.parse::<u32>().map_err(|_| "Invalid root page".to_string())?;
+            let root = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid root page".to_string())?;
             let key = parse_hex(p2).ok_or("Invalid hex key")?;
             match db.btree_get(root, &key).await.map_err(|e| e.to_string())? {
                 Some(v) => Ok(format!("{} bytes: {}", v.len(), hex_short(&v))),
@@ -214,7 +236,9 @@ async fn execute_command(
             }
         }
         ("btree", "insert") => {
-            let root = p1.parse::<u32>().map_err(|_| "Invalid root page".to_string())?;
+            let root = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid root page".to_string())?;
             // p2 = "key:value" in hex
             let parts: Vec<&str> = p2.splitn(2, ':').collect();
             if parts.len() != 2 {
@@ -222,19 +246,25 @@ async fn execute_command(
             }
             let key = parse_hex(parts[0]).ok_or("Invalid hex key")?;
             let value = parse_hex(parts[1]).ok_or("Invalid hex value")?;
-            db.btree_insert(root, &key, &value).await
+            db.btree_insert(root, &key, &value)
+                .await
                 .map(|_| "OK".into())
                 .map_err(|e| e.to_string())
         }
         ("btree", "delete") => {
-            let root = p1.parse::<u32>().map_err(|_| "Invalid root page".to_string())?;
+            let root = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid root page".to_string())?;
             let key = parse_hex(p2).ok_or("Invalid hex key")?;
-            db.btree_delete(root, &key).await
+            db.btree_delete(root, &key)
+                .await
                 .map(|existed| if existed { "Deleted" } else { "Key not found" }.into())
                 .map_err(|e| e.to_string())
         }
         ("page", "read") => {
-            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
+            let page_id = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid page ID".to_string())?;
             let info = db.read_page(page_id).await.map_err(|e| e.to_string())?;
             let type_name = info
                 .page_type
@@ -248,28 +278,41 @@ async fn execute_command(
             ))
         }
         ("page", "init") => {
-            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
+            let page_id = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid page ID".to_string())?;
             let pt = match p2 {
                 "BTreeLeaf" | "btree_leaf" => exdb_storage::page::PageType::BTreeLeaf,
                 "BTreeInternal" | "btree_internal" => exdb_storage::page::PageType::BTreeInternal,
                 "Heap" | "heap" => exdb_storage::page::PageType::Heap,
                 "Overflow" | "overflow" => exdb_storage::page::PageType::Overflow,
                 "Free" | "free" => exdb_storage::page::PageType::Free,
-                _ => return Err("Unknown page type. Use: BTreeLeaf, BTreeInternal, Heap, Overflow, Free".into()),
+                _ => {
+                    return Err(
+                        "Unknown page type. Use: BTreeLeaf, BTreeInternal, Heap, Overflow, Free"
+                            .into(),
+                    );
+                }
             };
-            db.init_page(page_id, pt).await
+            db.init_page(page_id, pt)
+                .await
                 .map(|_| format!("Page #{page_id} initialized as {p2}"))
                 .map_err(|e| e.to_string())
         }
         ("page", "insert_slot") => {
-            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
+            let page_id = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid page ID".to_string())?;
             let data = parse_hex(p2).ok_or("Invalid hex data")?;
-            db.insert_slot(page_id, &data).await
+            db.insert_slot(page_id, &data)
+                .await
                 .map(|slot_id| format!("Inserted slot #{slot_id}"))
                 .map_err(|e| e.to_string())
         }
         ("page", "update_slot") => {
-            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
+            let page_id = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid page ID".to_string())?;
             // p2 = "slot_id:hex_data"
             let parts: Vec<&str> = p2.splitn(2, ':').collect();
             if parts.len() != 2 {
@@ -277,26 +320,38 @@ async fn execute_command(
             }
             let slot_id = parts[0].parse::<u16>().map_err(|_| "Invalid slot ID")?;
             let data = parse_hex(parts[1]).ok_or("Invalid hex data")?;
-            db.update_slot(page_id, slot_id, &data).await
+            db.update_slot(page_id, slot_id, &data)
+                .await
                 .map(|_| format!("Updated slot #{slot_id}"))
                 .map_err(|e| e.to_string())
         }
         ("page", "delete_slot") => {
-            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
-            let slot_id = p2.parse::<u16>().map_err(|_| "Invalid slot ID".to_string())?;
-            db.delete_slot(page_id, slot_id).await
+            let page_id = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid page ID".to_string())?;
+            let slot_id = p2
+                .parse::<u16>()
+                .map_err(|_| "Invalid slot ID".to_string())?;
+            db.delete_slot(page_id, slot_id)
+                .await
                 .map(|_| format!("Deleted slot #{slot_id}"))
                 .map_err(|e| e.to_string())
         }
         ("page", "compact") => {
-            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
-            db.compact_page(page_id).await
+            let page_id = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid page ID".to_string())?;
+            db.compact_page(page_id)
+                .await
                 .map(|_| "Compacted".into())
                 .map_err(|e| e.to_string())
         }
         ("page", "stamp_checksum") => {
-            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
-            db.stamp_checksum(page_id).await
+            let page_id = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid page ID".to_string())?;
+            db.stamp_checksum(page_id)
+                .await
                 .map(|_| "Checksum stamped".into())
                 .map_err(|e| e.to_string())
         }
@@ -306,26 +361,44 @@ async fn execute_command(
                 Ok("Free list is empty".into())
             } else {
                 let chain: Vec<String> = info.chain.iter().map(|p| format!("#{p}")).collect();
-                Ok(format!("{} pages: {}", info.chain.len(), chain.join(" -> ")))
+                Ok(format!(
+                    "{} pages: {}",
+                    info.chain.len(),
+                    chain.join(" -> ")
+                ))
             }
         }
-        ("freelist", "allocate") => {
-            db.free_list_allocate().await
-                .map(|id| format!("Allocated page #{id}"))
-                .map_err(|e| e.to_string())
-        }
+        ("freelist", "allocate") => db
+            .free_list_allocate()
+            .await
+            .map(|id| format!("Allocated page #{id}"))
+            .map_err(|e| e.to_string()),
         ("freelist", "deallocate") => {
-            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
-            db.free_list_deallocate(page_id).await
+            let page_id = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid page ID".to_string())?;
+            db.free_list_deallocate(page_id)
+                .await
                 .map(|_| format!("Deallocated page #{page_id}"))
                 .map_err(|e| e.to_string())
         }
         ("heap", "load") => {
-            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
-            let slot_id = p2.parse::<u16>().map_err(|_| "Invalid slot ID".to_string())?;
-            let data = db.heap_load(page_id, slot_id).await.map_err(|e| e.to_string())?;
+            let page_id = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid page ID".to_string())?;
+            let slot_id = p2
+                .parse::<u16>()
+                .map_err(|_| "Invalid slot ID".to_string())?;
+            let data = db
+                .heap_load(page_id, slot_id)
+                .await
+                .map_err(|e| e.to_string())?;
             if let Ok(text) = std::str::from_utf8(&data) {
-                Ok(format!("{} bytes: {}", data.len(), &text[..text.len().min(200)]))
+                Ok(format!(
+                    "{} bytes: {}",
+                    data.len(),
+                    &text[..text.len().min(200)]
+                ))
             } else {
                 Ok(format!("{} bytes: {}", data.len(), hex_short(&data)))
             }
@@ -340,9 +413,14 @@ async fn execute_command(
             Ok(format!("HeapRef {{ page: {page_id}, slot: {slot_id} }}"))
         }
         ("heap", "free") => {
-            let page_id = p1.parse::<u32>().map_err(|_| "Invalid page ID".to_string())?;
-            let slot_id = p2.parse::<u16>().map_err(|_| "Invalid slot ID".to_string())?;
-            db.heap_free(page_id, slot_id).await
+            let page_id = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid page ID".to_string())?;
+            let slot_id = p2
+                .parse::<u16>()
+                .map_err(|_| "Invalid slot ID".to_string())?;
+            db.heap_free(page_id, slot_id)
+                .await
                 .map(|_| "Freed".into())
                 .map_err(|e| e.to_string())
         }
@@ -351,10 +429,19 @@ async fn execute_command(
             if cols.is_empty() {
                 Ok("No collections".into())
             } else {
-                let lines: Vec<String> = cols.iter().map(|c| {
-                    format!("  [{}] {} (root={}, docs={}, indexes={})",
-                        c.id, c.name, c.data_root_page, c.doc_count, c.indexes.len())
-                }).collect();
+                let lines: Vec<String> = cols
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "  [{}] {} (root={}, docs={}, indexes={})",
+                            c.id,
+                            c.name,
+                            c.data_root_page,
+                            c.doc_count,
+                            c.indexes.len()
+                        )
+                    })
+                    .collect();
                 Ok(format!("{} collections:\n{}", cols.len(), lines.join("\n")))
             }
         }
@@ -362,20 +449,31 @@ async fn execute_command(
             if p1.is_empty() {
                 return Err("Name required in param1".into());
             }
-            db.catalog_create_collection(p1).await
-                .map(|info| format!("Created '{}' (id={}, root={})", info.name, info.id, info.data_root_page))
+            db.catalog_create_collection(p1)
+                .await
+                .map(|info| {
+                    format!(
+                        "Created '{}' (id={}, root={})",
+                        info.name, info.id, info.data_root_page
+                    )
+                })
                 .map_err(|e| e.to_string())
         }
         ("catalog", "drop_collection") => {
-            let col_id = p1.parse::<u64>().map_err(|_| "Invalid collection ID in param1".to_string())?;
+            let col_id = p1
+                .parse::<u64>()
+                .map_err(|_| "Invalid collection ID in param1".to_string())?;
             let name = if p2.is_empty() { "unknown" } else { p2 };
-            db.catalog_drop_collection(col_id, name).await
+            db.catalog_drop_collection(col_id, name)
+                .await
                 .map(|_| format!("Dropped collection #{col_id}"))
                 .map_err(|e| e.to_string())
         }
         ("catalog", "create_index") => {
             // p1 = collection_id, p2 = "name:field1,field2"
-            let col_id = p1.parse::<u64>().map_err(|_| "Invalid collection ID in param1".to_string())?;
+            let col_id = p1
+                .parse::<u64>()
+                .map_err(|_| "Invalid collection ID in param1".to_string())?;
             let parts: Vec<&str> = p2.splitn(2, ':').collect();
             if parts.len() != 2 {
                 return Err("Format param2: index_name:field1,field2".into());
@@ -385,33 +483,60 @@ async fn execute_command(
                 .split(',')
                 .map(|f| f.trim().split('.').map(|s| s.to_string()).collect())
                 .collect();
-            db.catalog_create_index(col_id, name, field_paths).await
-                .map(|info| format!("Created index '{}' (id={}, root={})", info.name, info.id, info.root_page))
+            db.catalog_create_index(col_id, name, field_paths)
+                .await
+                .map(|info| {
+                    format!(
+                        "Created index '{}' (id={}, root={})",
+                        info.name, info.id, info.root_page
+                    )
+                })
                 .map_err(|e| e.to_string())
         }
         ("catalog", "drop_index") => {
-            let idx_id = p1.parse::<u64>().map_err(|_| "Invalid index ID in param1".to_string())?;
-            db.catalog_drop_index(idx_id).await
+            let idx_id = p1
+                .parse::<u64>()
+                .map_err(|_| "Invalid index ID in param1".to_string())?;
+            db.catalog_drop_index(idx_id)
+                .await
                 .map(|_| format!("Dropped index #{idx_id}"))
                 .map_err(|e| e.to_string())
         }
         ("docstore", "scan") => {
-            let root = p1.parse::<u32>().map_err(|_| "Invalid root page in param1".to_string())?;
+            let root = p1
+                .parse::<u32>()
+                .map_err(|_| "Invalid root page in param1".to_string())?;
             let read_ts = if p2.is_empty() || p2 == "max" {
                 u64::MAX
             } else {
-                p2.parse::<u64>().map_err(|_| "Invalid read_ts in param2".to_string())?
+                p2.parse::<u64>()
+                    .map_err(|_| "Invalid read_ts in param2".to_string())?
             };
-            let entries = db.docstore_scan(root, read_ts, 50).await.map_err(|e| e.to_string())?;
+            let entries = db
+                .docstore_scan(root, read_ts, 50)
+                .await
+                .map_err(|e| e.to_string())?;
             if entries.is_empty() {
                 Ok("No visible documents".into())
             } else {
-                let lines: Vec<String> = entries.iter().map(|e| {
-                    let body = e.body_json.as_deref().unwrap_or("(binary)");
-                    let short = if body.len() > 60 { &body[..60] } else { body };
-                    format!("  {} ts={} {}", &e.doc_id_hex[..8.min(e.doc_id_hex.len())], e.version_ts, short)
-                }).collect();
-                Ok(format!("{} documents:\n{}", entries.len(), lines.join("\n")))
+                let lines: Vec<String> = entries
+                    .iter()
+                    .map(|e| {
+                        let body = e.body_json.as_deref().unwrap_or("(binary)");
+                        let short = if body.len() > 60 { &body[..60] } else { body };
+                        format!(
+                            "  {} ts={} {}",
+                            &e.doc_id_hex[..8.min(e.doc_id_hex.len())],
+                            e.version_ts,
+                            short
+                        )
+                    })
+                    .collect();
+                Ok(format!(
+                    "{} documents:\n{}",
+                    entries.len(),
+                    lines.join("\n")
+                ))
             }
         }
         ("docstore", "versions") => {
@@ -420,16 +545,28 @@ async fn execute_command(
             if parts.len() != 2 {
                 return Err("Format: root_page:doc_id_hex".into());
             }
-            let root = parts[0].parse::<u32>().map_err(|_| "Invalid root page".to_string())?;
-            let versions = db.docstore_versions(root, parts[1]).await.map_err(|e| e.to_string())?;
+            let root = parts[0]
+                .parse::<u32>()
+                .map_err(|_| "Invalid root page".to_string())?;
+            let versions = db
+                .docstore_versions(root, parts[1])
+                .await
+                .map_err(|e| e.to_string())?;
             if versions.is_empty() {
                 Ok("No versions found".into())
             } else {
-                let lines: Vec<String> = versions.iter().map(|v| {
-                    let marker = if v.is_tombstone { " [TOMBSTONE]" } else { "" };
-                    format!("  ts={}{} {}", v.ts, marker, v.body_preview)
-                }).collect();
-                Ok(format!("{} versions:\n{}", versions.len(), lines.join("\n")))
+                let lines: Vec<String> = versions
+                    .iter()
+                    .map(|v| {
+                        let marker = if v.is_tombstone { " [TOMBSTONE]" } else { "" };
+                        format!("  ts={}{} {}", v.ts, marker, v.body_preview)
+                    })
+                    .collect();
+                Ok(format!(
+                    "{} versions:\n{}",
+                    versions.len(),
+                    lines.join("\n")
+                ))
             }
         }
         ("docstore", "decode_key") => {
@@ -438,7 +575,8 @@ async fn execute_command(
         }
         ("docstore", "encode_key") => {
             // p1 = doc_id_hex, p2 = ts
-            let key = db.encode_key_bytes("primary", p1, p2, "")
+            let key = db
+                .encode_key_bytes("primary", p1, p2, "")
                 .map_err(|e| e.to_string())?;
             Ok(key)
         }
@@ -448,8 +586,12 @@ async fn execute_command(
             if parts.len() != 2 {
                 return Err("Format param1: sec_root:primary_root".into());
             }
-            let sec_root = parts[0].parse::<u32>().map_err(|_| "Invalid sec_root".to_string())?;
-            let primary_root = parts[1].parse::<u32>().map_err(|_| "Invalid primary_root".to_string())?;
+            let sec_root = parts[0]
+                .parse::<u32>()
+                .map_err(|_| "Invalid sec_root".to_string())?;
+            let primary_root = parts[1]
+                .parse::<u32>()
+                .map_err(|_| "Invalid primary_root".to_string())?;
 
             let parts2: Vec<&str> = p2.rsplitn(2, ':').collect();
             let (scalars_json, read_ts) = if parts2.len() == 2 {
@@ -459,33 +601,49 @@ async fn execute_command(
                 (p2, u64::MAX)
             };
 
-            let hits = db.secondary_scan(sec_root, primary_root, scalars_json, read_ts, 50).await
+            let hits = db
+                .secondary_scan(sec_root, primary_root, scalars_json, read_ts, 50)
+                .await
                 .map_err(|e| e.to_string())?;
             if hits.is_empty() {
                 Ok("No results".into())
             } else {
-                let lines: Vec<String> = hits.iter().map(|h| {
-                    format!("  {} ts={}", &h.doc_id_hex[..8.min(h.doc_id_hex.len())], h.version_ts)
-                }).collect();
+                let lines: Vec<String> = hits
+                    .iter()
+                    .map(|h| {
+                        format!(
+                            "  {} ts={}",
+                            &h.doc_id_hex[..8.min(h.doc_id_hex.len())],
+                            h.version_ts
+                        )
+                    })
+                    .collect();
                 Ok(format!("{} hits:\n{}", hits.len(), lines.join("\n")))
             }
         }
         ("query", "resolve") => {
             // p1 = index_fields (comma-separated), p2 = range_json
             if p1.is_empty() {
-                return Err("Param1: index fields (comma-separated). Param2: range JSON array".into());
+                return Err(
+                    "Param1: index fields (comma-separated). Param2: range JSON array".into(),
+                );
             }
-            let index_fields: Vec<exdb_core::field_path::FieldPath> = p1.split(',')
+            let index_fields: Vec<exdb_core::field_path::FieldPath> = p1
+                .split(',')
                 .map(|s| {
                     let s = s.trim();
                     let segs: Vec<String> = s.split('.').map(|p| p.to_string()).collect();
-                    if segs.len() == 1 { exdb_core::field_path::FieldPath::single(&segs[0]) }
-                    else { exdb_core::field_path::FieldPath::new(segs) }
+                    if segs.len() == 1 {
+                        exdb_core::field_path::FieldPath::single(&segs[0])
+                    } else {
+                        exdb_core::field_path::FieldPath::new(segs)
+                    }
                 })
                 .collect();
 
-            let range_exprs = super::query::scan::parse_range_exprs(if p2.is_empty() { "[]" } else { p2 })
-                .map_err(|e| format!("Range parse error: {e}"))?;
+            let range_exprs =
+                super::query::scan::parse_range_exprs(if p2.is_empty() { "[]" } else { p2 })
+                    .map_err(|e| format!("Range parse error: {e}"))?;
 
             let index_info = exdb_query::IndexInfo {
                 index_id: exdb_core::types::IndexId(1),
@@ -499,7 +657,8 @@ async fn execute_command(
                 None,
                 exdb_storage::btree::ScanDirection::Forward,
                 None,
-            ).map_err(|e| format!("{e:?}"))?;
+            )
+            .map_err(|e| format!("{e:?}"))?;
             Ok(format!("{method:?}"))
         }
         ("query", "filter") => {
@@ -507,28 +666,38 @@ async fn execute_command(
             if p1.is_empty() || p2.is_empty() {
                 return Err("Param1: document JSON. Param2: filter JSON".into());
             }
-            let doc: serde_json::Value = serde_json::from_str(p1)
-                .map_err(|e| format!("Invalid document: {e}"))?;
-            let filter = super::query::scan::parse_filter(p2)
-                .map_err(|e| format!("Invalid filter: {e}"))?;
+            let doc: serde_json::Value =
+                serde_json::from_str(p1).map_err(|e| format!("Invalid document: {e}"))?;
+            let filter =
+                super::query::scan::parse_filter(p2).map_err(|e| format!("Invalid filter: {e}"))?;
             let matches = exdb_query::filter_matches(&doc, &filter);
-            Ok(if matches { "MATCH (true)" } else { "NO MATCH (false)" }.into())
+            Ok(if matches {
+                "MATCH (true)"
+            } else {
+                "NO MATCH (false)"
+            }
+            .into())
         }
         ("query", "range_validate") => {
             // p1 = index fields, p2 = range JSON
             if p1.is_empty() {
                 return Err("Param1: index fields (comma-separated). Param2: range JSON".into());
             }
-            let index_fields: Vec<exdb_core::field_path::FieldPath> = p1.split(',')
+            let index_fields: Vec<exdb_core::field_path::FieldPath> = p1
+                .split(',')
                 .map(|s| {
                     let s = s.trim();
                     let segs: Vec<String> = s.split('.').map(|p| p.to_string()).collect();
-                    if segs.len() == 1 { exdb_core::field_path::FieldPath::single(&segs[0]) }
-                    else { exdb_core::field_path::FieldPath::new(segs) }
+                    if segs.len() == 1 {
+                        exdb_core::field_path::FieldPath::single(&segs[0])
+                    } else {
+                        exdb_core::field_path::FieldPath::new(segs)
+                    }
                 })
                 .collect();
-            let range_exprs = super::query::scan::parse_range_exprs(if p2.is_empty() { "[]" } else { p2 })
-                .map_err(|e| format!("Range parse error: {e}"))?;
+            let range_exprs =
+                super::query::scan::parse_range_exprs(if p2.is_empty() { "[]" } else { p2 })
+                    .map_err(|e| format!("Range parse error: {e}"))?;
             let shape = exdb_query::validate_range(&index_fields, &range_exprs)
                 .map_err(|e| format!("{e:?}"))?;
             Ok(format!(
@@ -541,16 +710,21 @@ async fn execute_command(
             if p1.is_empty() {
                 return Err("Param1: index fields (comma-separated). Param2: range JSON".into());
             }
-            let index_fields: Vec<exdb_core::field_path::FieldPath> = p1.split(',')
+            let index_fields: Vec<exdb_core::field_path::FieldPath> = p1
+                .split(',')
                 .map(|s| {
                     let s = s.trim();
                     let segs: Vec<String> = s.split('.').map(|p| p.to_string()).collect();
-                    if segs.len() == 1 { exdb_core::field_path::FieldPath::single(&segs[0]) }
-                    else { exdb_core::field_path::FieldPath::new(segs) }
+                    if segs.len() == 1 {
+                        exdb_core::field_path::FieldPath::single(&segs[0])
+                    } else {
+                        exdb_core::field_path::FieldPath::new(segs)
+                    }
                 })
                 .collect();
-            let range_exprs = super::query::scan::parse_range_exprs(if p2.is_empty() { "[]" } else { p2 })
-                .map_err(|e| format!("Range parse error: {e}"))?;
+            let range_exprs =
+                super::query::scan::parse_range_exprs(if p2.is_empty() { "[]" } else { p2 })
+                    .map_err(|e| format!("Range parse error: {e}"))?;
             let (lower, upper) = exdb_query::encode_range(&index_fields, &range_exprs)
                 .map_err(|e| format!("{e:?}"))?;
             let fmt_bound = |b: &std::ops::Bound<Vec<u8>>| match b {
@@ -558,7 +732,11 @@ async fn execute_command(
                 std::ops::Bound::Included(v) => format!("Included({})", hex_short(v)),
                 std::ops::Bound::Excluded(v) => format!("Excluded({})", hex_short(v)),
             };
-            Ok(format!("lower: {}\nupper: {}", fmt_bound(&lower), fmt_bound(&upper)))
+            Ok(format!(
+                "lower: {}\nupper: {}",
+                fmt_bound(&lower),
+                fmt_bound(&upper)
+            ))
         }
         _ => Err(format!("Unknown command: {target}.{method}")),
     }

@@ -82,13 +82,17 @@ tokio::spawn(async move {
 
 ### Read Operations
 - `get(collection, doc_id)` — point lookup by document ID
+- `get_bson(collection, doc_id)` — point lookup as a native BSON document
 - `query(collection, index, range, filter, direction, limit)` — index scan with filtering
+- `query_bson(collection, index, range, filter, direction, limit)` — index scan returning native BSON documents
 - `list_collections()` — list all collections
 - `list_indexes(collection)` — list indexes for a collection
 
 ### Write Operations
 - `insert(collection, body)` — insert new document, returns generated DocId
+- `insert_bson(collection, body)` — insert a native BSON document
 - `replace(collection, doc_id, body)` — replace entire document
+- `replace_bson(collection, doc_id, body)` — replace with a native BSON document
 - `patch(collection, doc_id, patch)` — RFC 7396 merge-patch
 - `delete(collection, doc_id)` — delete a document
 
@@ -116,6 +120,13 @@ let db = sys.get_database_by_name("mydb").unwrap();
 
 sys.close().await?;
 ```
+
+`SystemDatabase` creates a `_system/` directory and persists the managed
+database registry in `_system/registry.json`. Reopening the same root restores
+database IDs, names, configs, registered restored paths, and dropped-entry
+removals before serving lookups. Dropping a database removes its data directory
+after closing the managed handle, and returns `DatabaseInUse` if external
+handles are still alive.
 
 ## Concurrency Model
 

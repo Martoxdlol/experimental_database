@@ -77,6 +77,14 @@ pub enum DatabaseError {
     #[error("commit error: {0}")]
     Commit(String),
 
+    /// Startup or maintenance integrity check failed.
+    #[error("integrity check failed during {phase}: {errors} errors ({issues} total issues)")]
+    IntegrityCheckFailed {
+        phase: String,
+        errors: usize,
+        issues: usize,
+    },
+
     /// Replication quorum lost.
     #[error("replication quorum lost")]
     QuorumLost,
@@ -89,6 +97,10 @@ pub enum DatabaseError {
     #[error("database already exists: {0}")]
     DatabaseAlreadyExists(String),
 
+    /// Named database cannot be dropped because live handles still exist.
+    #[error("database is in use: {0}")]
+    DatabaseInUse(String),
+
     /// Reserved name (SystemDatabase).
     #[error("reserved name: {0}")]
     ReservedName(String),
@@ -96,6 +108,21 @@ pub enum DatabaseError {
     /// Invalid name.
     #[error("invalid name: {0}")]
     InvalidName(String),
+
+    /// Invalid database configuration.
+    #[error("invalid database config: {0}")]
+    InvalidConfig(String),
+}
+
+impl DatabaseError {
+    /// True when the error represents a client-supplied index range that cannot
+    /// be encoded against the selected index.
+    pub fn is_invalid_range(&self) -> bool {
+        matches!(
+            self,
+            Self::Range(_) | Self::Access(exdb_query::AccessError::Range(_))
+        )
+    }
 }
 
 /// Convenience alias.

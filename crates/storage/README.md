@@ -356,9 +356,9 @@ The engine pre-creates two catalog B-trees whose root pages are persisted in the
 | File header field | Key format | Value | Role |
 |---|---|---|---|
 | `catalog_root_page` | `entity_type \|\| entity_id` | Full serialized `CollectionEntry` / `IndexEntry` | **Primary index** — lookup by numeric ID |
-| `catalog_name_root_page` | `entity_type \|\| name` | `entity_id` (8 bytes) | **Secondary index** — lookup by name, returns ID |
+| `catalog_name_root_page` | collections: `0x01 \|\| name \|\| 0x00`; indexes: `0x02 \|\| collection_id \|\| name \|\| 0x00` | `entity_id` (8 bytes) | **Secondary index** — lookup by scoped name, returns ID |
 
-The name index stores only the entity ID, acting as a pointer back to the full entry in the ID catalog. The lookup flow is: **name → id → full entry → root page → open B-tree**.
+The name index stores only the entity ID, acting as a pointer back to the full entry in the ID catalog. Collection names are database-scoped; index names are collection-scoped. The lookup flow is: **scoped name → id → full entry → root page → open B-tree**.
 
 #### Registering a collection and index
 
@@ -401,7 +401,7 @@ let idx = IndexEntry {
 let idx_id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx.index_id);
 catalog.insert(&idx_id_key, &catalog_btree::serialize_index(&idx)).await.unwrap();
 
-let idx_name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Index, &idx.name);
+let idx_name_key = catalog_btree::make_catalog_index_name_key(idx.collection_id, &idx.name);
 name_idx.insert(&idx_name_key, &catalog_btree::serialize_name_value(idx.index_id)).await.unwrap();
 ```
 

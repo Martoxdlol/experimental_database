@@ -1,14 +1,15 @@
 use dioxus::prelude::*;
 
 use exdb_core::field_path::FieldPath;
-use exdb_query::{validate_range, encode_range};
+use exdb_query::{encode_range, validate_range};
 
 use super::scan::parse_range_exprs;
 
 #[component]
 pub fn RangeToolsModule() -> Element {
     let mut fields_input: Signal<String> = use_signal(|| "age".to_string());
-    let mut range_json: Signal<String> = use_signal(|| r#"[{"Gte": ["age", 18]}, {"Lt": ["age", 65]}]"#.to_string());
+    let mut range_json: Signal<String> =
+        use_signal(|| r#"[{"Gte": ["age", 18]}, {"Lt": ["age", 65]}]"#.to_string());
     let mut result: Signal<Option<RangeResult>> = use_signal(|| None);
 
     rsx! {
@@ -150,23 +151,34 @@ fn evaluate_range(fields_str: &str, range_str: &str) -> RangeResult {
 
     let range_exprs = match parse_range_exprs(range_str) {
         Ok(r) => r,
-        Err(e) => return RangeResult { shape: None, encoded: None, error: Some(e) },
+        Err(e) => {
+            return RangeResult {
+                shape: None,
+                encoded: None,
+                error: Some(e),
+            };
+        }
     };
 
     // Validate
     let shape = match validate_range(&index_fields, &range_exprs) {
         Ok(s) => s,
-        Err(e) => return RangeResult {
-            shape: None,
-            encoded: None,
-            error: Some(format!("Validation error: {e:?}")),
-        },
+        Err(e) => {
+            return RangeResult {
+                shape: None,
+                encoded: None,
+                error: Some(format!("Validation error: {e:?}")),
+            };
+        }
     };
 
     let shape_str = format!(
         "eq_count: {}\nrange_field: {}\nhas_lower: {}\nhas_upper: {}",
         shape.eq_count,
-        shape.range_field.map(|i| i.to_string()).unwrap_or("None".into()),
+        shape
+            .range_field
+            .map(|i| i.to_string())
+            .unwrap_or("None".into()),
         shape.has_lower,
         shape.has_upper,
     );
@@ -178,11 +190,13 @@ fn evaluate_range(fields_str: &str, range_str: &str) -> RangeResult {
             let upper_str = format_bound(&upper);
             format!("lower: {lower_str}\nupper: {upper_str}")
         }
-        Err(e) => return RangeResult {
-            shape: Some(shape_str),
-            encoded: None,
-            error: Some(format!("Encoding error: {e:?}")),
-        },
+        Err(e) => {
+            return RangeResult {
+                shape: Some(shape_str),
+                encoded: None,
+                error: Some(format!("Encoding error: {e:?}")),
+            };
+        }
     };
 
     RangeResult {

@@ -16,7 +16,7 @@ use std::ops::Bound;
 use std::pin::Pin;
 
 /// A single result row from a query scan.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ScanRow {
     pub doc_id: DocId,
     pub version_ts: Ts,
@@ -62,16 +62,12 @@ pub async fn execute_scan<'a>(
     let read_interval = compute_read_interval(method);
 
     match method {
-        AccessMethod::PrimaryGet {
-            doc_id,
-            ..
-        } => {
+        AccessMethod::PrimaryGet { doc_id, .. } => {
             let body = primary_index.get_at_ts(doc_id, read_ts).await?;
             let version_ts = primary_index.get_version_ts(doc_id, read_ts).await?;
             let row = match (body, version_ts) {
                 (Some(body_bytes), Some(ts)) => {
-                    let doc = decode_document(&body_bytes)
-                        .map_err(std::io::Error::other)?;
+                    let doc = decode_document(&body_bytes).map_err(std::io::Error::other)?;
                     Some(ScanRow {
                         doc_id: *doc_id,
                         version_ts: ts,
@@ -245,9 +241,7 @@ fn compute_read_interval(method: &AccessMethod) -> ReadIntervalInfo {
             upper: match upper {
                 Bound::Excluded(v) => Bound::Excluded(v.clone()),
                 Bound::Unbounded => Bound::Unbounded,
-                Bound::Included(v) => {
-                    Bound::Excluded(exdb_docstore::prefix_successor(v))
-                }
+                Bound::Included(v) => Bound::Excluded(exdb_docstore::prefix_successor(v)),
             },
         },
 

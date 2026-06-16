@@ -7,7 +7,7 @@
 
 use crate::backend::{PageStorage, WalStorage};
 use crate::page::SlottedPageRef;
-use crate::wal::{Lsn, WalRecord, WAL_RECORD_CHECKPOINT};
+use crate::wal::{Lsn, WAL_RECORD_CHECKPOINT, WalRecord};
 use async_trait::async_trait;
 use std::io;
 use std::path::Path;
@@ -111,8 +111,7 @@ impl Recovery {
 
         // Step 2: DWB recovery (if applicable).
         if let Some(path) = dwb_path {
-            let (restored, skipped) =
-                Self::dwb_recover(path, page_storage, page_size).await?;
+            let (restored, skipped) = Self::dwb_recover(path, page_storage, page_size).await?;
             stats.dwb_pages_restored = restored;
             stats.dwb_pages_skipped_corrupt = skipped;
         }
@@ -149,19 +148,41 @@ impl Recovery {
             }
         }
 
-        // Check WAL: see if there are any valid records past checkpoint_lsn.
+        Self::has_valid_wal_frame_at(wal_storage, checkpoint_lsn).await
+    }
+
+    async fn has_valid_wal_frame_at(wal_storage: &dyn WalStorage, lsn: Lsn) -> io::Result<bool> {
         let mut header_buf = [0u8; WAL_FRAME_HEADER_SIZE];
-        let n = wal_storage.read_from(checkpoint_lsn, &mut header_buf).await?;
-        if n >= WAL_FRAME_HEADER_SIZE {
-            let payload_len = u32::from_le_bytes(
-                [header_buf[0], header_buf[1], header_buf[2], header_buf[3]],
-            ) as usize;
-            if payload_len > 0 && payload_len <= MAX_WAL_RECORD_SIZE {
-                return Ok(true);
-            }
+        let n = wal_storage.read_from(lsn, &mut header_buf).await?;
+        if n < WAL_FRAME_HEADER_SIZE {
+            return Ok(false);
         }
 
-        Ok(false)
+        let payload_len =
+            u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]])
+                as usize;
+        if payload_len == 0 || payload_len > MAX_WAL_RECORD_SIZE {
+            return Ok(false);
+        }
+
+        let mut payload = vec![0u8; payload_len];
+        let n = wal_storage
+            .read_from(lsn + WAL_FRAME_HEADER_SIZE as u64, &mut payload)
+            .await?;
+        if n < payload_len {
+            return Ok(false);
+        }
+
+        let stored_crc =
+            u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+        let record_type = header_buf[8];
+        let computed_crc = {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&[record_type]);
+            hasher.update(&payload);
+            hasher.finalize()
+        };
+        Ok(computed_crc == stored_crc)
     }
 
     /// Replay WAL records starting from `start_lsn`, calling the handler for
@@ -184,12 +205,11 @@ impl Recovery {
                 break;
             }
 
-            let payload_len = u32::from_le_bytes(
-                [header_buf[0], header_buf[1], header_buf[2], header_buf[3]],
-            ) as usize;
-            let stored_crc = u32::from_le_bytes(
-                [header_buf[4], header_buf[5], header_buf[6], header_buf[7]],
-            );
+            let payload_len =
+                u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]])
+                    as usize;
+            let stored_crc =
+                u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
             let record_type = header_buf[8];
 
             // End-of-log sentinel.
@@ -201,14 +221,13 @@ impl Recovery {
             if payload_len > MAX_WAL_RECORD_SIZE {
                 if mode == RecoveryMode::BestEffort {
                     stats.records_skipped_corrupt += 1;
-                    current_lsn = match Self::scan_forward_for_valid_frame(
-                        wal_storage, current_lsn + 1,
-                    )
-                    .await?
-                    {
-                        Some(next) => next,
-                        None => break,
-                    };
+                    current_lsn =
+                        match Self::scan_forward_for_valid_frame(wal_storage, current_lsn + 1)
+                            .await?
+                        {
+                            Some(next) => next,
+                            None => break,
+                        };
                     continue;
                 }
                 break;
@@ -234,14 +253,13 @@ impl Recovery {
             if computed_crc != stored_crc {
                 if mode == RecoveryMode::BestEffort {
                     stats.records_skipped_corrupt += 1;
-                    current_lsn = match Self::scan_forward_for_valid_frame(
-                        wal_storage, current_lsn + 1,
-                    )
-                    .await?
-                    {
-                        Some(next) => next,
-                        None => break,
-                    };
+                    current_lsn =
+                        match Self::scan_forward_for_valid_frame(wal_storage, current_lsn + 1)
+                            .await?
+                        {
+                            Some(next) => next,
+                            None => break,
+                        };
                     continue;
                 }
                 // Strict mode: stop replay.
@@ -289,9 +307,9 @@ impl Recovery {
                 return Ok(None);
             }
 
-            let payload_len = u32::from_le_bytes(
-                [header_buf[0], header_buf[1], header_buf[2], header_buf[3]],
-            ) as usize;
+            let payload_len =
+                u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]])
+                    as usize;
             let record_type = header_buf[8];
 
             // Quick plausibility check.
@@ -317,9 +335,8 @@ impl Recovery {
                 hasher.update(&payload);
                 hasher.finalize()
             };
-            let stored_crc = u32::from_le_bytes(
-                [header_buf[4], header_buf[5], header_buf[6], header_buf[7]],
-            );
+            let stored_crc =
+                u32::from_le_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
 
             if computed_crc == stored_crc {
                 return Ok(Some(probe));
@@ -372,11 +389,18 @@ impl Recovery {
         }
 
         let header_buf = &file_data[..DWB_HEADER_SIZE];
-        let magic = u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let magic =
+            u32::from_le_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
         let _version = u16::from_le_bytes([header_buf[4], header_buf[5]]);
         let dwb_page_size = u16::from_le_bytes([header_buf[6], header_buf[7]]);
-        let page_count = u32::from_le_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]]);
-        let stored_checksum = u32::from_le_bytes([header_buf[12], header_buf[13], header_buf[14], header_buf[15]]);
+        let page_count =
+            u32::from_le_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]]);
+        let stored_checksum = u32::from_le_bytes([
+            header_buf[12],
+            header_buf[13],
+            header_buf[14],
+            header_buf[15],
+        ]);
 
         // Verify magic.
         if magic != DWB_MAGIC {
@@ -533,10 +557,7 @@ mod tests {
 
     impl ErrorOnNthHandler {
         fn new(error_on: usize) -> Self {
-            Self {
-                count: 0,
-                error_on,
-            }
+            Self { count: 0, error_on }
         }
     }
 
@@ -784,7 +805,9 @@ mod tests {
     async fn needs_recovery_false() {
         let wal_storage = MemoryWalStorage::new();
 
-        let result = Recovery::needs_recovery(None, &wal_storage, 0).await.unwrap();
+        let result = Recovery::needs_recovery(None, &wal_storage, 0)
+            .await
+            .unwrap();
         assert!(!result);
     }
 
@@ -804,8 +827,9 @@ mod tests {
         }
 
         let wal_storage = MemoryWalStorage::new();
-        let result =
-            Recovery::needs_recovery(Some(dwb_path.as_path()), &wal_storage, 0).await.unwrap();
+        let result = Recovery::needs_recovery(Some(dwb_path.as_path()), &wal_storage, 0)
+            .await
+            .unwrap();
         assert!(result);
     }
 
@@ -820,8 +844,44 @@ mod tests {
         let frame = encode_frame(0x01, b"data");
         wal_storage.append(&frame).await.unwrap();
 
-        let result = Recovery::needs_recovery(None, &wal_storage, 0).await.unwrap();
+        let result = Recovery::needs_recovery(None, &wal_storage, 0)
+            .await
+            .unwrap();
         assert!(result);
+    }
+
+    #[tokio::test]
+    async fn needs_recovery_ignores_crc_bad_wal_tail() {
+        let wal_storage = MemoryWalStorage::new();
+
+        let mut frame = encode_frame(0x01, b"data");
+        frame[4] ^= 0xFF;
+        wal_storage.append(&frame).await.unwrap();
+
+        let result = Recovery::needs_recovery(None, &wal_storage, 0)
+            .await
+            .unwrap();
+        assert!(
+            !result,
+            "CRC-bad WAL tail should not be treated as a valid recovery workload"
+        );
+    }
+
+    #[tokio::test]
+    async fn needs_recovery_ignores_truncated_wal_tail() {
+        let wal_storage = MemoryWalStorage::new();
+
+        let mut frame = encode_frame(0x01, b"data");
+        frame.truncate(WAL_FRAME_HEADER_SIZE + 2);
+        wal_storage.append(&frame).await.unwrap();
+
+        let result = Recovery::needs_recovery(None, &wal_storage, 0)
+            .await
+            .unwrap();
+        assert!(
+            !result,
+            "truncated WAL tail should not be treated as a valid recovery workload"
+        );
     }
 
     // ─── Test 9: Idempotent replay ───
@@ -901,7 +961,9 @@ mod tests {
         assert_eq!(end_lsn, 0);
 
         // needs_recovery should be false.
-        let needs = Recovery::needs_recovery(None, &wal_storage, 0).await.unwrap();
+        let needs = Recovery::needs_recovery(None, &wal_storage, 0)
+            .await
+            .unwrap();
         assert!(!needs);
     }
 
@@ -995,7 +1057,9 @@ mod tests {
         wal_storage.append(&frame1).await.unwrap();
 
         // Write corrupt bytes (invalid CRC).
-        let corrupt = vec![0x05, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x42, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let corrupt = vec![
+            0x05, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x42, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+        ];
         wal_storage.append(&corrupt).await.unwrap();
 
         let frame2 = encode_frame(0x01, b"after");

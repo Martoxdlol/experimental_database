@@ -4,7 +4,7 @@
 //! the index, encoding the range, and producing an `AccessMethod` consumed by
 //! the scan executor.
 
-use crate::range_encoder::{encode_range, RangeError};
+use crate::range_encoder::{RangeError, encode_range};
 use exdb_core::field_path::FieldPath;
 use exdb_core::filter::{Filter, RangeExpr};
 use exdb_core::types::{CollectionId, DocId, IndexId};

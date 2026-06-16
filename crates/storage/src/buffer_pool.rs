@@ -12,11 +12,12 @@
 //!   double-write buffer during checkpoint.
 
 use crate::backend::{PageId, PageStorage};
+use crate::page::{SlottedPage, SlottedPageRef};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // ─── Types ───
 
@@ -79,6 +80,8 @@ struct FrameData {
     page_id: Option<PageId>,
     /// Whether the page has been modified since the last flush.
     dirty: bool,
+    /// Monotonic mutation counter for this frame.
+    dirty_generation: u64,
 }
 
 /// One slot in the fixed-size frame array.
@@ -124,6 +127,7 @@ impl BufferPool {
                     data: vec![0u8; config.page_size],
                     page_id: None,
                     dirty: false,
+                    dirty_generation: 0,
                 }),
                 pin_count: AtomicU32::new(0),
                 ref_bit: AtomicBool::new(false),
@@ -137,6 +141,26 @@ impl BufferPool {
             page_storage,
             page_size: config.page_size,
         }
+    }
+
+    fn verify_page_read(page_id: PageId, buf: &[u8]) -> io::Result<()> {
+        let page = SlottedPageRef::from_buf(buf)?;
+        if page.page_id() != page_id {
+            return Err(crate::error::StorageError::Corruption(format!(
+                "page id mismatch on read: requested {}, page header has {}",
+                page_id,
+                page.page_id(),
+            ))
+            .into());
+        }
+        if !page.verify_checksum() {
+            return Err(crate::error::StorageError::Corruption(format!(
+                "page checksum mismatch on read for page {}",
+                page_id,
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     /// Fetch a page for reading. Loads from the backend on a cache miss.
@@ -176,6 +200,7 @@ impl BufferPool {
         // Cache miss: read from backend into a temporary buffer (no locks held during I/O).
         let mut tmp_buf = vec![0u8; self.page_size];
         self.page_storage.read_page(page_id, &mut tmp_buf).await?;
+        Self::verify_page_read(page_id, &tmp_buf)?;
 
         // Find a victim frame.
         let victim_frame_id = self.find_victim()?;
@@ -210,6 +235,7 @@ impl BufferPool {
         guard.data.copy_from_slice(&tmp_buf);
         guard.page_id = Some(page_id);
         guard.dirty = false;
+        guard.dirty_generation = 0;
         slot.ref_bit.store(true, Ordering::Release);
         slot.pin_count.store(1, Ordering::Release);
         drop(guard);
@@ -226,7 +252,10 @@ impl BufferPool {
     /// Fetch a page for writing. Loads from the backend on a cache miss.
     ///
     /// Returns an exclusive guard — only one writer per frame.
-    pub async fn fetch_page_exclusive(&self, page_id: PageId) -> io::Result<ExclusivePageGuard<'_>> {
+    pub async fn fetch_page_exclusive(
+        &self,
+        page_id: PageId,
+    ) -> io::Result<ExclusivePageGuard<'_>> {
         // Fast path: check if the page is already cached.
         {
             let pt = self.page_table.read();
@@ -255,6 +284,7 @@ impl BufferPool {
         // Cache miss: read from backend into temp buffer.
         let mut tmp_buf = vec![0u8; self.page_size];
         self.page_storage.read_page(page_id, &mut tmp_buf).await?;
+        Self::verify_page_read(page_id, &tmp_buf)?;
 
         // Find a victim frame.
         let victim_frame_id = self.find_victim()?;
@@ -285,6 +315,7 @@ impl BufferPool {
         guard.data.copy_from_slice(&tmp_buf);
         guard.page_id = Some(page_id);
         guard.dirty = false;
+        guard.dirty_generation = 0;
         slot.ref_bit.store(true, Ordering::Release);
         slot.pin_count.store(1, Ordering::Release);
 
@@ -314,6 +345,7 @@ impl BufferPool {
         guard.data.fill(0);
         guard.page_id = Some(page_id);
         guard.dirty = false;
+        guard.dirty_generation = 0;
         slot.ref_bit.store(true, Ordering::Release);
         slot.pin_count.store(1, Ordering::Release);
 
@@ -333,16 +365,19 @@ impl BufferPool {
                 match pt.get(&page_id) {
                     Some(&fid) => fid,
                     None => {
-                        return Err(crate::error::StorageError::InternalBug(
-                            format!("page {} not in buffer pool", page_id),
-                        )
-                        .into())
+                        return Err(crate::error::StorageError::InternalBug(format!(
+                            "page {} not in buffer pool",
+                            page_id
+                        ))
+                        .into());
                     }
                 }
             };
 
             let slot = &self.frames[frame_id as usize];
-            let guard = slot.lock.read();
+            let mut guard = slot.lock.write();
+            let mut page = SlottedPage::from_buf(&mut guard.data)?;
+            page.stamp_checksum();
             let data_copy = guard.data.clone();
             drop(guard);
             (frame_id, data_copy)
@@ -357,14 +392,16 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Snapshot all dirty frames. Returns `(page_id, page_data_copy, lsn)` tuples.
+    /// Snapshot all dirty frames.
+    ///
+    /// Returns `(page_id, page_data_copy, lsn, dirty_generation)` tuples.
     ///
     /// Stamps the CRC-32C checksum on each dirty page before copying, so that
     /// the DWB and recovery can use checksums for torn-write detection.
     ///
     /// Does **not** clear dirty flags (the checkpoint layer does that after the
     /// double-write buffer write via [`mark_clean`]).
-    pub fn dirty_pages(&self) -> Vec<(PageId, Vec<u8>, Lsn)> {
+    pub fn dirty_pages(&self) -> Vec<(PageId, Vec<u8>, Lsn, u64)> {
         use crate::page::SlottedPage;
 
         let mut result = Vec::new();
@@ -373,17 +410,18 @@ impl BufferPool {
             // Acquire write lock so we can stamp the checksum in-place.
             let mut guard = slot.lock.write();
             if guard.dirty
-                && let Some(pid) = guard.page_id {
-                    // Stamp the checksum before snapshotting.
-                    let mut page = SlottedPage::from_buf(&mut guard.data)
-                        .expect("pool frame is always page_size");
-                    page.stamp_checksum();
+                && let Some(pid) = guard.page_id
+            {
+                // Stamp the checksum before snapshotting.
+                let mut page =
+                    SlottedPage::from_buf(&mut guard.data).expect("pool frame is always page_size");
+                page.stamp_checksum();
 
-                    let data_copy = guard.data.clone();
-                    // Read LSN from the page buffer at offset 24 (little-endian u64).
-                    let lsn = read_lsn_from_buf(&guard.data);
-                    result.push((pid, data_copy, lsn));
-                }
+                let data_copy = guard.data.clone();
+                // Read LSN from the page buffer at offset 24 (little-endian u64).
+                let lsn = read_lsn_from_buf(&guard.data);
+                result.push((pid, data_copy, lsn, guard.dirty_generation));
+            }
         }
 
         result
@@ -391,10 +429,10 @@ impl BufferPool {
 
     /// Mark a specific frame as clean (after checkpoint scatter-write).
     ///
-    /// Only clears the dirty flag if the frame's current LSN matches
-    /// `expected_lsn`. If the LSN has changed (a writer modified the page
-    /// since the snapshot), the dirty flag is left set.
-    pub fn mark_clean(&self, page_id: PageId, expected_lsn: Lsn) {
+    /// Only clears the dirty flag if the frame's current LSN and dirty
+    /// generation match the snapshot. If a writer modified the page since the
+    /// snapshot, the dirty flag is left set.
+    pub fn mark_clean(&self, page_id: PageId, expected_lsn: Lsn, expected_generation: u64) {
         let frame_id = {
             let pt = self.page_table.read();
             match pt.get(&page_id) {
@@ -406,7 +444,7 @@ impl BufferPool {
         let slot = &self.frames[frame_id as usize];
         let mut guard = slot.lock.write();
         let current_lsn = read_lsn_from_buf(&guard.data);
-        if current_lsn == expected_lsn {
+        if current_lsn == expected_lsn && guard.dirty_generation == expected_generation {
             guard.dirty = false;
         }
     }
@@ -498,9 +536,7 @@ impl BufferPool {
             return Ok(idx);
         }
 
-        Err(io::Error::other(
-            BufferPoolFull,
-        ))
+        Err(io::Error::other(BufferPoolFull))
     }
 }
 
@@ -511,11 +547,7 @@ fn read_lsn_from_buf(buf: &[u8]) -> Lsn {
     if buf.len() < LSN_OFFSET + LSN_SIZE {
         return 0;
     }
-    u64::from_le_bytes(
-        buf[LSN_OFFSET..LSN_OFFSET + LSN_SIZE]
-            .try_into()
-            .unwrap(),
-    )
+    u64::from_le_bytes(buf[LSN_OFFSET..LSN_OFFSET + LSN_SIZE].try_into().unwrap())
 }
 
 // ─── SharedPageGuard ───
@@ -577,7 +609,9 @@ impl<'a> ExclusivePageGuard<'a> {
 
     /// The page ID of the loaded page.
     pub fn page_id(&self) -> PageId {
-        self.guard.page_id.expect("ExclusivePageGuard has no page_id")
+        self.guard
+            .page_id
+            .expect("ExclusivePageGuard has no page_id")
     }
 
     /// Explicitly mark the page as dirty (without going through `data_mut`).
@@ -590,6 +624,7 @@ impl<'a> Drop for ExclusivePageGuard<'a> {
     fn drop(&mut self) {
         if self.modified {
             self.guard.dirty = true;
+            self.guard.dirty_generation = self.guard.dirty_generation.wrapping_add(1);
         }
         self.pool.frames[self.frame_id as usize]
             .pin_count
@@ -606,6 +641,7 @@ impl<'a> Drop for ExclusivePageGuard<'a> {
 mod tests {
     use super::*;
     use crate::backend::{FilePageStorage, MemoryPageStorage};
+    use crate::page::PageType;
     use tempfile::TempDir;
 
     const PAGE_SIZE: usize = 4096;
@@ -620,20 +656,18 @@ mod tests {
     /// Helper: write a recognizable pattern into page `page_id` of the storage.
     async fn write_pattern(storage: &dyn PageStorage, page_id: PageId) {
         let mut page = vec![0u8; PAGE_SIZE];
-        // Fill with page_id as the repeating byte.
-        page.fill(page_id as u8);
-        // Stamp the page_id in the first 4 bytes (LE) for easy identification.
-        page[0..4].copy_from_slice(&page_id.to_le_bytes());
+        let mut slotted = SlottedPage::init(&mut page, page_id, PageType::Heap);
+        slotted.insert_slot(&[page_id as u8; 32]).unwrap();
+        slotted.stamp_checksum();
         storage.write_page(page_id, &page).await.unwrap();
     }
 
     /// Helper: verify a page buffer has the pattern written by `write_pattern`.
     fn verify_pattern(data: &[u8], page_id: PageId) {
-        let stored_id = u32::from_le_bytes(data[0..4].try_into().unwrap());
-        assert_eq!(stored_id, page_id, "page_id mismatch in buffer");
-        // Check a few bytes in the middle.
-        assert_eq!(data[100], page_id as u8);
-        assert_eq!(data[PAGE_SIZE - 1], page_id as u8);
+        let page = SlottedPageRef::from_buf(data).unwrap();
+        assert_eq!(page.page_id(), page_id, "page_id mismatch in buffer");
+        assert!(page.verify_checksum(), "page checksum should be valid");
+        assert_eq!(page.slot_data(0), &[page_id as u8; 32]);
     }
 
     fn make_pool(frame_count: usize, storage: Arc<dyn PageStorage>) -> BufferPool {
@@ -801,12 +835,16 @@ mod tests {
         }
 
         let dirty = pool.dirty_pages();
-        let mut dirty_ids: Vec<PageId> = dirty.iter().map(|(pid, _, _)| *pid).collect();
+        let mut dirty_ids: Vec<PageId> = dirty.iter().map(|(pid, _, _, _)| *pid).collect();
         dirty_ids.sort();
         assert_eq!(dirty_ids, vec![0, 2, 4, 6]);
 
-        for (pid, data, _lsn) in &dirty {
-            assert_eq!(data[0], 0xAA, "dirty page {} should have modified data", pid);
+        for (pid, data, _lsn, _generation) in &dirty {
+            assert_eq!(
+                data[0], 0xAA,
+                "dirty page {} should have modified data",
+                pid
+            );
         }
     }
 
@@ -827,11 +865,11 @@ mod tests {
 
         let dirty = pool.dirty_pages();
         assert_eq!(dirty.len(), 1);
-        let (pid, _data, lsn) = &dirty[0];
+        let (pid, _data, lsn, generation) = &dirty[0];
         assert_eq!(*pid, 0);
         assert_eq!(*lsn, 42);
 
-        pool.mark_clean(0, 42);
+        pool.mark_clean(0, 42, *generation);
 
         let dirty = pool.dirty_pages();
         assert!(dirty.is_empty(), "page should be clean after mark_clean");
@@ -862,11 +900,50 @@ mod tests {
             buf[LSN_OFFSET..LSN_OFFSET + LSN_SIZE].copy_from_slice(&20u64.to_le_bytes());
         }
 
-        pool.mark_clean(0, 10);
+        pool.mark_clean(0, 10, dirty[0].3);
 
         let dirty = pool.dirty_pages();
         assert_eq!(dirty.len(), 1, "page should still be dirty (stale LSN)");
         assert_eq!(dirty[0].2, 20, "page should have the new LSN");
+    }
+
+    #[tokio::test]
+    async fn test_mark_clean_stale_generation_with_same_lsn() {
+        let storage = make_memory_storage(4).await;
+        write_pattern(&*storage, 0).await;
+
+        let pool = make_pool(8, storage.clone());
+
+        {
+            let mut guard = pool.fetch_page_exclusive(0).await.unwrap();
+            let buf = guard.data_mut();
+            buf[LSN_OFFSET..LSN_OFFSET + LSN_SIZE].copy_from_slice(&10u64.to_le_bytes());
+            buf[100] = 1;
+        }
+
+        let dirty = pool.dirty_pages();
+        assert_eq!(dirty.len(), 1);
+        let generation = dirty[0].3;
+
+        {
+            let mut guard = pool.fetch_page_exclusive(0).await.unwrap();
+            let buf = guard.data_mut();
+            buf[100] = 2;
+        }
+
+        pool.mark_clean(0, 10, generation);
+
+        let dirty = pool.dirty_pages();
+        assert_eq!(
+            dirty.len(),
+            1,
+            "page should still be dirty after a same-LSN post-snapshot write"
+        );
+        assert_eq!(dirty[0].2, 10, "page LSN should remain unchanged");
+        assert!(
+            dirty[0].3 > generation,
+            "dirty generation should advance for same-LSN writes"
+        );
     }
 
     // ─── Test 10: new_page ───
@@ -1021,12 +1098,48 @@ mod tests {
         let dirty = pool.dirty_pages();
         assert_eq!(dirty.len(), 1);
 
-        let (pid, data, _lsn) = &dirty[0];
+        let (pid, data, _lsn, _generation) = &dirty[0];
         assert_eq!(*pid, 0);
         let page_ref = SlottedPageRef::from_buf(data).unwrap();
         assert!(
             page_ref.verify_checksum(),
             "BUG: dirty page snapshot should have a valid checksum for DWB recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shared_fetch_rejects_corrupt_cold_page() {
+        let storage = make_memory_storage(1).await;
+        write_pattern(&*storage, 0).await;
+
+        let mut corrupt = vec![0u8; PAGE_SIZE];
+        storage.read_page(0, &mut corrupt).await.unwrap();
+        corrupt[PAGE_SIZE - 1] ^= 0xFF;
+        storage.write_page(0, &corrupt).await.unwrap();
+
+        let pool = make_pool(1, storage);
+        let result = pool.fetch_page_shared(0).await;
+        assert!(
+            result.is_err(),
+            "cold shared fetch should reject a page with a bad checksum"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exclusive_fetch_rejects_corrupt_cold_page() {
+        let storage = make_memory_storage(1).await;
+        write_pattern(&*storage, 0).await;
+
+        let mut corrupt = vec![0u8; PAGE_SIZE];
+        storage.read_page(0, &mut corrupt).await.unwrap();
+        corrupt[PAGE_SIZE - 1] ^= 0xFF;
+        storage.write_page(0, &corrupt).await.unwrap();
+
+        let pool = make_pool(1, storage);
+        let result = pool.fetch_page_exclusive(0).await;
+        assert!(
+            result.is_err(),
+            "cold exclusive fetch should reject a page with a bad checksum"
         );
     }
 

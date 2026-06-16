@@ -8,7 +8,10 @@ pub fn SubscriptionsModule() -> Element {
     let _rev = *state.revision.read();
 
     let engine = state.engine.read().clone();
-    let collections = engine.as_ref().map(|e| e.l6.list_collections()).unwrap_or_default();
+    let collections = engine
+        .as_ref()
+        .map(|e| e.l6.list_collections())
+        .unwrap_or_default();
 
     let events: Signal<Vec<String>> = use_signal(Vec::new);
     let active = use_signal(|| false);

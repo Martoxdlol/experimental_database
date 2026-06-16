@@ -82,7 +82,8 @@ impl PostingList {
             .into());
         }
 
-        let count = u32::from_le_bytes(data[0..4].try_into().expect("bounds checked above")) as usize;
+        let count =
+            u32::from_le_bytes(data[0..4].try_into().expect("bounds checked above")) as usize;
         let mut offset = 4;
         let mut entries = Vec::with_capacity(count);
 
@@ -93,8 +94,11 @@ impl PostingList {
                 )
                 .into());
             }
-            let key_len =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().expect("bounds checked above")) as usize;
+            let key_len = u16::from_le_bytes(
+                data[offset..offset + 2]
+                    .try_into()
+                    .expect("bounds checked above"),
+            ) as usize;
             offset += 2;
 
             if offset + key_len > data.len() {
@@ -112,8 +116,11 @@ impl PostingList {
                 )
                 .into());
             }
-            let value_len =
-                u16::from_le_bytes(data[offset..offset + 2].try_into().expect("bounds checked above")) as usize;
+            let value_len = u16::from_le_bytes(
+                data[offset..offset + 2]
+                    .try_into()
+                    .expect("bounds checked above"),
+            ) as usize;
             offset += 2;
 
             if offset + value_len > data.len() {
@@ -261,9 +268,7 @@ mod tests {
 
     #[test]
     fn multi_entry_roundtrip() {
-        let entries: Vec<PostingEntry> = (0u8..10)
-            .map(|i| entry(&[i], &[i * 2]))
-            .collect();
+        let entries: Vec<PostingEntry> = (0u8..10).map(|i| entry(&[i], &[i * 2])).collect();
         let pl = list(entries);
         let data = pl.encode();
         let decoded = PostingList::decode(&data).unwrap();
@@ -273,10 +278,7 @@ mod tests {
 
     #[test]
     fn encoded_size_matches() {
-        let pl = list(vec![
-            entry(b"abc", b"12"),
-            entry(b"def", b""),
-        ]);
+        let pl = list(vec![entry(b"abc", b"12"), entry(b"def", b"")]);
         assert_eq!(pl.encoded_size(), pl.encode().len());
     }
 
@@ -304,11 +306,7 @@ mod tests {
 
     #[test]
     fn contains_key_found() {
-        let pl = list(vec![
-            entry(&[1], b""),
-            entry(&[3], b""),
-            entry(&[5], b""),
-        ]);
+        let pl = list(vec![entry(&[1], b""), entry(&[3], b""), entry(&[5], b"")]);
         assert!(pl.contains_key(&[1]));
         assert!(pl.contains_key(&[3]));
         assert!(pl.contains_key(&[5]));
@@ -316,11 +314,7 @@ mod tests {
 
     #[test]
     fn contains_key_missing() {
-        let pl = list(vec![
-            entry(&[1], b""),
-            entry(&[3], b""),
-            entry(&[5], b""),
-        ]);
+        let pl = list(vec![entry(&[1], b""), entry(&[3], b""), entry(&[5], b"")]);
         assert!(!pl.contains_key(&[0]));
         assert!(!pl.contains_key(&[2]));
         assert!(!pl.contains_key(&[6]));
@@ -383,10 +377,7 @@ mod tests {
         ]);
         let result = a.intersect(&b);
         // Values from a.
-        assert_eq!(
-            result,
-            list(vec![entry(&[2], b"a"), entry(&[3], b"a")])
-        );
+        assert_eq!(result, list(vec![entry(&[2], b"a"), entry(&[3], b"a")]));
     }
 
     #[test]
@@ -407,17 +398,10 @@ mod tests {
 
     #[test]
     fn difference_basic() {
-        let a = list(vec![
-            entry(&[1], b""),
-            entry(&[2], b""),
-            entry(&[3], b""),
-        ]);
+        let a = list(vec![entry(&[1], b""), entry(&[2], b""), entry(&[3], b"")]);
         let b = list(vec![entry(&[2], b"")]);
         let result = a.difference(&b);
-        assert_eq!(
-            result,
-            list(vec![entry(&[1], b""), entry(&[3], b"")])
-        );
+        assert_eq!(result, list(vec![entry(&[1], b""), entry(&[3], b"")]));
     }
 
     #[test]
@@ -498,7 +482,7 @@ mod tests {
         let pl = list(vec![
             entry(&[1], b""),
             entry(&[2], b"short"),
-            entry(&[3], &vec![0xAB; 100]),
+            entry(&[3], &[0xAB; 100]),
         ]);
         let data = pl.encode();
         let decoded = PostingList::decode(&data).unwrap();

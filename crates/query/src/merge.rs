@@ -10,6 +10,7 @@ use exdb_core::encoding::extract_scalar;
 use exdb_core::field_path::FieldPath;
 use exdb_core::filter::Filter;
 use exdb_core::types::{DocId, Scalar};
+use exdb_docstore::array_indexing::compute_index_entries;
 use exdb_docstore::key_encoding::encode_key_prefix;
 use exdb_storage::btree::ScanDirection;
 use std::collections::{HashMap, HashSet};
@@ -27,8 +28,9 @@ pub struct MergeView<'a> {
 /// Merge snapshot scan results with buffered mutations.
 ///
 /// Accepts a Stream of scan results (from execute_scan) and merges with
-/// buffered writes. Collects everything into a Vec since merge-sort requires
-/// both sides to be fully materialized.
+/// buffered writes. Snapshot-only/delete-overlay scans stop as soon as a limit
+/// is satisfied; scans with pending insert/replace rows collect both sides
+/// because merge-sort ordering requires fully materialized inputs.
 #[allow(clippy::too_many_arguments)]
 pub async fn merge_with_writes<S>(
     mut snapshot: S,
@@ -43,9 +45,50 @@ pub async fn merge_with_writes<S>(
 where
     S: futures_core::Stream<Item = std::io::Result<ScanRow>> + Unpin,
 {
-    let delete_set: HashSet<DocId> = merge_view.deletes.iter().copied().collect();
     let replace_map: HashMap<DocId, &serde_json::Value> =
         merge_view.replaces.iter().map(|(id, v)| (*id, v)).collect();
+    let replaced_set: HashSet<DocId> = replace_map.keys().copied().collect();
+    let delete_set: HashSet<DocId> = merge_view
+        .deletes
+        .iter()
+        .copied()
+        .chain(replaced_set.iter().copied())
+        .collect();
+
+    // Replaces are handled as "remove old snapshot row, add pending body if it
+    // still belongs in this scan." That covers moves into or out of the range.
+    let mut pending_rows = Vec::new();
+    for (doc_id, doc) in merge_view.inserts.iter().chain(merge_view.replaces.iter()) {
+        if let Some(f) = post_filter
+            && !filter_matches(doc, f)
+        {
+            continue;
+        }
+
+        let sort_keys = compute_index_entries(doc, sort_fields).map_err(std::io::Error::other)?;
+        for sort_key in sort_keys {
+            if key_in_range(&sort_key, range_lower, range_upper) {
+                pending_rows.push((*doc_id, doc.clone(), sort_key));
+            }
+        }
+    }
+
+    if pending_rows.is_empty() {
+        let mut result = Vec::new();
+        while let Some(item) = snapshot.next().await {
+            let row = item?;
+            if delete_set.contains(&row.doc_id) {
+                continue;
+            }
+            result.push(row);
+            if let Some(limit) = limit
+                && result.len() >= limit
+            {
+                break;
+            }
+        }
+        return Ok(result);
+    }
 
     // Step 1: Consume snapshot with delete/replace overlay
     let mut snapshot_rows = Vec::new();
@@ -54,34 +97,7 @@ where
         if delete_set.contains(&row.doc_id) {
             continue;
         }
-        if let Some(new_body) = replace_map.get(&row.doc_id) {
-            let doc = (*new_body).clone();
-            if let Some(f) = post_filter
-                && !filter_matches(&doc, f) {
-                    continue;
-                }
-            snapshot_rows.push(ScanRow {
-                doc_id: row.doc_id,
-                version_ts: row.version_ts,
-                doc,
-            });
-        } else {
-            snapshot_rows.push(row);
-        }
-    }
-
-    // Step 2: Find inserts within range that match filter
-    let mut insert_rows = Vec::new();
-    for (doc_id, doc) in merge_view.inserts {
-        let sort_key = extract_sort_key(doc, sort_fields);
-        if !key_in_range(&sort_key, range_lower, range_upper) {
-            continue;
-        }
-        if let Some(f) = post_filter
-            && !filter_matches(doc, f) {
-                continue;
-            }
-        insert_rows.push((*doc_id, doc.clone(), sort_key));
+        snapshot_rows.push(row);
     }
 
     // Step 3: Merge by sort key
@@ -94,7 +110,7 @@ where
         })
         .collect();
 
-    let mut keyed_inserts: Vec<(Vec<u8>, ScanRow)> = insert_rows
+    let mut keyed_pending: Vec<(Vec<u8>, ScanRow)> = pending_rows
         .into_iter()
         .map(|(doc_id, doc, sort_key)| {
             (
@@ -112,16 +128,16 @@ where
     match direction {
         ScanDirection::Forward => {
             keyed_snapshot.sort_by(|a, b| a.0.cmp(&b.0));
-            keyed_inserts.sort_by(|a, b| a.0.cmp(&b.0));
+            keyed_pending.sort_by(|a, b| a.0.cmp(&b.0));
         }
         ScanDirection::Backward => {
             keyed_snapshot.sort_by(|a, b| b.0.cmp(&a.0));
-            keyed_inserts.sort_by(|a, b| b.0.cmp(&a.0));
+            keyed_pending.sort_by(|a, b| b.0.cmp(&a.0));
         }
     }
 
     // Merge-sort the two sorted lists
-    let mut result = merge_sorted(keyed_snapshot, keyed_inserts, direction);
+    let mut result = merge_sorted(keyed_snapshot, keyed_pending, direction);
 
     // Step 4: Apply limit
     if let Some(limit) = limit {
@@ -204,6 +220,11 @@ mod tests {
     use exdb_core::field_path::FieldPath;
     use exdb_core::types::DocId;
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio_stream::StreamExt;
 
     fn fp(name: &str) -> FieldPath {
         FieldPath::single(name)
@@ -237,6 +258,17 @@ mod tests {
     ) -> std::pin::Pin<Box<dyn futures_core::Stream<Item = std::io::Result<ScanRow>> + Send + Unpin>>
     {
         Box::pin(tokio_stream::iter(rows))
+    }
+
+    fn counted_stream(
+        rows: Vec<std::io::Result<ScanRow>>,
+        polls: Arc<AtomicUsize>,
+    ) -> std::pin::Pin<Box<dyn futures_core::Stream<Item = std::io::Result<ScanRow>> + Send + Unpin>>
+    {
+        Box::pin(tokio_stream::iter(rows).map(move |row| {
+            polls.fetch_add(1, Ordering::SeqCst);
+            row
+        }))
     }
 
     #[tokio::test]
@@ -342,6 +374,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replace_moved_out_of_range_is_excluded() {
+        let rows = vec![Ok(make_row(1, json!({"x": 5})))];
+        let replaces = [(make_doc_id(1), json!({"x": 50}))];
+        let mv = MergeView {
+            inserts: &[],
+            deletes: &[],
+            replaces: &replaces,
+        };
+        let lower = encode_key_prefix(&[Scalar::Int64(0)]);
+        let upper = encode_key_prefix(&[Scalar::Int64(10)]);
+        let result = merge_with_writes(
+            stream_from_vec(rows),
+            &mv,
+            &[fp("x")],
+            Bound::Included(&lower),
+            Bound::Excluded(&upper),
+            None,
+            ScanDirection::Forward,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn replace_moved_into_range_is_included() {
+        let rows: Vec<std::io::Result<ScanRow>> = vec![];
+        let replaces = [(make_doc_id(1), json!({"x": 5}))];
+        let mv = MergeView {
+            inserts: &[],
+            deletes: &[],
+            replaces: &replaces,
+        };
+        let lower = encode_key_prefix(&[Scalar::Int64(0)]);
+        let upper = encode_key_prefix(&[Scalar::Int64(10)]);
+        let result = merge_with_writes(
+            stream_from_vec(rows),
+            &mv,
+            &[fp("x")],
+            Bound::Included(&lower),
+            Bound::Excluded(&upper),
+            None,
+            ScanDirection::Forward,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].doc_id, make_doc_id(1));
+        assert_eq!(result[0].doc["x"], 5);
+    }
+
+    #[tokio::test]
     async fn insert_within_range() {
         let rows: Vec<std::io::Result<ScanRow>> = vec![];
         let inserts = [(make_doc_id(10), json!({"x": 5}))];
@@ -363,6 +449,32 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn insert_array_entry_within_range() {
+        let rows: Vec<std::io::Result<ScanRow>> = vec![];
+        let inserts = [(make_doc_id(10), json!({"tags": ["cold", "urgent"]}))];
+        let mv = MergeView {
+            inserts: &inserts,
+            deletes: &[],
+            replaces: &[],
+        };
+        let urgent_key = encode_key_prefix(&[Scalar::String("urgent".to_string())]);
+        let result = merge_with_writes(
+            stream_from_vec(rows),
+            &mv,
+            &[fp("tags")],
+            Bound::Included(urgent_key.as_slice()),
+            Bound::Included(urgent_key.as_slice()),
+            None,
+            ScanDirection::Forward,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].doc["tags"][1], "urgent");
     }
 
     #[tokio::test]
@@ -432,11 +544,11 @@ mod tests {
 
     #[tokio::test]
     async fn limit_applied() {
-        let rows: Vec<std::io::Result<ScanRow>> = (1..=5)
-            .map(|i| Ok(make_row(i, json!({"x": i}))))
-            .collect();
+        let rows: Vec<std::io::Result<ScanRow>> =
+            (1..=5).map(|i| Ok(make_row(i, json!({"x": i})))).collect();
+        let polls = Arc::new(AtomicUsize::new(0));
         let result = merge_with_writes(
-            stream_from_vec(rows),
+            counted_stream(rows, Arc::clone(&polls)),
             &empty_merge_view(),
             &[fp("x")],
             Bound::Unbounded,
@@ -448,6 +560,75 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.len(), 3);
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn limit_with_delete_overlay_stops_after_enough_visible_rows() {
+        let rows: Vec<std::io::Result<ScanRow>> =
+            (1..=5).map(|i| Ok(make_row(i, json!({"x": i})))).collect();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let deletes = [make_doc_id(1)];
+        let mv = MergeView {
+            inserts: &[],
+            deletes: &deletes,
+            replaces: &[],
+        };
+
+        let result = merge_with_writes(
+            counted_stream(rows, Arc::clone(&polls)),
+            &mv,
+            &[fp("x")],
+            Bound::Unbounded,
+            Bound::Unbounded,
+            None,
+            ScanDirection::Forward,
+            Some(2),
+        )
+        .await
+        .unwrap();
+
+        let xs: Vec<i64> = result
+            .iter()
+            .map(|r| r.doc["x"].as_i64().unwrap())
+            .collect();
+        assert_eq!(xs, vec![2, 3]);
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn backward_limit_with_delete_overlay_stops_after_enough_visible_rows() {
+        let rows: Vec<std::io::Result<ScanRow>> = (1..=5)
+            .rev()
+            .map(|i| Ok(make_row(i, json!({"x": i}))))
+            .collect();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let deletes = [make_doc_id(5)];
+        let mv = MergeView {
+            inserts: &[],
+            deletes: &deletes,
+            replaces: &[],
+        };
+
+        let result = merge_with_writes(
+            counted_stream(rows, Arc::clone(&polls)),
+            &mv,
+            &[fp("x")],
+            Bound::Unbounded,
+            Bound::Unbounded,
+            None,
+            ScanDirection::Backward,
+            Some(2),
+        )
+        .await
+        .unwrap();
+
+        let xs: Vec<i64> = result
+            .iter()
+            .map(|r| r.doc["x"].as_i64().unwrap())
+            .collect();
+        assert_eq!(xs, vec![4, 3]);
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

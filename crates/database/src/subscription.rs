@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use exdb_core::types::TxId;
 use exdb_tx::{InvalidationEvent, ReadSet, SubscriptionId, SubscriptionRegistry};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
@@ -12,6 +13,7 @@ use tokio::sync::mpsc;
 /// RAII handle to a subscription. Automatically unsubscribes on drop.
 pub struct SubscriptionHandle {
     id: SubscriptionId,
+    tx_id: TxId,
     registry: Arc<RwLock<SubscriptionRegistry>>,
     events: Option<mpsc::Receiver<InvalidationEvent>>,
 }
@@ -20,11 +22,13 @@ impl SubscriptionHandle {
     /// Create a new subscription handle.
     pub(crate) fn new(
         id: SubscriptionId,
+        tx_id: TxId,
         registry: Arc<RwLock<SubscriptionRegistry>>,
         events: mpsc::Receiver<InvalidationEvent>,
     ) -> Self {
         SubscriptionHandle {
             id,
+            tx_id,
             registry,
             events: Some(events),
         }
@@ -33,6 +37,11 @@ impl SubscriptionHandle {
     /// Get the subscription ID.
     pub fn id(&self) -> SubscriptionId {
         self.id
+    }
+
+    /// Get the transaction ID whose read set registered this subscription.
+    pub fn tx_id(&self) -> TxId {
+        self.tx_id
     }
 
     /// Wait for the next invalidation event.
@@ -94,14 +103,9 @@ mod tests {
                 limit_boundary: None,
             },
         );
-        let id = registry.write().register(
-            SubscriptionMode::Watch,
-            0,
-            1,
-            1,
-            read_set,
-            tx,
-        );
+        let id = registry
+            .write()
+            .register(SubscriptionMode::Watch, 0, 1, 1, read_set, tx);
         (id, rx)
     }
 
@@ -109,8 +113,9 @@ mod tests {
     fn handle_id() {
         let registry = make_registry();
         let (id, rx) = register_sub(&registry);
-        let handle = SubscriptionHandle::new(id, Arc::clone(&registry), rx);
+        let handle = SubscriptionHandle::new(id, 1, Arc::clone(&registry), rx);
         assert_eq!(handle.id(), id);
+        assert_eq!(handle.tx_id(), 1);
     }
 
     #[test]
@@ -118,7 +123,7 @@ mod tests {
         let registry = make_registry();
         let (id, rx) = register_sub(&registry);
         {
-            let _handle = SubscriptionHandle::new(id, Arc::clone(&registry), rx);
+            let _handle = SubscriptionHandle::new(id, 1, Arc::clone(&registry), rx);
             // Verify subscription exists
             assert!(registry.read().subscription_count() > 0);
         }
@@ -130,7 +135,7 @@ mod tests {
     fn explicit_unsubscribe() {
         let registry = make_registry();
         let (id, rx) = register_sub(&registry);
-        let handle = SubscriptionHandle::new(id, Arc::clone(&registry), rx);
+        let handle = SubscriptionHandle::new(id, 1, Arc::clone(&registry), rx);
         handle.unsubscribe();
         assert_eq!(registry.read().subscription_count(), 0);
     }
@@ -139,7 +144,7 @@ mod tests {
     async fn next_event_returns_none_after_unsubscribe() {
         let registry = make_registry();
         let (id, rx) = register_sub(&registry);
-        let mut handle = SubscriptionHandle::new(id, Arc::clone(&registry), rx);
+        let mut handle = SubscriptionHandle::new(id, 1, Arc::clone(&registry), rx);
 
         // Drop the sender side by removing from registry (simulates cleanup)
         registry.write().remove(id);
@@ -153,7 +158,7 @@ mod tests {
     fn update_read_set() {
         let registry = make_registry();
         let (id, rx) = register_sub(&registry);
-        let handle = SubscriptionHandle::new(id, Arc::clone(&registry), rx);
+        let handle = SubscriptionHandle::new(id, 1, Arc::clone(&registry), rx);
 
         // Should not panic
         let new_rs = ReadSet::new();
@@ -176,16 +181,11 @@ mod tests {
                 limit_boundary: None,
             },
         );
-        let id = registry.write().register(
-            SubscriptionMode::Notify,
-            0,
-            1,
-            1,
-            read_set,
-            tx.clone(),
-        );
+        let id = registry
+            .write()
+            .register(SubscriptionMode::Notify, 0, 1, 1, read_set, tx.clone());
 
-        let mut handle = SubscriptionHandle::new(id, Arc::clone(&registry), rx);
+        let mut handle = SubscriptionHandle::new(id, 1, Arc::clone(&registry), rx);
 
         // Send an event via the channel
         let event = InvalidationEvent {
@@ -206,8 +206,8 @@ mod tests {
         let (id1, rx1) = register_sub(&registry);
         let (id2, rx2) = register_sub(&registry);
 
-        let handle1 = SubscriptionHandle::new(id1, Arc::clone(&registry), rx1);
-        let _handle2 = SubscriptionHandle::new(id2, Arc::clone(&registry), rx2);
+        let handle1 = SubscriptionHandle::new(id1, 1, Arc::clone(&registry), rx1);
+        let _handle2 = SubscriptionHandle::new(id2, 2, Arc::clone(&registry), rx2);
 
         handle1.unsubscribe();
         // handle2 still alive

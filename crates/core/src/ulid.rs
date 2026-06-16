@@ -104,7 +104,10 @@ pub fn decode_ulid(s: &str) -> Result<DocId, String> {
         }
         let bits = DECODE_TABLE[byte as usize];
         if bits == 0xFF {
-            return Err(format!("invalid character '{}' at position {i}", byte as char));
+            return Err(format!(
+                "invalid character '{}' at position {i}",
+                byte as char
+            ));
         }
         if i == 0 {
             // First char only uses 2 bits for a 128-bit ULID
@@ -146,7 +149,8 @@ pub fn generate_ulid() -> DocId {
         // Extract a numeric value from the thread ID debug representation.
         let tid: u64 = {
             let s = format!("{:?}", thread_id);
-            s.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
+            s.bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64))
         };
         let seed = millis
             .wrapping_mul(6364136223846793005)

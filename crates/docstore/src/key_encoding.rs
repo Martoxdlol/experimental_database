@@ -261,7 +261,10 @@ fn decode_escaped_bytes(data: &[u8]) -> Result<(Vec<u8>, usize), String> {
                 result.push(0x00);
                 i += 2;
             } else {
-                return Err(format!("invalid escape sequence: 0x00, 0x{:02X}", data[i + 1]));
+                return Err(format!(
+                    "invalid escape sequence: 0x00, 0x{:02X}",
+                    data[i + 1]
+                ));
             }
         } else {
             result.push(data[i]);
@@ -299,7 +302,10 @@ mod tests {
     #[test]
     fn test_int64_ordering() {
         let values = [i64::MIN, -1, 0, 1, i64::MAX];
-        let encoded: Vec<_> = values.iter().map(|v| encode_scalar(&Scalar::Int64(*v))).collect();
+        let encoded: Vec<_> = values
+            .iter()
+            .map(|v| encode_scalar(&Scalar::Int64(*v)))
+            .collect();
         for i in 0..encoded.len() - 1 {
             assert!(
                 encoded[i] < encoded[i + 1],
@@ -323,9 +329,16 @@ mod tests {
     #[test]
     fn test_float64_ordering() {
         let values = [f64::NEG_INFINITY, -1.0, 0.0, 1.0, f64::INFINITY, f64::NAN];
-        let encoded: Vec<_> = values.iter().map(|v| encode_scalar(&Scalar::Float64(*v))).collect();
+        let encoded: Vec<_> = values
+            .iter()
+            .map(|v| encode_scalar(&Scalar::Float64(*v)))
+            .collect();
         for i in 0..encoded.len() - 1 {
-            assert!(encoded[i] < encoded[i + 1], "index {i} should sort before {}", i + 1);
+            assert!(
+                encoded[i] < encoded[i + 1],
+                "index {i} should sort before {}",
+                i + 1
+            );
         }
     }
 
@@ -399,8 +412,17 @@ mod tests {
 
     #[test]
     fn test_bytes_ordering() {
-        let values: Vec<Vec<u8>> = vec![vec![], vec![0x01], vec![0x01, 0x01], vec![0x01, 0x02], vec![0x02]];
-        let encoded: Vec<_> = values.iter().map(|b| encode_scalar(&Scalar::Bytes(b.clone()))).collect();
+        let values: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0x01],
+            vec![0x01, 0x01],
+            vec![0x01, 0x02],
+            vec![0x02],
+        ];
+        let encoded: Vec<_> = values
+            .iter()
+            .map(|b| encode_scalar(&Scalar::Bytes(b.clone())))
+            .collect();
         for i in 0..encoded.len() - 1 {
             assert!(encoded[i] < encoded[i + 1]);
         }
@@ -419,7 +441,11 @@ mod tests {
         ];
         let encoded: Vec<_> = values.iter().map(encode_scalar).collect();
         for i in 0..encoded.len() - 1 {
-            assert!(encoded[i] < encoded[i + 1], "type at index {i} should sort before {}", i + 1);
+            assert!(
+                encoded[i] < encoded[i + 1],
+                "type at index {i} should sort before {}",
+                i + 1
+            );
         }
     }
 
@@ -714,9 +740,19 @@ mod tests {
             f64::INFINITY,
             f64::NAN,
         ];
-        let encoded: Vec<_> = values.iter().map(|v| encode_scalar(&Scalar::Float64(*v))).collect();
+        let encoded: Vec<_> = values
+            .iter()
+            .map(|v| encode_scalar(&Scalar::Float64(*v)))
+            .collect();
         for i in 0..encoded.len() - 1 {
-            assert!(encoded[i] < encoded[i + 1], "index {} ({}) should sort before {} ({})", i, values[i], i + 1, values[i + 1]);
+            assert!(
+                encoded[i] < encoded[i + 1],
+                "index {} ({}) should sort before {} ({})",
+                i,
+                values[i],
+                i + 1,
+                values[i + 1]
+            );
         }
     }
 
@@ -810,7 +846,12 @@ mod tests {
         for val in &values {
             let encoded = encode_scalar(val);
             let (decoded, consumed) = decode_scalar(&encoded).unwrap();
-            assert_eq!(consumed, encoded.len(), "consumed should match encoded length for {:?}", val);
+            assert_eq!(
+                consumed,
+                encoded.len(),
+                "consumed should match encoded length for {:?}",
+                val
+            );
             match (val, &decoded) {
                 (Scalar::Id(_), Scalar::String(_)) => {} // Id decodes as String, expected
                 _ => assert_eq!(*val, decoded, "roundtrip failed for {:?}", val),
@@ -824,13 +865,20 @@ mod tests {
     fn test_primary_key_ts_ordering_comprehensive() {
         let id = DocId([1; 16]);
         let timestamps = [0, 1, 100, 1000, u64::MAX / 2, u64::MAX];
-        let keys: Vec<_> = timestamps.iter().map(|&ts| make_primary_key(&id, ts)).collect();
+        let keys: Vec<_> = timestamps
+            .iter()
+            .map(|&ts| make_primary_key(&id, ts))
+            .collect();
         // Newer ts has smaller inv_ts, so sorts first (before older entries)
         for i in 0..keys.len() - 1 {
-            assert!(keys[i] > keys[i + 1],
+            assert!(
+                keys[i] > keys[i + 1],
                 "ts={} (inv_ts={}) should sort after ts={} (inv_ts={})",
-                timestamps[i], inv_ts(timestamps[i]),
-                timestamps[i + 1], inv_ts(timestamps[i + 1]));
+                timestamps[i],
+                inv_ts(timestamps[i]),
+                timestamps[i + 1],
+                inv_ts(timestamps[i + 1])
+            );
         }
     }
 
@@ -844,6 +892,9 @@ mod tests {
         let k2 = make_secondary_key(&[Scalar::Int64(2)], &id, ts);
         let k3 = make_secondary_key(&[Scalar::String("a".into())], &id, ts);
         assert!(k1 < k2, "Int(1) < Int(2) in secondary key");
-        assert!(k2 < k3, "Int(2) < String('a') in secondary key (cross-type)");
+        assert!(
+            k2 < k3,
+            "Int(2) < String('a') in secondary key (cross-type)"
+        );
     }
 }

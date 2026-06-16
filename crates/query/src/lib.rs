@@ -18,13 +18,13 @@ pub use exdb_core::filter::{Filter, RangeExpr};
 pub use post_filter::{compare_scalars, filter_matches};
 
 // Range encoding
-pub use range_encoder::{encode_range, validate_range, RangeError, RangeShape};
+pub use range_encoder::{RangeError, RangeShape, encode_range, validate_range};
 
 // Access method resolution
-pub use access::{resolve_access, AccessError, AccessMethod, IndexInfo};
+pub use access::{AccessError, AccessMethod, IndexInfo, resolve_access};
 
 // Scan execution
-pub use scan::{execute_scan, QueryScanStream, ReadIntervalInfo, ScanRow, ScanStats};
+pub use scan::{QueryScanStream, ReadIntervalInfo, ScanRow, ScanStats, execute_scan};
 
 // Write-set merge
-pub use merge::{merge_with_writes, MergeView};
+pub use merge::{MergeView, merge_with_writes};

@@ -48,7 +48,8 @@ impl CellFlags {
 }
 
 /// Stream type for primary index scans.
-pub type PrimaryScanStream<'a> = Pin<Box<dyn Stream<Item = std::io::Result<(DocId, Ts, Vec<u8>)>> + Send + 'a>>;
+pub type PrimaryScanStream<'a> =
+    Pin<Box<dyn Stream<Item = std::io::Result<(DocId, Ts, Vec<u8>)>> + Send + 'a>>;
 
 /// The clustered primary B-tree wrapper with MVCC semantics.
 pub struct PrimaryIndex {
@@ -80,11 +81,13 @@ impl PrimaryIndex {
         let key = make_primary_key(doc_id, commit_ts);
         let value = match body {
             None => {
-                vec![CellFlags {
-                    tombstone: true,
-                    external: false,
-                }
-                .to_byte()]
+                vec![
+                    CellFlags {
+                        tombstone: true,
+                        external: false,
+                    }
+                    .to_byte(),
+                ]
             }
             Some(data) => {
                 if data.len() <= self.external_threshold {
@@ -130,8 +133,8 @@ impl PrimaryIndex {
 
         while let Some(result) = iter.next().await {
             let (key, value) = result?;
-            let (entry_doc_id, entry_ts) = parse_primary_key(&key)
-                .map_err(std::io::Error::other)?;
+            let (entry_doc_id, entry_ts) =
+                parse_primary_key(&key).map_err(std::io::Error::other)?;
             if entry_doc_id != *doc_id {
                 return Ok(None);
             }
@@ -145,6 +148,25 @@ impl PrimaryIndex {
             return self.load_body(&value).await.map(Some);
         }
         Ok(None)
+    }
+
+    /// Get one exact physical version of a document.
+    ///
+    /// Returns None if the exact version is absent or is a tombstone.
+    pub async fn get_version(
+        &self,
+        doc_id: &DocId,
+        version_ts: Ts,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        let key = make_primary_key(doc_id, version_ts);
+        let Some(value) = self.btree.get(&key).await? else {
+            return Ok(None);
+        };
+        let flags = CellFlags::from_byte(value[0]);
+        if flags.tombstone {
+            return Ok(None);
+        }
+        self.load_body(&value).await.map(Some)
     }
 
     /// Get the latest visible version's timestamp.
@@ -161,8 +183,8 @@ impl PrimaryIndex {
 
         while let Some(result) = iter.next().await {
             let (key, value) = result?;
-            let (entry_doc_id, entry_ts) = parse_primary_key(&key)
-                .map_err(std::io::Error::other)?;
+            let (entry_doc_id, entry_ts) =
+                parse_primary_key(&key).map_err(std::io::Error::other)?;
             if entry_doc_id != *doc_id {
                 return Ok(None);
             }
@@ -225,6 +247,19 @@ impl PrimaryIndex {
         &self.btree
     }
 
+    /// Remove one physical document version and free its external heap body, if any.
+    ///
+    /// This is used by ordinary vacuum and rollback vacuum. It only removes the
+    /// exact `(doc_id, commit_ts)` version; MVCC visibility decisions stay with
+    /// callers.
+    pub async fn remove_version(&self, doc_id: &DocId, commit_ts: Ts) -> std::io::Result<bool> {
+        let key = make_primary_key(doc_id, commit_ts);
+        if let Some(value) = self.btree.get(&key).await? {
+            self.free_external_body(&value).await?;
+        }
+        self.btree.delete(&key).await
+    }
+
     /// Access the storage engine (for heap operations).
     pub fn engine(&self) -> &Arc<StorageEngine> {
         &self.engine
@@ -235,6 +270,24 @@ impl PrimaryIndex {
         load_body_from_value(&self.engine, value).await
     }
 
+    async fn free_external_body(&self, value: &[u8]) -> std::io::Result<()> {
+        if value.is_empty() {
+            return Ok(());
+        }
+        let flags = CellFlags::from_byte(value[0]);
+        if flags.tombstone || !flags.external {
+            return Ok(());
+        }
+        if value.len() < 11 {
+            return Err(std::io::Error::other(
+                "cell value too short for external ref",
+            ));
+        }
+        let href_bytes: [u8; 6] = value[5..11].try_into().expect("bounds checked above");
+        self.engine
+            .heap_free(HeapRef::from_bytes(&href_bytes))
+            .await
+    }
 }
 
 /// Extract the body from a cell value. Returns Ok(body_bytes) for inline,
@@ -247,18 +300,23 @@ fn decode_cell_body(value: &[u8]) -> std::io::Result<Result<Vec<u8>, HeapRef>> {
     let flags = CellFlags::from_byte(value[0]);
     debug_assert!(!flags.tombstone, "decode_cell_body called on tombstone");
 
-    let body_len = u32::from_le_bytes(value[1..5].try_into().expect("bounds checked above")) as usize;
+    let body_len =
+        u32::from_le_bytes(value[1..5].try_into().expect("bounds checked above")) as usize;
 
     if flags.external {
         if value.len() < 11 {
-            return Err(std::io::Error::other("cell value too short for external ref"));
+            return Err(std::io::Error::other(
+                "cell value too short for external ref",
+            ));
         }
         let href_bytes: [u8; 6] = value[5..11].try_into().expect("bounds checked above");
         let href = HeapRef::from_bytes(&href_bytes);
         Ok(Err(href)) // Err variant = external, needs heap_load
     } else {
         if value.len() < 5 + body_len {
-            return Err(std::io::Error::other("cell value too short for inline body"));
+            return Err(std::io::Error::other(
+                "cell value too short for inline body",
+            ));
         }
         Ok(Ok(value[5..5 + body_len].to_vec())) // Ok variant = inline
     }
@@ -307,7 +365,11 @@ mod tests {
     use exdb_storage::engine::{StorageConfig, StorageEngine};
 
     async fn setup() -> (Arc<StorageEngine>, PrimaryIndex) {
-        let engine = Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap());
+        let engine = Arc::new(
+            StorageEngine::open_in_memory(StorageConfig::default())
+                .await
+                .unwrap(),
+        );
         let btree = engine.create_btree().await.unwrap();
         let pi = PrimaryIndex::new(btree, engine.clone(), 4096);
         (engine, pi)
@@ -400,8 +462,10 @@ mod tests {
             id[15] = i;
             pi.insert_version(&DocId(id), 1, Some(&[i])).await.unwrap();
         }
-        let results: Vec<_> = pi.scan_at_ts(10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await;
+        let results: Vec<_> = pi
+            .scan_at_ts(10, ScanDirection::Forward)
+            .collect::<Vec<_>>()
+            .await;
         assert_eq!(results.len(), 3);
         for r in &results {
             assert!(r.is_ok());
@@ -414,8 +478,10 @@ mod tests {
         let doc_id = DocId([1; 16]);
         pi.insert_version(&doc_id, 1, Some(b"hello")).await.unwrap();
         pi.insert_version(&doc_id, 5, None).await.unwrap();
-        let results: Vec<_> = pi.scan_at_ts(10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await;
+        let results: Vec<_> = pi
+            .scan_at_ts(10, ScanDirection::Forward)
+            .collect::<Vec<_>>()
+            .await;
         assert!(results.is_empty());
     }
 
@@ -427,7 +493,8 @@ mod tests {
         pi.insert_version(&doc_id, 5, Some(b"v5")).await.unwrap();
         let results: Vec<_> = pi
             .scan_at_ts(10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -456,8 +523,10 @@ mod tests {
         let (_engine, pi) = setup().await;
         let doc_id = DocId([1; 16]);
         assert!(pi.get_at_ts(&doc_id, 10).await.unwrap().is_none());
-        let results: Vec<_> = pi.scan_at_ts(10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await;
+        let results: Vec<_> = pi
+            .scan_at_ts(10, ScanDirection::Forward)
+            .collect::<Vec<_>>()
+            .await;
         assert!(results.is_empty());
     }
 
@@ -472,13 +541,19 @@ mod tests {
 
     #[tokio::test]
     async fn external_storage() {
-        let engine = Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap());
+        let engine = Arc::new(
+            StorageEngine::open_in_memory(StorageConfig::default())
+                .await
+                .unwrap(),
+        );
         let btree = engine.create_btree().await.unwrap();
         // Very low threshold to force external storage
         let pi = PrimaryIndex::new(btree, engine.clone(), 10);
         let doc_id = DocId([1; 16]);
         let big_body = vec![0xAB; 100];
-        pi.insert_version(&doc_id, 1, Some(&big_body)).await.unwrap();
+        pi.insert_version(&doc_id, 1, Some(&big_body))
+            .await
+            .unwrap();
         let loaded = pi.get_at_ts(&doc_id, 1).await.unwrap().unwrap();
         assert_eq!(loaded, big_body);
     }
@@ -490,7 +565,8 @@ mod tests {
             let mut id = [0u8; 16];
             id[12..16].copy_from_slice(&i.to_be_bytes());
             pi.insert_version(&DocId(id), 1, Some(&i.to_le_bytes()))
-                .await.unwrap();
+                .await
+                .unwrap();
         }
         for i in 0..100u32 {
             let mut id = [0u8; 16];
@@ -510,14 +586,17 @@ mod tests {
             id[15] = i;
             pi.insert_version(&DocId(id), 1, Some(&[i])).await.unwrap();
         }
-        let results: Vec<_> = pi.scan_at_ts(10, ScanDirection::Backward)
-            .collect::<Vec<_>>().await
+        let results: Vec<_> = pi
+            .scan_at_ts(10, ScanDirection::Backward)
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(results.len(), 3);
         // Backward: highest doc_id first
-        assert_eq!(results[0].0 .0[15], 2);
-        assert_eq!(results[2].0 .0[15], 0);
+        assert_eq!(results[0].0.0[15], 2);
+        assert_eq!(results[2].0.0[15], 0);
     }
 
     #[tokio::test]
@@ -529,10 +608,13 @@ mod tests {
         pi.insert_version(&doc_id, 10, Some(b"v10")).await.unwrap();
 
         // At ts=7: should see v5
-        let results: Vec<_> = pi.scan_at_ts(7, ScanDirection::Backward)
-            .collect::<Vec<_>>().await
+        let results: Vec<_> = pi
+            .scan_at_ts(7, ScanDirection::Backward)
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].1, 5);
         assert_eq!(results[0].2, b"v5");
@@ -545,10 +627,13 @@ mod tests {
         pi.insert_version(&id, 1, Some(b"hello")).await.unwrap();
         pi.insert_version(&id, 5, None).await.unwrap();
 
-        let results: Vec<_> = pi.scan_at_ts(10, ScanDirection::Backward)
-            .collect::<Vec<_>>().await
+        let results: Vec<_> = pi
+            .scan_at_ts(10, ScanDirection::Backward)
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -558,7 +643,9 @@ mod tests {
     async fn get_at_ts_zero() {
         let (_engine, pi) = setup().await;
         let doc_id = DocId([1; 16]);
-        pi.insert_version(&doc_id, 0, Some(b"at_zero")).await.unwrap();
+        pi.insert_version(&doc_id, 0, Some(b"at_zero"))
+            .await
+            .unwrap();
         assert_eq!(pi.get_at_ts(&doc_id, 0).await.unwrap().unwrap(), b"at_zero");
     }
 
@@ -567,7 +654,10 @@ mod tests {
         let (_engine, pi) = setup().await;
         let doc_id = DocId([1; 16]);
         pi.insert_version(&doc_id, 5, Some(b"data")).await.unwrap();
-        assert_eq!(pi.get_at_ts(&doc_id, u64::MAX).await.unwrap().unwrap(), b"data");
+        assert_eq!(
+            pi.get_at_ts(&doc_id, u64::MAX).await.unwrap().unwrap(),
+            b"data"
+        );
     }
 
     // ─── Multiple tombstones ───
@@ -606,24 +696,33 @@ mod tests {
         pi.insert_version(&doc_b, 5, Some(b"b")).await.unwrap();
 
         // ts=0: nothing
-        let r: Vec<_> = pi.scan_at_ts(0, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+        let r: Vec<_> = pi
+            .scan_at_ts(0, ScanDirection::Forward)
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(r.len(), 0);
 
         // ts=3: only A
-        let r: Vec<_> = pi.scan_at_ts(3, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+        let r: Vec<_> = pi
+            .scan_at_ts(3, ScanDirection::Forward)
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(r.len(), 1);
 
         // ts=10: both
-        let r: Vec<_> = pi.scan_at_ts(10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+        let r: Vec<_> = pi
+            .scan_at_ts(10, ScanDirection::Forward)
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(r.len(), 2);
     }
 
@@ -631,7 +730,11 @@ mod tests {
 
     #[tokio::test]
     async fn external_storage_in_scan() {
-        let engine = Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap());
+        let engine = Arc::new(
+            StorageEngine::open_in_memory(StorageConfig::default())
+                .await
+                .unwrap(),
+        );
         let btree = engine.create_btree().await.unwrap();
         let pi = PrimaryIndex::new(btree, engine.clone(), 10); // low threshold
 
@@ -642,10 +745,13 @@ mod tests {
             pi.insert_version(&DocId(id), 1, Some(&big)).await.unwrap();
         }
 
-        let results: Vec<_> = pi.scan_at_ts(10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+        let results: Vec<_> = pi
+            .scan_at_ts(10, ScanDirection::Forward)
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(results.len(), 3);
         for r in &results {
             assert_eq!(r.2, big);
@@ -698,6 +804,20 @@ mod tests {
         assert_eq!(pi.get_version_ts(&id, 100).await.unwrap(), Some(10));
     }
 
+    #[tokio::test]
+    async fn get_exact_version_returns_requested_body_only() {
+        let (_engine, pi) = setup().await;
+        let id = DocId([1; 16]);
+        pi.insert_version(&id, 1, Some(b"v1")).await.unwrap();
+        pi.insert_version(&id, 5, Some(b"v5")).await.unwrap();
+        pi.insert_version(&id, 9, None).await.unwrap();
+
+        assert_eq!(pi.get_version(&id, 1).await.unwrap().unwrap(), b"v1");
+        assert_eq!(pi.get_version(&id, 5).await.unwrap().unwrap(), b"v5");
+        assert!(pi.get_version(&id, 9).await.unwrap().is_none());
+        assert!(pi.get_version(&id, 7).await.unwrap().is_none());
+    }
+
     // ─── Empty body (zero-length document) ───
 
     #[tokio::test]
@@ -714,21 +834,26 @@ mod tests {
     #[tokio::test]
     async fn scan_doc_ordering() {
         let (_engine, pi) = setup().await;
-        let ids: Vec<DocId> = (0..20u8).map(|i| {
-            let mut id = [0u8; 16];
-            id[15] = i;
-            DocId(id)
-        }).collect();
+        let ids: Vec<DocId> = (0..20u8)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[15] = i;
+                DocId(id)
+            })
+            .collect();
 
         // Insert in reverse order
         for id in ids.iter().rev() {
             pi.insert_version(id, 1, Some(&[id.0[15]])).await.unwrap();
         }
 
-        let results: Vec<_> = pi.scan_at_ts(10, ScanDirection::Forward)
-            .collect::<Vec<_>>().await
+        let results: Vec<_> = pi
+            .scan_at_ts(10, ScanDirection::Forward)
+            .collect::<Vec<_>>()
+            .await
             .into_iter()
-            .collect::<Result<Vec<_>, _>>().unwrap();
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(results.len(), 20);
         // Should come out in sorted order regardless of insert order
         for (i, (doc_id, _, _)) in results.iter().enumerate() {

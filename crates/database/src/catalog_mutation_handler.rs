@@ -45,6 +45,14 @@ impl CatalogMutationHandlerImpl {
             catalog_name_btree,
         }
     }
+
+    fn snapshot_catalog(&self) -> CatalogCache {
+        self.catalog.read().clone()
+    }
+
+    fn replace_catalog(&self, cache: CatalogCache) {
+        *self.catalog.write() = cache;
+    }
 }
 
 #[async_trait(?Send)]
@@ -72,18 +80,16 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
         created_at_root_page: u32,
     ) -> std::io::Result<()> {
         // Persist to catalog B-trees + update cache
-        {
-            let mut cache = self.catalog.write();
-            CatalogPersistence::apply_create_collection(
-                &self.catalog_id_btree,
-                &self.catalog_name_btree,
-                &mut cache,
-                provisional_id,
-                name,
-                primary_root_page,
-            )
-            .await?;
-        }
+        let mut cache = self.snapshot_catalog();
+        CatalogPersistence::apply_create_collection(
+            &self.catalog_id_btree,
+            &self.catalog_name_btree,
+            &mut cache,
+            provisional_id,
+            name,
+            primary_root_page,
+        )
+        .await?;
 
         // Create PrimaryIndex handle
         let btree_handle = self.storage.open_btree(primary_root_page);
@@ -93,19 +99,16 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
             Arc::clone(&self.storage),
             external_threshold,
         ));
-        self.primary_indexes
-            .write()
-            .insert(provisional_id, primary);
+        self.primary_indexes.write().insert(provisional_id, primary);
 
         // Create _created_at secondary index handle + metadata
         let created_at_btree = self.storage.open_btree(created_at_root_page);
         let primary_ref = self.primary_indexes.read().get(&provisional_id).cloned();
         if let Some(primary_ref) = primary_ref {
             let secondary = Arc::new(SecondaryIndex::new(created_at_btree, primary_ref));
-            let idx_id = self.catalog.read().allocate_index_id();
+            let idx_id = cache.allocate_index_id();
             self.secondary_indexes.write().insert(idx_id, secondary);
 
-            let mut cache = self.catalog.write();
             let meta = IndexMeta {
                 index_id: idx_id,
                 collection_id: provisional_id,
@@ -122,15 +125,13 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
             )
             .await?;
         }
+        self.replace_catalog(cache);
 
         Ok(())
     }
 
     /// Apply a DropCollection mutation.
-    async fn apply_drop_collection(
-        &self,
-        collection_id: CollectionId,
-    ) -> std::io::Result<()> {
+    async fn apply_drop_collection(&self, collection_id: CollectionId) -> std::io::Result<()> {
         // Get index IDs to remove handles
         let index_ids: Vec<IndexId> = {
             let cache = self.catalog.read();
@@ -140,6 +141,17 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
                 .map(|m| m.index_id)
                 .collect()
         };
+
+        // Persist to catalog B-trees + update cache
+        let mut cache = self.snapshot_catalog();
+        CatalogPersistence::apply_drop_collection(
+            &self.catalog_id_btree,
+            &self.catalog_name_btree,
+            &mut cache,
+            collection_id,
+        )
+        .await?;
+        self.replace_catalog(cache);
 
         // Remove index handles
         {
@@ -151,16 +163,6 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
 
         // Remove primary handle
         self.primary_indexes.write().remove(&collection_id);
-
-        // Persist to catalog B-trees + update cache
-        let mut cache = self.catalog.write();
-        CatalogPersistence::apply_drop_collection(
-            &self.catalog_id_btree,
-            &self.catalog_name_btree,
-            &mut cache,
-            collection_id,
-        )
-        .await?;
 
         Ok(())
     }
@@ -174,20 +176,6 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
         field_paths: &[FieldPath],
         root_page: u32,
     ) -> std::io::Result<()> {
-        // Create SecondaryIndex handle
-        let btree_handle = self.storage.open_btree(root_page);
-        let primary = self
-            .primary_indexes
-            .read()
-            .get(&collection_id)
-            .cloned();
-        if let Some(primary) = primary {
-            let secondary = Arc::new(SecondaryIndex::new(btree_handle, primary));
-            self.secondary_indexes
-                .write()
-                .insert(provisional_id, secondary);
-        }
-
         // Persist to catalog B-trees + update cache
         let meta = IndexMeta {
             index_id: provisional_id,
@@ -197,7 +185,7 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
             root_page,
             state: IndexState::Building,
         };
-        let mut cache = self.catalog.write();
+        let mut cache = self.snapshot_catalog();
         CatalogPersistence::apply_create_index(
             &self.catalog_id_btree,
             &self.catalog_name_btree,
@@ -205,17 +193,25 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
             &meta,
         )
         .await?;
+        self.replace_catalog(cache);
+
+        // Create SecondaryIndex handle
+        let btree_handle = self.storage.open_btree(root_page);
+        let primary = self.primary_indexes.read().get(&collection_id).cloned();
+        if let Some(primary) = primary {
+            let secondary = Arc::new(SecondaryIndex::new(btree_handle, primary));
+            self.secondary_indexes
+                .write()
+                .insert(provisional_id, secondary);
+        }
 
         Ok(())
     }
 
     /// Apply a DropIndex mutation.
     async fn apply_drop_index(&self, index_id: IndexId) -> std::io::Result<()> {
-        // Remove handle
-        self.secondary_indexes.write().remove(&index_id);
-
         // Persist to catalog B-trees + update cache
-        let mut cache = self.catalog.write();
+        let mut cache = self.snapshot_catalog();
         CatalogPersistence::apply_drop_index(
             &self.catalog_id_btree,
             &self.catalog_name_btree,
@@ -223,6 +219,10 @@ impl CatalogMutationHandler for CatalogMutationHandlerImpl {
             index_id,
         )
         .await?;
+        self.replace_catalog(cache);
+
+        // Remove handle
+        self.secondary_indexes.write().remove(&index_id);
 
         Ok(())
     }

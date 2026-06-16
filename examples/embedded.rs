@@ -1,10 +1,11 @@
-//! Example: Embed exdb in a Rust application.
+//! Package example lives at `crates/database/examples/embedded.rs`.
+//!
+//! Run it with:
 //!
 //! ```bash
-//! cargo run --example embedded
+//! cargo run -p exdb --example embedded
 //! ```
 
 fn main() {
-    println!("embedded example: not yet implemented");
-    // TODO: open database, create collection, insert/query documents
+    println!("run: cargo run -p exdb --example embedded");
 }

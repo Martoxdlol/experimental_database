@@ -6,7 +6,7 @@
 
 use crate::buffer_pool::BufferPool;
 use crate::dwb::DoubleWriteBuffer;
-use crate::wal::{Lsn, WalWriter, WAL_RECORD_CHECKPOINT};
+use crate::wal::{Lsn, WAL_RECORD_CHECKPOINT, WalWriter};
 use std::io;
 use std::sync::Arc;
 
@@ -68,19 +68,21 @@ impl Checkpoint {
         let dirty = self.buffer_pool.dirty_pages();
 
         // Step 3: If durable and non-empty, write through DWB.
-        if self.is_durable && !dirty.is_empty()
-            && let Some(ref dwb) = self.dwb {
-                // Strip the LSN from dirty_pages results; DWB takes &[(PageId, Vec<u8>)].
-                let pages_for_dwb: Vec<_> = dirty
-                    .iter()
-                    .map(|(page_id, data, _lsn)| (*page_id, data.clone()))
-                    .collect();
-                dwb.write_pages(&pages_for_dwb).await?;
-            }
+        if self.is_durable
+            && !dirty.is_empty()
+            && let Some(ref dwb) = self.dwb
+        {
+            // Strip the LSN from dirty_pages results; DWB takes &[(PageId, Vec<u8>)].
+            let pages_for_dwb: Vec<_> = dirty
+                .iter()
+                .map(|(page_id, data, _lsn, _generation)| (*page_id, data.clone()))
+                .collect();
+            dwb.write_pages(&pages_for_dwb).await?;
+        }
 
         // Step 4: Mark flushed pages as clean.
-        for (page_id, _data, lsn) in &dirty {
-            self.buffer_pool.mark_clean(*page_id, *lsn);
+        for (page_id, _data, lsn, generation) in &dirty {
+            self.buffer_pool.mark_clean(*page_id, *lsn, *generation);
         }
 
         // Step 5: Write checkpoint WAL record.
@@ -104,7 +106,9 @@ mod tests {
     use crate::backend::{MemoryPageStorage, MemoryWalStorage, PageStorage, WalStorage};
     use crate::buffer_pool::{BufferPool, BufferPoolConfig};
     use crate::page::{PageType, SlottedPage};
-    use crate::wal::{WalConfig, WalReader, WalRecord, WalStream, WAL_RECORD_CHECKPOINT, WAL_RECORD_TX_COMMIT};
+    use crate::wal::{
+        WAL_RECORD_CHECKPOINT, WAL_RECORD_TX_COMMIT, WalConfig, WalReader, WalRecord, WalStream,
+    };
     use tokio_stream::StreamExt;
 
     /// Helper: collect all records from a WalStream into a Vec.
@@ -145,8 +149,11 @@ mod tests {
     fn make_wal() -> (Arc<WalWriter>, Arc<MemoryWalStorage>) {
         let wal_storage = Arc::new(MemoryWalStorage::new());
         let writer = Arc::new(
-            WalWriter::new(wal_storage.clone() as Arc<dyn WalStorage>, WalConfig::default())
-                .unwrap(),
+            WalWriter::new(
+                wal_storage.clone() as Arc<dyn WalStorage>,
+                WalConfig::default(),
+            )
+            .unwrap(),
         );
         (writer, wal_storage)
     }
@@ -181,7 +188,11 @@ mod tests {
         let _lsn = checkpoint.run().await.unwrap();
 
         // Dirty flags should be cleared.
-        assert_eq!(pool.dirty_pages().len(), 0, "dirty pages should be cleared after checkpoint");
+        assert_eq!(
+            pool.dirty_pages().len(),
+            0,
+            "dirty pages should be cleared after checkpoint"
+        );
     }
 
     // ─── Test 2: Checkpoint WAL record ───
@@ -207,7 +218,11 @@ mod tests {
         let records: Vec<WalRecord> = collect_records(reader.read_from(0)).await.unwrap();
 
         // Should have at least 2 records: the TX_COMMIT and the CHECKPOINT.
-        assert!(records.len() >= 2, "expected at least 2 records, got {}", records.len());
+        assert!(
+            records.len() >= 2,
+            "expected at least 2 records, got {}",
+            records.len()
+        );
 
         // Find the checkpoint record.
         let checkpoint_record = records
@@ -216,9 +231,7 @@ mod tests {
             .expect("should find a checkpoint record");
 
         // Verify the payload is the checkpoint LSN.
-        let stored_lsn = u64::from_le_bytes(
-            checkpoint_record.payload[0..8].try_into().unwrap(),
-        );
+        let stored_lsn = u64::from_le_bytes(checkpoint_record.payload[0..8].try_into().unwrap());
         assert_eq!(stored_lsn, checkpoint_lsn);
     }
 
@@ -286,14 +299,14 @@ mod tests {
         // We can't easily interleave with the checkpoint, so we test mark_clean directly.
         let dirty = pool.dirty_pages();
         assert_eq!(dirty.len(), 1);
-        let (_, _, original_lsn) = &dirty[0];
+        let (_, _, original_lsn, original_generation) = &dirty[0];
         assert_eq!(*original_lsn, 10);
 
         // Second modification: LSN = 20 (page modified since snapshot).
         write_lsn_to_page(&pool, 0, 20).await;
 
         // Mark clean with the OLD LSN. Should NOT clear dirty.
-        pool.mark_clean(0, 10);
+        pool.mark_clean(0, 10, *original_generation);
 
         let dirty_after = pool.dirty_pages();
         assert_eq!(dirty_after.len(), 1, "page should remain dirty (stale LSN)");
@@ -360,7 +373,12 @@ mod tests {
             .unwrap();
 
         let lsn2 = checkpoint.run().await.unwrap();
-        assert!(lsn2 > lsn1, "checkpoint LSN should advance: {} > {}", lsn2, lsn1);
+        assert!(
+            lsn2 > lsn1,
+            "checkpoint LSN should advance: {} > {}",
+            lsn2,
+            lsn1
+        );
 
         // Write more.
         wal_writer
@@ -369,6 +387,11 @@ mod tests {
             .unwrap();
 
         let lsn3 = checkpoint.run().await.unwrap();
-        assert!(lsn3 > lsn2, "checkpoint LSN should advance: {} > {}", lsn3, lsn2);
+        assert!(
+            lsn3 > lsn2,
+            "checkpoint LSN should advance: {} > {}",
+            lsn3,
+            lsn2
+        );
     }
 }

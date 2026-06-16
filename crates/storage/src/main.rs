@@ -85,13 +85,17 @@ async fn main() -> std::io::Result<()> {
     };
     let id_key =
         catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, col.collection_id);
-    catalog.insert(&id_key, &catalog_btree::serialize_collection(&col)).await?;
+    catalog
+        .insert(&id_key, &catalog_btree::serialize_collection(&col))
+        .await?;
 
     let name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, &col.name);
-    name_idx.insert(
-        &name_key,
-        &catalog_btree::serialize_name_value(col.collection_id),
-    ).await?;
+    name_idx
+        .insert(
+            &name_key,
+            &catalog_btree::serialize_name_value(col.collection_id),
+        )
+        .await?;
     println!("Registered collection '{}'", col.name);
 
     // Register a GIN index (by ID + by name).
@@ -111,14 +115,18 @@ async fn main() -> std::io::Result<()> {
         config: vec![],
     };
     let idx_id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, gin_idx.index_id);
-    catalog.insert(&idx_id_key, &catalog_btree::serialize_index(&gin_idx)).await?;
+    catalog
+        .insert(&idx_id_key, &catalog_btree::serialize_index(&gin_idx))
+        .await?;
 
     let idx_name_key =
-        catalog_btree::make_catalog_name_key(CatalogEntityType::Index, &gin_idx.name);
-    name_idx.insert(
-        &idx_name_key,
-        &catalog_btree::serialize_name_value(gin_idx.index_id),
-    ).await?;
+        catalog_btree::make_catalog_index_name_key(gin_idx.collection_id, &gin_idx.name);
+    name_idx
+        .insert(
+            &idx_name_key,
+            &catalog_btree::serialize_name_value(gin_idx.index_id),
+        )
+        .await?;
     println!(
         "Registered GIN index '{}' (posting={}, pending={}, docterm={})",
         gin_idx.name,
@@ -188,7 +196,8 @@ async fn main() -> std::io::Result<()> {
     // Look up "users" collection by name
     let lookup_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, "users");
     let id_bytes = name_idx2
-        .get(&lookup_key).await?
+        .get(&lookup_key)
+        .await?
         .expect("collection 'users' not found in name index");
     let collection_id = catalog_btree::deserialize_name_value(&id_bytes)?;
     println!(
@@ -198,7 +207,10 @@ async fn main() -> std::io::Result<()> {
 
     // Fetch the full CollectionEntry by ID
     let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, collection_id);
-    let col_bytes = catalog2.get(&id_key).await?.expect("collection entry not found");
+    let col_bytes = catalog2
+        .get(&id_key)
+        .await?
+        .expect("collection entry not found");
     let col2 = catalog_btree::deserialize_collection(&col_bytes)?;
     println!(
         "Collection '{}': root_page={}, doc_count={}",
@@ -214,14 +226,17 @@ async fn main() -> std::io::Result<()> {
     );
 
     // Look up index by name too
-    let idx_lookup =
-        catalog_btree::make_catalog_name_key(CatalogEntityType::Index, "users_tags_gin");
+    let idx_lookup = catalog_btree::make_catalog_index_name_key(1, "users_tags_gin");
     let idx_id_bytes = name_idx2
-        .get(&idx_lookup).await?
+        .get(&idx_lookup)
+        .await?
         .expect("index not found by name");
     let idx_id = catalog_btree::deserialize_name_value(&idx_id_bytes)?;
     let idx_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Index, idx_id);
-    let idx_bytes = catalog2.get(&idx_key).await?.expect("index entry not found");
+    let idx_bytes = catalog2
+        .get(&idx_key)
+        .await?
+        .expect("index entry not found");
     let idx2 = catalog_btree::deserialize_index(&idx_bytes)?;
     println!(
         "Looked up index '{}' by name: root={}, aux={:?}",

@@ -20,9 +20,12 @@ pub fn CollectionsModule() -> Element {
 
     // Collection browser
     let engine = state.engine.read().clone();
-    let collections = engine.as_ref().map(|e| e.l6.list_collections()).unwrap_or_default();
+    let collections = engine
+        .as_ref()
+        .map(|e| e.l6.list_collections())
+        .unwrap_or_default();
 
-    let mut new_name = use_signal(|| String::new());
+    let mut new_name = use_signal(String::new);
 
     rsx! {
         div { class: "main-content",

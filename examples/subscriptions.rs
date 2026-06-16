@@ -1,10 +1,11 @@
-//! Example: Live query subscriptions.
+//! Package example lives at `crates/database/examples/subscriptions.rs`.
+//!
+//! Run it with:
 //!
 //! ```bash
-//! cargo run --example subscriptions
+//! cargo run -p exdb --example subscriptions
 //! ```
 
 fn main() {
-    println!("subscriptions example: not yet implemented");
-    // TODO: subscribe to a query, insert data, observe invalidation
+    println!("run: cargo run -p exdb --example subscriptions");
 }

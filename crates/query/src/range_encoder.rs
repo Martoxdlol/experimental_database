@@ -99,13 +99,14 @@ pub fn validate_range(
             eq_count += 1;
         } else if expr.is_lower_bound() {
             if let Some(rf) = range_field
-                && rf != field_pos {
-                    return Err(RangeError::FieldOutOfOrder {
-                        field: field.clone(),
-                        expected_position: rf,
-                    });
-                }
-            if field_pos < current_position {
+                && rf != field_pos
+            {
+                return Err(RangeError::FieldOutOfOrder {
+                    field: field.clone(),
+                    expected_position: rf,
+                });
+            }
+            if range_field.is_none() && field_pos != current_position {
                 return Err(RangeError::FieldOutOfOrder {
                     field: field.clone(),
                     expected_position: current_position,
@@ -122,13 +123,14 @@ pub fn validate_range(
         } else {
             // Upper bound
             if let Some(rf) = range_field
-                && rf != field_pos {
-                    return Err(RangeError::FieldOutOfOrder {
-                        field: field.clone(),
-                        expected_position: rf,
-                    });
-                }
-            if field_pos < current_position {
+                && rf != field_pos
+            {
+                return Err(RangeError::FieldOutOfOrder {
+                    field: field.clone(),
+                    expected_position: rf,
+                });
+            }
+            if range_field.is_none() && field_pos != current_position {
                 return Err(RangeError::FieldOutOfOrder {
                     field: field.clone(),
                     expected_position: current_position,
@@ -321,11 +323,8 @@ mod tests {
 
     #[test]
     fn validate_range_on_first_field() {
-        let shape = validate_range(
-            &fields(&["a"]),
-            &[RangeExpr::Gt(fp("a"), Scalar::Int64(5))],
-        )
-        .unwrap();
+        let shape =
+            validate_range(&fields(&["a"]), &[RangeExpr::Gt(fp("a"), Scalar::Int64(5))]).unwrap();
         assert_eq!(shape.eq_count, 0);
         assert_eq!(shape.range_field, Some(0));
     }
@@ -361,6 +360,56 @@ mod tests {
             &[RangeExpr::Eq(fp("b"), Scalar::Int64(1))],
         );
         assert!(matches!(result, Err(RangeError::FieldOutOfOrder { .. })));
+    }
+
+    #[test]
+    fn validate_error_lower_bound_after_skipped_prefix_field() {
+        // A range bound must be on the next field after the equality prefix.
+        let result = validate_range(
+            &fields(&["a", "b"]),
+            &[RangeExpr::Gte(fp("b"), Scalar::Int64(1))],
+        );
+        assert!(matches!(
+            result,
+            Err(RangeError::FieldOutOfOrder {
+                expected_position: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_error_upper_bound_after_skipped_prefix_field() {
+        // Same rule for upper bounds: [A, B] cannot start with lt(B).
+        let result = validate_range(
+            &fields(&["a", "b"]),
+            &[RangeExpr::Lt(fp("b"), Scalar::Int64(10))],
+        );
+        assert!(matches!(
+            result,
+            Err(RangeError::FieldOutOfOrder {
+                expected_position: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn validate_error_range_bound_skips_field_after_eq_prefix() {
+        let result = validate_range(
+            &fields(&["a", "b", "c"]),
+            &[
+                RangeExpr::Eq(fp("a"), Scalar::Int64(1)),
+                RangeExpr::Gte(fp("c"), Scalar::Int64(3)),
+            ],
+        );
+        assert!(matches!(
+            result,
+            Err(RangeError::FieldOutOfOrder {
+                expected_position: 1,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -425,11 +474,8 @@ mod tests {
 
     #[test]
     fn encode_eq_single_field() {
-        let (lower, upper) = encode_range(
-            &fields(&["a"]),
-            &[RangeExpr::Eq(fp("a"), Scalar::Int64(1))],
-        )
-        .unwrap();
+        let (lower, upper) =
+            encode_range(&fields(&["a"]), &[RangeExpr::Eq(fp("a"), Scalar::Int64(1))]).unwrap();
         let encoded = encode_scalar(&Scalar::Int64(1));
         assert_eq!(lower, Bound::Included(encoded.clone()));
         assert_eq!(upper, Bound::Excluded(successor_key(&encoded)));
@@ -465,11 +511,8 @@ mod tests {
 
     #[test]
     fn encode_gt() {
-        let (lower, upper) = encode_range(
-            &fields(&["a"]),
-            &[RangeExpr::Gt(fp("a"), Scalar::Int64(5))],
-        )
-        .unwrap();
+        let (lower, upper) =
+            encode_range(&fields(&["a"]), &[RangeExpr::Gt(fp("a"), Scalar::Int64(5))]).unwrap();
         let encoded = encode_scalar(&Scalar::Int64(5));
         assert_eq!(lower, Bound::Included(successor_key(&encoded)));
         assert!(matches!(upper, Bound::Unbounded));

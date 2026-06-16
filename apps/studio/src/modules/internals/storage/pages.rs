@@ -23,16 +23,11 @@ pub fn PagesModule() -> Element {
     let page_list = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db.clone();
-        async move {
-            db.scan_page_types().await.ok()
-        }
+        async move { db.scan_page_types().await.ok() }
     });
 
     // Load selected page detail
-    let _page_detail = use_memo(move || {
-
-        *selected_page.read()
-    });
+    let _page_detail = use_memo(move || *selected_page.read());
 
     rsx! {
         div { class: "master-detail",
@@ -142,17 +137,12 @@ fn PageDetail(page_id: u32, write_enabled: bool, selected_slot: Signal<Option<u1
     let page_info = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db.clone();
-        async move {
-            db.read_page(page_id).await.ok()
-        }
+        async move { db.read_page(page_id).await.ok() }
     });
 
     match page_info.read().as_ref() {
         Some(Some(info)) => {
-            let type_name = info
-                .page_type
-                .map(page_type_name)
-                .unwrap_or("Unknown");
+            let type_name = info.page_type.map(page_type_name).unwrap_or("Unknown");
             let checksum_class = if info.checksum_valid {
                 "status-badge ok"
             } else {

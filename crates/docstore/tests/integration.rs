@@ -1,13 +1,13 @@
 //! Integration tests for exdb-docstore — cross-module workflows.
 
-use exdb_core::encoding::encode_document;
+use exdb_core::encoding::{decode_document, encode_document};
 use exdb_core::field_path::FieldPath;
 use exdb_core::types::{CollectionId, DocId, IndexId, Scalar};
 use exdb_docstore::key_encoding::{
     encode_key_prefix, make_secondary_key, make_secondary_key_from_prefix, successor_key,
 };
-use exdb_docstore::{IndexBuilder, PrimaryIndex, SecondaryIndex, VacuumCoordinator};
 use exdb_docstore::vacuum::VacuumCandidate;
+use exdb_docstore::{IndexBuilder, PrimaryIndex, SecondaryIndex, VacuumCoordinator};
 use exdb_storage::btree::ScanDirection;
 use exdb_storage::engine::{StorageConfig, StorageEngine};
 use std::collections::HashMap;
@@ -16,7 +16,11 @@ use std::sync::Arc;
 use tokio_stream::StreamExt;
 
 async fn engine() -> Arc<StorageEngine> {
-    Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap())
+    Arc::new(
+        StorageEngine::open_in_memory(StorageConfig::default())
+            .await
+            .unwrap(),
+    )
 }
 
 fn doc_id(n: u8) -> DocId {
@@ -30,7 +34,10 @@ async fn make_primary(engine: &Arc<StorageEngine>) -> Arc<PrimaryIndex> {
     Arc::new(PrimaryIndex::new(btree, engine.clone(), 4096))
 }
 
-async fn make_secondary(engine: &Arc<StorageEngine>, primary: &Arc<PrimaryIndex>) -> Arc<SecondaryIndex> {
+async fn make_secondary(
+    engine: &Arc<StorageEngine>,
+    primary: &Arc<PrimaryIndex>,
+) -> Arc<SecondaryIndex> {
     let btree = engine.create_btree().await.unwrap();
     Arc::new(SecondaryIndex::new(btree, primary.clone()))
 }
@@ -59,26 +66,38 @@ async fn write_build_query_flow() {
     for i in 0..5u8 {
         let doc = serde_json::json!({"name": format!("user_{i}"), "age": (20 + i) as i64});
         let body = encode_document(&doc);
-        primary.insert_version(&doc_id(i), 1, Some(&body)).await.unwrap();
+        primary
+            .insert_version(&doc_id(i), 1, Some(&body))
+            .await
+            .unwrap();
     }
 
     // Build secondary index on "name"
-    let builder = IndexBuilder::new(primary.clone(), secondary.clone(), vec![FieldPath::single("name")]);
+    let builder = IndexBuilder::new(
+        primary.clone(),
+        secondary.clone(),
+        vec![FieldPath::single("name")],
+    );
     let count = builder.build(10, None).await.unwrap();
     assert_eq!(count, 5);
 
     // Query by exact name
     let prefix = encode_key_prefix(&[Scalar::String("user_2".into())]);
     let upper = successor_key(&prefix);
-    let results = collect_stream(secondary
-        .scan_at_ts(Bound::Included(&prefix), Bound::Excluded(&upper), 10, ScanDirection::Forward))
-        .await.unwrap();
+    let results = collect_stream(secondary.scan_at_ts(
+        Bound::Included(&prefix),
+        Bound::Excluded(&upper),
+        10,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, doc_id(2));
 
     // Verify body through primary
     let body = primary.get_at_ts(&doc_id(2), 10).await.unwrap().unwrap();
-    let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let doc = decode_document(&body).unwrap();
     assert_eq!(doc["name"], "user_2");
 }
 
@@ -90,20 +109,47 @@ async fn mvcc_time_travel() {
     let primary = make_primary(&eng).await;
     let id = doc_id(1);
 
-    primary.insert_version(&id, 1, Some(b"{\"v\":1}")).await.unwrap();
-    primary.insert_version(&id, 5, Some(b"{\"v\":5}")).await.unwrap();
-    primary.insert_version(&id, 10, Some(b"{\"v\":10}")).await.unwrap();
+    primary
+        .insert_version(&id, 1, Some(b"{\"v\":1}"))
+        .await
+        .unwrap();
+    primary
+        .insert_version(&id, 5, Some(b"{\"v\":5}"))
+        .await
+        .unwrap();
+    primary
+        .insert_version(&id, 10, Some(b"{\"v\":10}"))
+        .await
+        .unwrap();
 
     // Before any version
     assert!(primary.get_at_ts(&id, 0).await.unwrap().is_none());
 
     // At each version
-    assert_eq!(primary.get_at_ts(&id, 1).await.unwrap().unwrap(), b"{\"v\":1}");
-    assert_eq!(primary.get_at_ts(&id, 3).await.unwrap().unwrap(), b"{\"v\":1}");
-    assert_eq!(primary.get_at_ts(&id, 5).await.unwrap().unwrap(), b"{\"v\":5}");
-    assert_eq!(primary.get_at_ts(&id, 7).await.unwrap().unwrap(), b"{\"v\":5}");
-    assert_eq!(primary.get_at_ts(&id, 10).await.unwrap().unwrap(), b"{\"v\":10}");
-    assert_eq!(primary.get_at_ts(&id, u64::MAX).await.unwrap().unwrap(), b"{\"v\":10}");
+    assert_eq!(
+        primary.get_at_ts(&id, 1).await.unwrap().unwrap(),
+        b"{\"v\":1}"
+    );
+    assert_eq!(
+        primary.get_at_ts(&id, 3).await.unwrap().unwrap(),
+        b"{\"v\":1}"
+    );
+    assert_eq!(
+        primary.get_at_ts(&id, 5).await.unwrap().unwrap(),
+        b"{\"v\":5}"
+    );
+    assert_eq!(
+        primary.get_at_ts(&id, 7).await.unwrap().unwrap(),
+        b"{\"v\":5}"
+    );
+    assert_eq!(
+        primary.get_at_ts(&id, 10).await.unwrap().unwrap(),
+        b"{\"v\":10}"
+    );
+    assert_eq!(
+        primary.get_at_ts(&id, u64::MAX).await.unwrap().unwrap(),
+        b"{\"v\":10}"
+    );
 }
 
 // ─── Multi-document scan at various timestamps ───
@@ -114,36 +160,58 @@ async fn scan_at_various_timestamps() {
     let primary = make_primary(&eng).await;
 
     // doc 1: created at ts=1, updated at ts=5
-    primary.insert_version(&doc_id(1), 1, Some(b"d1v1")).await.unwrap();
-    primary.insert_version(&doc_id(1), 5, Some(b"d1v5")).await.unwrap();
+    primary
+        .insert_version(&doc_id(1), 1, Some(b"d1v1"))
+        .await
+        .unwrap();
+    primary
+        .insert_version(&doc_id(1), 5, Some(b"d1v5"))
+        .await
+        .unwrap();
 
     // doc 2: created at ts=3
-    primary.insert_version(&doc_id(2), 3, Some(b"d2v3")).await.unwrap();
+    primary
+        .insert_version(&doc_id(2), 3, Some(b"d2v3"))
+        .await
+        .unwrap();
 
     // doc 3: created at ts=2, deleted at ts=4
-    primary.insert_version(&doc_id(3), 2, Some(b"d3v2")).await.unwrap();
+    primary
+        .insert_version(&doc_id(3), 2, Some(b"d3v2"))
+        .await
+        .unwrap();
     primary.insert_version(&doc_id(3), 4, None).await.unwrap();
 
     // At ts=0: nothing visible
-    let r = collect_stream(primary.scan_at_ts(0, ScanDirection::Forward)).await.unwrap();
+    let r = collect_stream(primary.scan_at_ts(0, ScanDirection::Forward))
+        .await
+        .unwrap();
     assert_eq!(r.len(), 0);
 
     // At ts=1: only doc 1
-    let r = collect_stream(primary.scan_at_ts(1, ScanDirection::Forward)).await.unwrap();
+    let r = collect_stream(primary.scan_at_ts(1, ScanDirection::Forward))
+        .await
+        .unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].0, doc_id(1));
     assert_eq!(r[0].2, b"d1v1");
 
     // At ts=3: doc 1 (v1), doc 2, doc 3
-    let r = collect_stream(primary.scan_at_ts(3, ScanDirection::Forward)).await.unwrap();
+    let r = collect_stream(primary.scan_at_ts(3, ScanDirection::Forward))
+        .await
+        .unwrap();
     assert_eq!(r.len(), 3);
 
     // At ts=4: doc 1 (v1), doc 2, doc 3 deleted
-    let r = collect_stream(primary.scan_at_ts(4, ScanDirection::Forward)).await.unwrap();
+    let r = collect_stream(primary.scan_at_ts(4, ScanDirection::Forward))
+        .await
+        .unwrap();
     assert_eq!(r.len(), 2);
 
     // At ts=10: doc 1 (v5), doc 2
-    let r = collect_stream(primary.scan_at_ts(10, ScanDirection::Forward)).await.unwrap();
+    let r = collect_stream(primary.scan_at_ts(10, ScanDirection::Forward))
+        .await
+        .unwrap();
     assert_eq!(r.len(), 2);
     assert_eq!(r[0].2, b"d1v5");
 }
@@ -158,11 +226,18 @@ async fn backward_scan_ordering() {
     for i in 0..5u8 {
         let mut id = [0u8; 16];
         id[15] = i;
-        primary.insert_version(&DocId(id), 1, Some(&[i])).await.unwrap();
+        primary
+            .insert_version(&DocId(id), 1, Some(&[i]))
+            .await
+            .unwrap();
     }
 
-    let forward = collect_stream(primary.scan_at_ts(10, ScanDirection::Forward)).await.unwrap();
-    let backward = collect_stream(primary.scan_at_ts(10, ScanDirection::Backward)).await.unwrap();
+    let forward = collect_stream(primary.scan_at_ts(10, ScanDirection::Forward))
+        .await
+        .unwrap();
+    let backward = collect_stream(primary.scan_at_ts(10, ScanDirection::Backward))
+        .await
+        .unwrap();
 
     assert_eq!(forward.len(), 5);
     assert_eq!(backward.len(), 5);
@@ -183,14 +258,25 @@ async fn backward_scan_mvcc() {
     let primary = make_primary(&eng).await;
 
     // doc 1: two versions
-    primary.insert_version(&doc_id(1), 1, Some(b"v1")).await.unwrap();
-    primary.insert_version(&doc_id(1), 5, Some(b"v5")).await.unwrap();
+    primary
+        .insert_version(&doc_id(1), 1, Some(b"v1"))
+        .await
+        .unwrap();
+    primary
+        .insert_version(&doc_id(1), 5, Some(b"v5"))
+        .await
+        .unwrap();
 
     // doc 2: one version
-    primary.insert_version(&doc_id(2), 3, Some(b"d2")).await.unwrap();
+    primary
+        .insert_version(&doc_id(2), 3, Some(b"d2"))
+        .await
+        .unwrap();
 
     // At ts=4: should see doc1@v1, doc2@v3
-    let results = collect_stream(primary.scan_at_ts(4, ScanDirection::Backward)).await.unwrap();
+    let results = collect_stream(primary.scan_at_ts(4, ScanDirection::Backward))
+        .await
+        .unwrap();
     assert_eq!(results.len(), 2);
     // Backward: doc2 first, then doc1
     assert_eq!(results[0].0, doc_id(2));
@@ -243,7 +329,10 @@ async fn insert_update_vacuum_cycle() {
     });
 
     let eligible = vc.drain_eligible(10);
-    let removed = vc.execute(&eligible, &primaries, &secondaries).await.unwrap();
+    let removed = vc
+        .execute(&eligible, &primaries, &secondaries)
+        .await
+        .unwrap();
     assert!(removed >= 2); // primary + secondary entry
 
     // After vacuum: v1 gone, v2 still accessible
@@ -253,17 +342,27 @@ async fn insert_update_vacuum_cycle() {
     // Secondary scan for "Alice" returns nothing
     let alice_prefix = encode_key_prefix(&[Scalar::String("Alice".into())]);
     let alice_upper = successor_key(&alice_prefix);
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Included(&alice_prefix), Bound::Excluded(&alice_upper), 10, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Included(&alice_prefix),
+        Bound::Excluded(&alice_upper),
+        10,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert!(r.is_empty());
 
     // Secondary scan for "Bob" works
     let bob_prefix = encode_key_prefix(&[Scalar::String("Bob".into())]);
     let bob_upper = successor_key(&bob_prefix);
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Included(&bob_prefix), Bound::Excluded(&bob_upper), 10, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Included(&bob_prefix),
+        Bound::Excluded(&bob_upper),
+        10,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].0, d);
 }
@@ -278,16 +377,26 @@ async fn index_build_then_update_stale_detection() {
 
     let d = doc_id(1);
     let doc_v1 = serde_json::json!({"status": "active"});
-    primary.insert_version(&d, 1, Some(&encode_document(&doc_v1))).await.unwrap();
+    primary
+        .insert_version(&d, 1, Some(&encode_document(&doc_v1)))
+        .await
+        .unwrap();
 
     // Build index at ts=5
-    let builder = IndexBuilder::new(primary.clone(), secondary.clone(), vec![FieldPath::single("status")]);
+    let builder = IndexBuilder::new(
+        primary.clone(),
+        secondary.clone(),
+        vec![FieldPath::single("status")],
+    );
     let count = builder.build(5, None).await.unwrap();
     assert_eq!(count, 1);
 
     // Update document at ts=10 (secondary index now has stale entry for ts=1)
     let doc_v2 = serde_json::json!({"status": "inactive"});
-    primary.insert_version(&d, 10, Some(&encode_document(&doc_v2))).await.unwrap();
+    primary
+        .insert_version(&d, 10, Some(&encode_document(&doc_v2)))
+        .await
+        .unwrap();
     // Insert new secondary entry at ts=10
     let new_key = make_secondary_key(&[Scalar::String("inactive".into())], &d, 10);
     secondary.insert_entry(&new_key).await.unwrap();
@@ -295,17 +404,27 @@ async fn index_build_then_update_stale_detection() {
     // Query for "active" at ts=15: stale entry should be filtered by primary verification
     let prefix = encode_key_prefix(&[Scalar::String("active".into())]);
     let upper = successor_key(&prefix);
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Included(&prefix), Bound::Excluded(&upper), 15, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Included(&prefix),
+        Bound::Excluded(&upper),
+        15,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert!(r.is_empty(), "stale entry should be filtered out");
 
     // Query for "inactive" at ts=15: should find it
     let prefix = encode_key_prefix(&[Scalar::String("inactive".into())]);
     let upper = successor_key(&prefix);
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Included(&prefix), Bound::Excluded(&upper), 15, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Included(&prefix),
+        Bound::Excluded(&upper),
+        15,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert_eq!(r.len(), 1);
 }
 
@@ -318,7 +437,10 @@ async fn secondary_scan_after_delete() {
     let secondary = make_secondary(&eng, &primary).await;
 
     let d = doc_id(1);
-    primary.insert_version(&d, 1, Some(b"{\"x\":1}")).await.unwrap();
+    primary
+        .insert_version(&d, 1, Some(b"{\"x\":1}"))
+        .await
+        .unwrap();
     let key = make_secondary_key(&[Scalar::Int64(1)], &d, 1);
     secondary.insert_entry(&key).await.unwrap();
 
@@ -326,15 +448,25 @@ async fn secondary_scan_after_delete() {
     primary.insert_version(&d, 5, None).await.unwrap();
 
     // At ts=3: document still visible
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 3, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Unbounded,
+        Bound::Unbounded,
+        3,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert_eq!(r.len(), 1);
 
     // At ts=10: document deleted
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Unbounded,
+        Bound::Unbounded,
+        10,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert!(r.is_empty());
 }
 
@@ -361,9 +493,14 @@ async fn compound_index_with_array_build_and_query() {
     // Query for category="tech", tags="rust"
     let prefix = encode_key_prefix(&[Scalar::String("tech".into()), Scalar::String("rust".into())]);
     let upper = successor_key(&prefix);
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Included(&prefix), Bound::Excluded(&upper), 10, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Included(&prefix),
+        Bound::Excluded(&upper),
+        10,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].0, d);
 }
@@ -380,17 +517,29 @@ async fn many_documents_index_build() {
         let mut id = [0u8; 16];
         id[12..16].copy_from_slice(&i.to_be_bytes());
         let doc = serde_json::json!({"val": i as i64});
-        primary.insert_version(&DocId(id), 1, Some(&encode_document(&doc))).await.unwrap();
+        primary
+            .insert_version(&DocId(id), 1, Some(&encode_document(&doc)))
+            .await
+            .unwrap();
     }
 
-    let builder = IndexBuilder::new(primary.clone(), secondary.clone(), vec![FieldPath::single("val")]);
+    let builder = IndexBuilder::new(
+        primary.clone(),
+        secondary.clone(),
+        vec![FieldPath::single("val")],
+    );
     let count = builder.build(10, None).await.unwrap();
     assert_eq!(count, 200);
 
     // Full scan should return all 200
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Unbounded,
+        Bound::Unbounded,
+        10,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert_eq!(r.len(), 200);
 }
 
@@ -405,12 +554,18 @@ async fn rollback_restores_previous_state() {
     let secondary = Arc::new(SecondaryIndex::new(sec_btree, primary.clone()));
 
     let d = doc_id(1);
-    primary.insert_version(&d, 1, Some(b"original")).await.unwrap();
+    primary
+        .insert_version(&d, 1, Some(b"original"))
+        .await
+        .unwrap();
     let sec_key_v1 = make_secondary_key(&[Scalar::String("orig".into())], &d, 1);
     secondary.insert_entry(&sec_key_v1).await.unwrap();
 
     // "Commit" at ts=5 (simulating a failed replication)
-    primary.insert_version(&d, 5, Some(b"updated")).await.unwrap();
+    primary
+        .insert_version(&d, 5, Some(b"updated"))
+        .await
+        .unwrap();
     let sec_key_v2 = make_secondary_key(&[Scalar::String("upd".into())], &d, 5);
     secondary.insert_entry(&sec_key_v2).await.unwrap();
 
@@ -426,17 +581,27 @@ async fn rollback_restores_previous_state() {
         &[(IndexId(1), Some(sec_key_v2))],
         &primaries,
         &secondaries,
-    ).await.unwrap();
+    )
+    .await
+    .unwrap();
 
     // Original version visible again at ts=10
-    assert_eq!(primary.get_at_ts(&d, 10).await.unwrap().unwrap(), b"original");
+    assert_eq!(
+        primary.get_at_ts(&d, 10).await.unwrap().unwrap(),
+        b"original"
+    );
 
     // Secondary scan for "orig" works
     let prefix = encode_key_prefix(&[Scalar::String("orig".into())]);
     let upper = successor_key(&prefix);
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Included(&prefix), Bound::Excluded(&upper), 10, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Included(&prefix),
+        Bound::Excluded(&upper),
+        10,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert_eq!(r.len(), 1);
 }
 
@@ -453,11 +618,16 @@ async fn external_storage_scan() {
     for i in 0..5u8 {
         let mut id = [0u8; 16];
         id[15] = i;
-        primary.insert_version(&DocId(id), 1, Some(&big_body)).await.unwrap();
+        primary
+            .insert_version(&DocId(id), 1, Some(&big_body))
+            .await
+            .unwrap();
     }
 
     // Scan should load all bodies from heap
-    let results = collect_stream(primary.scan_at_ts(10, ScanDirection::Forward)).await.unwrap();
+    let results = collect_stream(primary.scan_at_ts(10, ScanDirection::Forward))
+        .await
+        .unwrap();
     assert_eq!(results.len(), 5);
     for (_, _, body) in &results {
         assert_eq!(body.len(), 500);
@@ -477,10 +647,15 @@ async fn external_storage_backward_scan() {
         let mut id = [0u8; 16];
         id[15] = i;
         let body = vec![i; 100];
-        primary.insert_version(&DocId(id), 1, Some(&body)).await.unwrap();
+        primary
+            .insert_version(&DocId(id), 1, Some(&body))
+            .await
+            .unwrap();
     }
 
-    let results = collect_stream(primary.scan_at_ts(10, ScanDirection::Backward)).await.unwrap();
+    let results = collect_stream(primary.scan_at_ts(10, ScanDirection::Backward))
+        .await
+        .unwrap();
     assert_eq!(results.len(), 3);
     // Backward: doc_id(2) first, then 1, then 0
     assert_eq!(results[0].0, doc_id(2));
@@ -500,7 +675,9 @@ async fn empty_body_document() {
     assert!(body.is_empty());
 
     // Also works in scan
-    let results = collect_stream(primary.scan_at_ts(5, ScanDirection::Forward)).await.unwrap();
+    let results = collect_stream(primary.scan_at_ts(5, ScanDirection::Forward))
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert!(results[0].2.is_empty());
 }
@@ -523,9 +700,14 @@ async fn secondary_same_value_multiple_docs() {
 
     let prefix = encode_key_prefix(&[Scalar::String("shared".into())]);
     let upper = successor_key(&prefix);
-    let results = collect_stream(secondary
-        .scan_at_ts(Bound::Included(&prefix), Bound::Excluded(&upper), 10, ScanDirection::Forward))
-        .await.unwrap();
+    let results = collect_stream(secondary.scan_at_ts(
+        Bound::Included(&prefix),
+        Bound::Excluded(&upper),
+        10,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert_eq!(results.len(), 5);
 }
 
@@ -544,12 +726,22 @@ async fn secondary_backward_scan() {
         secondary.insert_entry(&key).await.unwrap();
     }
 
-    let forward = collect_stream(secondary
-        .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Forward))
-        .await.unwrap();
-    let backward = collect_stream(secondary
-        .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 10, ScanDirection::Backward))
-        .await.unwrap();
+    let forward = collect_stream(secondary.scan_at_ts(
+        Bound::Unbounded,
+        Bound::Unbounded,
+        10,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
+    let backward = collect_stream(secondary.scan_at_ts(
+        Bound::Unbounded,
+        Bound::Unbounded,
+        10,
+        ScanDirection::Backward,
+    ))
+    .await
+    .unwrap();
 
     assert_eq!(forward.len(), 3);
     assert_eq!(backward.len(), 3);
@@ -592,10 +784,22 @@ async fn vacuum_multiple_collections() {
     let d1 = doc_id(1);
     let d2 = doc_id(2);
 
-    primary1.insert_version(&d1, 1, Some(b"old1")).await.unwrap();
-    primary1.insert_version(&d1, 5, Some(b"new1")).await.unwrap();
-    primary2.insert_version(&d2, 2, Some(b"old2")).await.unwrap();
-    primary2.insert_version(&d2, 6, Some(b"new2")).await.unwrap();
+    primary1
+        .insert_version(&d1, 1, Some(b"old1"))
+        .await
+        .unwrap();
+    primary1
+        .insert_version(&d1, 5, Some(b"new1"))
+        .await
+        .unwrap();
+    primary2
+        .insert_version(&d2, 2, Some(b"old2"))
+        .await
+        .unwrap();
+    primary2
+        .insert_version(&d2, 6, Some(b"new2"))
+        .await
+        .unwrap();
 
     let mut primaries = HashMap::new();
     primaries.insert(CollectionId(1), primary1.clone());
@@ -620,7 +824,10 @@ async fn vacuum_multiple_collections() {
         },
     ];
 
-    let removed = vc.execute(&candidates, &primaries, &secondaries).await.unwrap();
+    let removed = vc
+        .execute(&candidates, &primaries, &secondaries)
+        .await
+        .unwrap();
     assert_eq!(removed, 2);
 
     // Old versions gone, new versions still there
@@ -653,21 +860,36 @@ async fn delete_reinsert_secondary() {
     secondary.insert_entry(&k10).await.unwrap();
 
     // At ts=3: alive
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 3, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Unbounded,
+        Bound::Unbounded,
+        3,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert_eq!(r.len(), 1);
 
     // At ts=7: deleted
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 7, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Unbounded,
+        Bound::Unbounded,
+        7,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert!(r.is_empty());
 
     // At ts=15: alive again
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Unbounded, Bound::Unbounded, 15, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Unbounded,
+        Bound::Unbounded,
+        15,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].1, 10);
 }
@@ -682,20 +904,50 @@ async fn index_build_resolves_mvcc() {
 
     let d = doc_id(1);
     // Three versions of the same doc with different names
-    primary.insert_version(&d, 1, Some(&encode_document(&serde_json::json!({"name": "v1"})))).await.unwrap();
-    primary.insert_version(&d, 5, Some(&encode_document(&serde_json::json!({"name": "v5"})))).await.unwrap();
-    primary.insert_version(&d, 10, Some(&encode_document(&serde_json::json!({"name": "v10"})))).await.unwrap();
+    primary
+        .insert_version(
+            &d,
+            1,
+            Some(&encode_document(&serde_json::json!({"name": "v1"}))),
+        )
+        .await
+        .unwrap();
+    primary
+        .insert_version(
+            &d,
+            5,
+            Some(&encode_document(&serde_json::json!({"name": "v5"}))),
+        )
+        .await
+        .unwrap();
+    primary
+        .insert_version(
+            &d,
+            10,
+            Some(&encode_document(&serde_json::json!({"name": "v10"}))),
+        )
+        .await
+        .unwrap();
 
     // Build at ts=7: should only index v5
-    let builder = IndexBuilder::new(primary.clone(), secondary.clone(), vec![FieldPath::single("name")]);
+    let builder = IndexBuilder::new(
+        primary.clone(),
+        secondary.clone(),
+        vec![FieldPath::single("name")],
+    );
     let count = builder.build(7, None).await.unwrap();
     assert_eq!(count, 1);
 
     // Verify the entry is for "v5"
     let prefix = encode_key_prefix(&[Scalar::String("v5".into())]);
     let upper = successor_key(&prefix);
-    let r = collect_stream(secondary
-        .scan_at_ts(Bound::Included(&prefix), Bound::Excluded(&upper), 7, ScanDirection::Forward))
-        .await.unwrap();
+    let r = collect_stream(secondary.scan_at_ts(
+        Bound::Included(&prefix),
+        Bound::Excluded(&upper),
+        7,
+        ScanDirection::Forward,
+    ))
+    .await
+    .unwrap();
     assert_eq!(r.len(), 1);
 }

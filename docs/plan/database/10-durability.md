@@ -46,7 +46,7 @@ The B6 (`database.rs`) startup sequence says "Scan catalog B-tree → build Cata
 
 ### Dependencies
 
-- **S12 (`catalog_btree`)**: `CollectionEntry`, `IndexEntry`, `make_catalog_id_key`, `make_catalog_name_key`, `serialize_*`, `deserialize_*`
+- **S12 (`catalog_btree`)**: `CollectionEntry`, `IndexEntry`, `make_catalog_id_key`, `make_catalog_name_key`, `make_catalog_index_name_key`, `serialize_*`, `deserialize_*`
 - **S6 (`BTreeHandle`)**: `get`, `insert`, `delete`, `scan`
 - **B2 (`CatalogCache`)**: `add_collection`, `add_index`, `remove_collection`, `remove_index`, `set_index_state`
 - **L3 (`PrimaryIndex`, `SecondaryIndex`)**: Handle creation for recovered indexes
@@ -176,11 +176,11 @@ The WAL is the **single source of truth** after a crash. Everything that was com
 
 | Record Type | Constant | Handler Action |
 |-------------|----------|----------------|
-| `TxCommit` | `0x01` | Deserialize payload → apply catalog mutations → apply data mutations → apply index deltas |
+| `TxCommit` | `0x01` | Deserialize payload → apply catalog mutations → apply primary data mutations |
 | `IndexReady` | `0x07` | Transition index Building → Ready in catalog |
-| `Vacuum` | `0x08` | Remove old version entries (idempotent) |
+| `Vacuum` | `0x08` | Informational/reserved in current replay |
 | `VisibleTs` | `0x09` | Update visible_ts tracker |
-| `RollbackVacuum` | `0x0A` | Remove entries from rolled-back commits |
+| `RollbackVacuum` | `0x0A` | Informational/reserved; rollback cleanup is recomputed from replayed TxCommits |
 | `Checkpoint` | `0x02` | Skip (informational, handled by S10) |
 
 ### TxCommit Replay — The Critical Path
@@ -189,7 +189,6 @@ A `TxCommit` WAL record contains (serialized by L5 T7):
 1. `commit_ts: Ts`
 2. `catalog_mutations: Vec<CatalogMutation>` — DDL operations
 3. `data_mutations: Vec<(CollectionId, DocId, MutationOp, body)>` — document operations
-4. `index_deltas: Vec<(IndexId, IndexKeyWrite)>` — secondary index entries
 
 Replay order within a single TxCommit record is critical:
 
@@ -205,12 +204,19 @@ Step 2: Data mutations SECOND (collections must exist from step 1)
         - For each (collection_id, doc_id, op, body):
           Insert/Replace/Delete into the collection's PrimaryIndex
 
-Step 3: Index deltas THIRD (indexes must exist from step 1)
-        - For each (index_id, key_write):
-          Insert/Delete into the index's SecondaryIndex B-tree
+Step 3: Ready secondary indexes AFTER replay
+        - Rebuild every Ready SecondaryIndex from recovered PrimaryIndex versions
+          at visible_ts
+        - Drop any Building index because its B-tree may be partial
 ```
 
 **Why this order matters:** If a transaction creates a collection and inserts into it, the WAL record contains both the `CreateCollection` catalog mutation and the `Insert` data mutation. The data mutation references a `CollectionId` that only exists after the catalog mutation is applied. Reversing the order would cause a "collection not found" panic during replay.
+
+Current TxCommit payloads do not persist secondary index deltas. The live commit
+path still computes deltas for secondary-index writes, OCC, and subscription
+invalidation, but recovery and replica WAL apply rebuild Ready secondary indexes
+from the recovered primary versions. This favors a smaller, self-contained WAL
+format over direct secondary-index delta replay.
 
 ### API
 
@@ -274,9 +280,9 @@ impl WalRecordHandler for DatabaseRecoveryHandler {
         match record.record_type {
             WAL_RECORD_TX_COMMIT => self.replay_tx_commit(record),
             WAL_RECORD_INDEX_READY => self.replay_index_ready(record),
-            WAL_RECORD_VACUUM => self.replay_vacuum(record),
             WAL_RECORD_VISIBLE_TS => self.replay_visible_ts(record),
-            WAL_RECORD_ROLLBACK_VACUUM => self.replay_rollback_vacuum(record),
+            WAL_RECORD_VACUUM => Ok(()),          // informational/reserved
+            WAL_RECORD_ROLLBACK_VACUUM => Ok(()), // informational/reserved
             WAL_RECORD_CHECKPOINT => Ok(()), // skip
             unknown => {
                 tracing::warn!("unknown WAL record type 0x{:02x}, skipping", unknown);
@@ -293,7 +299,7 @@ impl WalRecordHandler for DatabaseRecoveryHandler {
 impl DatabaseRecoveryHandler {
     /// Replay a TxCommit record.
     ///
-    /// CRITICAL: catalog mutations first, then data, then index deltas.
+    /// CRITICAL: catalog mutations first, then data.
     fn replay_tx_commit(&mut self, record: &WalRecord) -> Result<()> {
         let payload = CommitPayload::deserialize(&record.payload)?;
 
@@ -308,11 +314,6 @@ impl DatabaseRecoveryHandler {
         // Step 2: Data mutations
         for (collection_id, doc_id, op, body) in &payload.data_mutations {
             self.apply_data_mutation(*collection_id, doc_id, op, body).await?;
-        }
-
-        // Step 3: Index deltas
-        for (index_id, key_write) in &payload.index_deltas {
-            self.apply_index_delta(*index_id, key_write).await?;
         }
 
         Ok(())
@@ -341,12 +342,9 @@ impl DatabaseRecoveryHandler {
         body: &Option<Vec<u8>>,
     ) -> Result<()>;
 
-    /// Apply an index delta (insert/delete key) to a secondary index.
-    async fn apply_index_delta(
-        &mut self,
-        index_id: IndexId,
-        key_write: &IndexKeyWrite,
-    ) -> Result<()>;
+    /// Rebuild every Ready secondary index from recovered primary versions
+    /// after WAL replay and rollback cleanup finish.
+    async fn rebuild_ready_secondary_indexes(&mut self) -> Result<()>;
 }
 ```
 
@@ -374,9 +372,12 @@ rollback_vacuum(recovered_ts, visible_ts, catalog, primary_indexes, secondary_in
 
         payload = deserialize(record)
 
-        // Reverse index deltas (remove secondary index entries)
-        for (index_id, key_write) in payload.index_deltas.reversed():
-            secondary_indexes[index_id].remove(key_write.key)
+        // Reverse secondary entries derived from the replayed body and
+        // currently Ready index definitions. Ready indexes will be rebuilt
+        // from the remaining primary versions after rollback.
+        for mutation in payload.data_mutations.reversed():
+            if mutation.body is Some:
+                remove_secondary_entries_for_body(mutation.body, record.commit_ts)
 
         // Reverse data mutations
         for (coll_id, doc_id, op, body) in payload.data_mutations.reversed():
@@ -391,24 +392,20 @@ rollback_vacuum(recovered_ts, visible_ts, catalog, primary_indexes, secondary_in
             match mutation:
                 CreateCollection(id) =>
                     catalog_persistence.apply_drop_collection(id)
-                    // Also drop the B-tree pages (or just leave them — they'll be
-                    // reclaimed by vacuum or are harmless orphans)
+                    reclaim transient B-tree root pages
                 DropCollection(id) =>
-                    // Cannot easily un-drop. Log a warning. The collection data
-                    // is still in the B-tree (MVCC tombstones). A more sophisticated
-                    // approach would re-create the catalog entry.
-                    // For now: panic on un-drop — this is a rare edge case that
-                    // requires manual intervention.
+                    reconstruct collection and dropped index metadata from WAL
                 CreateIndex(id) =>
                     catalog_persistence.apply_drop_index(id)
+                    reclaim transient index root page
                 DropIndex(id) =>
-                    // Same issue as DropCollection — cannot easily un-drop.
-                    // Log warning.
+                    reconstruct index metadata from WAL
 
-    // Write a RollbackVacuum WAL record (so this doesn't repeat on next restart)
-    wal.append(WAL_RECORD_ROLLBACK_VACUUM, &rollback_payload)
+    // Rebuild Ready secondary indexes from remaining primary versions.
+    rebuild_ready_indexes(visible_ts)
 
-    // Update visible_ts to match (gap is now closed)
+    // Checkpoint the repaired page/free-list/header state so the rollback is
+    // stable across a second crash/reopen.
 ```
 
 ### Design Limitation: Un-dropping
@@ -546,8 +543,9 @@ Database::open(path, config, replication):
 
 5.  Recovery::run(storage, wal, dwb_path, checkpoint_lsn, handler)
     → WAL replay from checkpoint_lsn
-    → Handler applies TxCommit (catalog + data + index), IndexReady, Vacuum, VisibleTs
-    → WAL payload version checked (V1 legacy vs V2 current) [D7]
+    → Handler applies TxCommit (catalog + primary data), IndexReady, VisibleTs
+    → Vacuum/rollback-vacuum records are informational in the current format
+    → WAL payload version checked (legacy V1/V2 vs current V3 BSON bodies) [D7]
     → Root page IDs from WAL used to open/initialize B-trees [D6]
     → Returns (end_lsn, RecoveredState)
 
@@ -556,7 +554,8 @@ Database::open(path, config, replication):
 7.  Rollback vacuum: if recovered_ts > visible_ts
     → Scan WAL backwards for un-replicated commits
     → Reverse their effects using full metadata from WAL record [D4]
-    → Write RollbackVacuum WAL record
+    → Rebuild Ready secondary indexes
+    → Checkpoint repaired state
 
 8.  Update file header: next_collection_id, next_index_id from catalog
 
@@ -647,7 +646,13 @@ This solves the critical problem where `create_btree()` during WAL replay could 
 
 ### D7: WAL Payload Version Field
 
-**Implemented in L5 code.** The TxCommit payload now starts with a `version: u8` byte (currently version 2). The deserializer auto-detects V1 (legacy, no version byte) vs V2. Future format changes only require incrementing the version and adding a new deserialization branch.
+**Implemented in L5 code.** The TxCommit payload now starts with a `version: u8`
+byte. Version 3 is current and stores document bodies as BSON. Version 2 remains
+accepted during recovery and converts legacy JSON document bodies to BSON during
+replay. Version 1 was unversioned and is accepted only as a best-effort legacy
+format when it does not collide with the explicit version namespace. Explicit
+versions greater than the current version are rejected during recovery instead
+of being guessed as legacy data.
 
 ### D8: Exclusive File Locking
 
@@ -658,12 +663,29 @@ This solves the critical problem where `create_btree()` during WAL replay could 
 WAL segment reclamation is an L2 responsibility. L6 provides two inputs:
 - `checkpoint_lsn` (from the last checkpoint) — segments before this are candidates
 - `min_required_lsn` (from L7 replication) — respects replica lag
+- optional WAL retention caps — force reclamation by retained bytes/age
 
-L2 decides which segments to delete. L6 does not directly manage segments.
+L2 decides which segments to delete. L6 does not directly manage segments. In
+single-node mode, L2 reclaims sealed segments after a successful durable
+checkpoint when the segment end LSN is covered by `checkpoint_lsn`; the active
+segment is never reclaimed. L2 now exposes a replication retention LSN hook and
+computes `min(checkpoint_lsn, min_required_lsn)` during checkpoint, then raises
+that reclamation point when configured retained-size or retained-age caps are
+exceeded. L7 can now route retained-WAL gaps to snapshot reconstruction when a
+primary snapshot source and replica snapshot sink are installed; server startup
+can install those bridges from JSON config for one managed database, and fresh
+configured replicas register the restored path after snapshot restore.
+Configured startup now reads the durable file-header generation for existing
+local state and persists operator generation for fresh local state. Peer
+handshakes now advertise the primary's current retained WAL floor from the
+storage-backed catch-up source, and replica attach uses that signal to request
+a snapshot immediately when retained WAL cannot cover local progress. Startup
+still needs richer policy orchestration beyond the current Tier 1/Tier 3
+attach decisions.
 
-### D10: File Header Shadow Copy (Not Yet Implemented)
+### D10: File Header Shadow Copy
 
-DESIGN.md 2.13.4 specifies a shadow copy of the file header at the last page of `data.db`. The `PageType::FileHeaderShadow = 0x07` enum variant is defined but the implementation is not written. Page 0 is protected by the DWB (same as all other pages during checkpoint), so torn writes on the header are already handled. The shadow copy is an additional defense-in-depth measure for future implementation.
+DESIGN.md 2.13.4 specifies a shadow copy of the file header at the last page of `data.db`. Durable storage reserves that trailing page with `PageType::FileHeaderShadow = 0x07`, rewrites it after page 0 during initialization, checkpoint, and close, and restores page 0 from the shadow if the primary header is corrupt on open. Page 0 remains protected by the DWB during checkpoint; the shadow copy is an additional defense-in-depth measure for header loss after WAL reclamation.
 
 ### D11: Heap Orphan Cleanup During Replay
 

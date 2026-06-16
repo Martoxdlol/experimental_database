@@ -6,8 +6,7 @@
 //! 2. **Rollback vacuum**: removes entries from commits that were never
 //!    replicated (`ts > visible_ts`).
 
-use crate::key_encoding::make_primary_key;
-use crate::primary_index::{CellFlags, PrimaryIndex};
+use crate::primary_index::PrimaryIndex;
 use crate::secondary_index::SecondaryIndex;
 use exdb_core::types::{CollectionId, DocId, IndexId, Ts};
 use std::collections::HashMap;
@@ -76,22 +75,12 @@ impl VacuumCoordinator {
 
         for candidate in candidates {
             // Remove primary entry
-            if let Some(primary) = primary_indexes.get(&candidate.collection_id) {
-                let key = make_primary_key(&candidate.doc_id, candidate.old_ts);
-
-                // Check if entry was external (heap-stored body)
-                if let Some(value) = primary.btree().get(&key).await? {
-                    let flags = CellFlags::from_byte(value[0]);
-                    if flags.external && !flags.tombstone && value.len() >= 11 {
-                        let href_bytes: [u8; 6] = value[5..11].try_into().expect("bounds checked above");
-                        let href = exdb_storage::heap::HeapRef::from_bytes(&href_bytes);
-                        primary.engine().heap_free(href).await?;
-                    }
-                }
-
-                if primary.btree().delete(&key).await? {
-                    removed += 1;
-                }
+            if let Some(primary) = primary_indexes.get(&candidate.collection_id)
+                && primary
+                    .remove_version(&candidate.doc_id, candidate.old_ts)
+                    .await?
+            {
+                removed += 1;
             }
 
             // Remove secondary entries
@@ -155,8 +144,7 @@ impl RollbackVacuum {
     ) -> std::io::Result<()> {
         for (collection_id, doc_id) in mutations {
             if let Some(primary) = primary_indexes.get(collection_id) {
-                let key = make_primary_key(doc_id, commit_ts);
-                primary.btree().delete(&key).await?;
+                primary.remove_version(doc_id, commit_ts).await?;
             }
         }
         for (index_id, new_key) in index_deltas {
@@ -186,7 +174,8 @@ impl RollbackVacuum {
                 &commit.index_deltas,
                 primary_indexes,
                 secondary_indexes,
-            ).await?;
+            )
+            .await?;
             count += 1;
         }
         Ok(count)
@@ -207,7 +196,11 @@ mod tests {
     );
 
     async fn setup() -> Setup {
-        let engine = Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap());
+        let engine = Arc::new(
+            StorageEngine::open_in_memory(StorageConfig::default())
+                .await
+                .unwrap(),
+        );
         let primary_btree = engine.create_btree().await.unwrap();
         let primary = Arc::new(PrimaryIndex::new(primary_btree, engine.clone(), 4096));
 
@@ -274,7 +267,10 @@ mod tests {
             superseding_ts: 10,
             old_index_keys: vec![],
         }];
-        let removed = vc.execute(&candidates, &primaries, &secondaries).await.unwrap();
+        let removed = vc
+            .execute(&candidates, &primaries, &secondaries)
+            .await
+            .unwrap();
         assert!(removed > 0);
 
         // Old version is gone, but new version still accessible
@@ -303,7 +299,10 @@ mod tests {
             superseding_ts: 10,
             old_index_keys: vec![(IndexId(1), sec_key)],
         }];
-        let removed = vc.execute(&candidates, &primaries, &secondaries).await.unwrap();
+        let removed = vc
+            .execute(&candidates, &primaries, &secondaries)
+            .await
+            .unwrap();
         assert!(removed >= 2); // primary + secondary
     }
 
@@ -314,15 +313,9 @@ mod tests {
         let d = doc(1);
         primary.insert_version(&d, 10, Some(b"body")).await.unwrap();
 
-        RollbackVacuum::rollback_commit(
-            10,
-            &[(CollectionId(1), d)],
-            &[],
-            &primaries,
-            &secondaries,
-        )
-        .await
-        .unwrap();
+        RollbackVacuum::rollback_commit(10, &[(CollectionId(1), d)], &[], &primaries, &secondaries)
+            .await
+            .unwrap();
 
         assert!(primary.get_at_ts(&d, 10).await.unwrap().is_none());
     }
@@ -335,15 +328,9 @@ mod tests {
         primary.insert_version(&d, 5, Some(b"v5")).await.unwrap();
         primary.insert_version(&d, 10, Some(b"v10")).await.unwrap();
 
-        RollbackVacuum::rollback_commit(
-            10,
-            &[(CollectionId(1), d)],
-            &[],
-            &primaries,
-            &secondaries,
-        )
-        .await
-        .unwrap();
+        RollbackVacuum::rollback_commit(10, &[(CollectionId(1), d)], &[], &primaries, &secondaries)
+            .await
+            .unwrap();
 
         assert_eq!(primary.get_at_ts(&d, 5).await.unwrap().unwrap(), b"v5");
         assert_eq!(primary.get_at_ts(&d, 10).await.unwrap().unwrap(), b"v5"); // falls back to v5
@@ -413,9 +400,14 @@ mod tests {
             superseding_ts: 10,
             old_index_keys: vec![],
         }];
-        vc.execute(&candidates, &primaries, &secondaries).await.unwrap();
+        vc.execute(&candidates, &primaries, &secondaries)
+            .await
+            .unwrap();
         // Second time: no-op (key already deleted)
-        let removed = vc.execute(&candidates, &primaries, &secondaries).await.unwrap();
+        let removed = vc
+            .execute(&candidates, &primaries, &secondaries)
+            .await
+            .unwrap();
         assert_eq!(removed, 0);
     }
 
@@ -484,8 +476,9 @@ mod tests {
             },
         ];
 
-        let count =
-            RollbackVacuum::rollback_from_wal(10, &wal_commits, &primaries, &secondaries).await.unwrap();
+        let count = RollbackVacuum::rollback_from_wal(10, &wal_commits, &primaries, &secondaries)
+            .await
+            .unwrap();
         assert_eq!(count, 2);
         assert!(primary.get_at_ts(&d1, 15).await.unwrap().is_none());
         assert!(primary.get_at_ts(&d2, 15).await.unwrap().is_none());
@@ -519,7 +512,11 @@ mod tests {
     #[tokio::test]
     async fn vacuum_external_body() {
         // Verify that external (heap-stored) bodies are freed during vacuum
-        let engine = Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap());
+        let engine = Arc::new(
+            StorageEngine::open_in_memory(StorageConfig::default())
+                .await
+                .unwrap(),
+        );
         let primary_btree = engine.create_btree().await.unwrap();
         let primary = Arc::new(PrimaryIndex::new(primary_btree, engine.clone(), 10)); // low threshold
 
@@ -540,7 +537,10 @@ mod tests {
             superseding_ts: 5,
             old_index_keys: vec![],
         }];
-        let removed = vc.execute(&candidates, &primaries, &secondaries).await.unwrap();
+        let removed = vc
+            .execute(&candidates, &primaries, &secondaries)
+            .await
+            .unwrap();
         assert_eq!(removed, 1);
 
         // New version still accessible
@@ -557,7 +557,9 @@ mod tests {
             &[],
             &primaries,
             &secondaries,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -570,20 +572,18 @@ mod tests {
             &[(IndexId(999), Some(vec![0x01, 0x02]))],
             &primaries,
             &secondaries,
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn rollback_none_index_delta() {
         // Index delta with None key — should skip
         let (_engine, primaries, secondaries) = setup().await;
-        RollbackVacuum::rollback_commit(
-            10,
-            &[],
-            &[(IndexId(1), None)],
-            &primaries,
-            &secondaries,
-        ).await.unwrap();
+        RollbackVacuum::rollback_commit(10, &[], &[(IndexId(1), None)], &primaries, &secondaries)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -621,7 +621,10 @@ mod tests {
             superseding_ts: 10,
             old_index_keys: vec![],
         }];
-        let removed = vc.execute(&candidates, &primaries, &secondaries).await.unwrap();
+        let removed = vc
+            .execute(&candidates, &primaries, &secondaries)
+            .await
+            .unwrap();
         assert_eq!(removed, 1);
 
         // New version still works
@@ -631,7 +634,9 @@ mod tests {
     #[tokio::test]
     async fn rollback_from_wal_empty() {
         let (_engine, primaries, secondaries) = setup().await;
-        let count = RollbackVacuum::rollback_from_wal(10, &[], &primaries, &secondaries).await.unwrap();
+        let count = RollbackVacuum::rollback_from_wal(10, &[], &primaries, &secondaries)
+            .await
+            .unwrap();
         assert_eq!(count, 0);
     }
 }

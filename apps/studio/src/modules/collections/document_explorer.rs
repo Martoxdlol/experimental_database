@@ -16,7 +16,7 @@ pub fn DocumentExplorer(collection: String) -> Element {
 
     // ─── Editing state ───
     let mut editing: Signal<Option<EditingCell>> = use_signal(|| None);
-    let mut edit_buffer = use_signal(|| String::new());
+    let mut edit_buffer = use_signal(String::new);
 
     // ─── Row detail / insert state ───
     let mut expanded_row: Signal<Option<usize>> = use_signal(|| None);
@@ -134,7 +134,7 @@ pub fn DocumentExplorer(collection: String) -> Element {
                         value: "{ps}",
                         onchange: move |e| {
                             if let Ok(n) = e.value().parse::<usize>() {
-                                page_size.set(n.max(10).min(500));
+                                page_size.set(n.clamp(10, 500));
                                 page.set(0);
                             }
                         },
@@ -264,7 +264,7 @@ pub fn DocumentExplorer(collection: String) -> Element {
                                             // Cells
                                             for cell in cells {
                                                 {
-                                                    let is_editing = editing.read().as_ref().map_or(false, |e| e.row == row_idx && e.col == cell.col);
+                                                    let is_editing = editing.read().as_ref().is_some_and(|e| e.row == row_idx && e.col == cell.col);
 
                                                     if is_editing {
                                                         let coll = collection_for_row.clone();
@@ -419,16 +419,22 @@ async fn save_cell_edit(
     map.insert(field.to_string(), new_value);
     let patch = serde_json::Value::Object(map);
 
-    match engine.l6.patch_doc(collection, &doc_id, patch).await {
+    match engine.l6.patch_doc(collection, doc_id, patch).await {
         Ok(exdb::TransactionResult::Success { .. }) => {
             state.notify_mutation();
-            state.last_result.set(Some(OperationResult::Success(format!("Updated {field}"))));
+            state
+                .last_result
+                .set(Some(OperationResult::Success(format!("Updated {field}"))));
         }
         Ok(exdb::TransactionResult::Conflict { error, .. }) => {
-            state.last_result.set(Some(OperationResult::Error(format!("Conflict: {error}"))));
+            state
+                .last_result
+                .set(Some(OperationResult::Error(format!("Conflict: {error}"))));
         }
         Err(e) => {
-            state.last_result.set(Some(OperationResult::Error(format!("{e}"))));
+            state
+                .last_result
+                .set(Some(OperationResult::Error(format!("{e}"))));
         }
         _ => {}
     }
@@ -439,10 +445,18 @@ fn parse_cell_value(s: &str) -> serde_json::Value {
     if trimmed.is_empty() || trimmed == "null" {
         return serde_json::Value::Null;
     }
-    if trimmed == "true" { return serde_json::Value::Bool(true); }
-    if trimmed == "false" { return serde_json::Value::Bool(false); }
-    if let Ok(n) = trimmed.parse::<i64>() { return serde_json::json!(n); }
-    if let Ok(n) = trimmed.parse::<f64>() { return serde_json::json!(n); }
+    if trimmed == "true" {
+        return serde_json::Value::Bool(true);
+    }
+    if trimmed == "false" {
+        return serde_json::Value::Bool(false);
+    }
+    if let Ok(n) = trimmed.parse::<i64>() {
+        return serde_json::json!(n);
+    }
+    if let Ok(n) = trimmed.parse::<f64>() {
+        return serde_json::json!(n);
+    }
     if (trimmed.starts_with('{') || trimmed.starts_with('['))
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed)
     {
@@ -466,7 +480,13 @@ fn detect_columns(docs: &[&serde_json::Value]) -> Vec<String> {
     }
     cols.sort_by(|a, b| {
         let rank = |s: &str| -> u8 {
-            if s == "_meta" { 2 } else if s.starts_with('_') { 1 } else { 0 }
+            if s == "_meta" {
+                2
+            } else if s.starts_with('_') {
+                1
+            } else {
+                0
+            }
         };
         rank(a).cmp(&rank(b)).then(a.cmp(b))
     });
@@ -479,7 +499,11 @@ fn format_cell(v: Option<&serde_json::Value>) -> String {
     match v {
         None | Some(serde_json::Value::Null) => "NULL".to_string(),
         Some(serde_json::Value::String(s)) => {
-            if s.len() > 80 { format!("{}...", &s[..80]) } else { s.clone() }
+            if s.len() > 80 {
+                format!("{}...", &s[..80])
+            } else {
+                s.clone()
+            }
         }
         Some(serde_json::Value::Number(n)) => n.to_string(),
         Some(serde_json::Value::Bool(b)) => b.to_string(),
@@ -497,4 +521,3 @@ fn format_cell_raw(v: Option<&serde_json::Value>) -> String {
         Some(v) => serde_json::to_string(v).unwrap_or_default(),
     }
 }
-

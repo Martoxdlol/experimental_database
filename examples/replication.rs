@@ -1,10 +1,13 @@
-//! Example: Primary + replica replication setup.
+//! Replication is currently exercised by the `exdb-replication` and
+//! `exdb-server` test suites rather than a runnable package example.
+//!
+//! Start with:
 //!
 //! ```bash
-//! cargo run --example replication
+//! cargo test -p exdb-replication --all-targets
+//! cargo test -p exdb-server configured_three_node_replication_applies_to_both_online_replicas
 //! ```
 
 fn main() {
-    println!("replication example: not yet implemented");
-    // TODO: start primary, connect replica, insert on primary, read on replica
+    println!("replication examples are covered by exdb-replication and exdb-server tests");
 }

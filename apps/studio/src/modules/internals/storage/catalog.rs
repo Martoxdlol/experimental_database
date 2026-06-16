@@ -15,9 +15,7 @@ pub fn CatalogModule() -> Element {
     let collections = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db.clone();
-        async move {
-            db.list_collections().await.ok()
-        }
+        async move { db.list_collections().await.ok() }
     });
 
     let mut selected_collection: Signal<Option<u64>> = use_signal(|| None);

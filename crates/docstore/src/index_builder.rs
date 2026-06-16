@@ -53,7 +53,9 @@ impl IndexBuilder {
         progress_tx: Option<tokio::sync::watch::Sender<BuildProgress>>,
     ) -> Result<u64, std::io::Error> {
         let start = std::time::Instant::now();
-        let mut scanner = self.primary.scan_at_ts(build_snapshot_ts, ScanDirection::Forward);
+        let mut scanner = self
+            .primary
+            .scan_at_ts(build_snapshot_ts, ScanDirection::Forward);
         let mut entries_inserted: u64 = 0;
         let mut docs_scanned: u64 = 0;
 
@@ -64,8 +66,8 @@ impl IndexBuilder {
             let doc = decode_document(&body_bytes)
                 .map_err(|e| std::io::Error::other(format!("document decode error: {e}")))?;
 
-            let key_prefixes = compute_index_entries(&doc, &self.field_paths)
-                .map_err(std::io::Error::other)?;
+            let key_prefixes =
+                compute_index_entries(&doc, &self.field_paths).map_err(std::io::Error::other)?;
 
             for prefix in key_prefixes {
                 let full_key = make_secondary_key_from_prefix(&prefix, &doc_id, version_ts);
@@ -97,7 +99,11 @@ mod tests {
     use exdb_storage::engine::{StorageConfig, StorageEngine};
 
     async fn setup() -> (Arc<StorageEngine>, Arc<PrimaryIndex>, Arc<SecondaryIndex>) {
-        let engine = Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap());
+        let engine = Arc::new(
+            StorageEngine::open_in_memory(StorageConfig::default())
+                .await
+                .unwrap(),
+        );
         let primary_btree = engine.create_btree().await.unwrap();
         let primary = Arc::new(PrimaryIndex::new(primary_btree, engine.clone(), 4096));
         let sec_btree = engine.create_btree().await.unwrap();
@@ -114,8 +120,7 @@ mod tests {
     #[tokio::test]
     async fn build_empty_collection() {
         let (_engine, primary, secondary) = setup().await;
-        let builder =
-            IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
+        let builder = IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
         let count = builder.build(10, None).await.unwrap();
         assert_eq!(count, 0);
     }
@@ -127,10 +132,10 @@ mod tests {
         let body = encode_document(&doc);
         primary
             .insert_version(&doc_id(1), 5, Some(&body))
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        let builder =
-            IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
+        let builder = IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
         let count = builder.build(10, None).await.unwrap();
         assert_eq!(count, 1);
     }
@@ -143,11 +148,11 @@ mod tests {
             let body = encode_document(&doc);
             primary
                 .insert_version(&doc_id(i), 5, Some(&body))
-                .await.unwrap();
+                .await
+                .unwrap();
         }
 
-        let builder =
-            IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
+        let builder = IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
         let count = builder.build(10, None).await.unwrap();
         assert_eq!(count, 10);
     }
@@ -159,10 +164,10 @@ mod tests {
         let body = encode_document(&doc);
         primary
             .insert_version(&doc_id(1), 5, Some(&body))
-            .await.unwrap();
+            .await
+            .unwrap();
 
-        let builder =
-            IndexBuilder::new(primary, secondary, vec![FieldPath::single("tags")]);
+        let builder = IndexBuilder::new(primary, secondary, vec![FieldPath::single("tags")]);
         let count = builder.build(10, None).await.unwrap();
         assert_eq!(count, 3);
     }
@@ -174,14 +179,15 @@ mod tests {
         let doc2 = serde_json::json!({"name": "Bob"});
         primary
             .insert_version(&doc_id(1), 5, Some(&encode_document(&doc1)))
-            .await.unwrap();
+            .await
+            .unwrap();
         primary
             .insert_version(&doc_id(2), 10, Some(&encode_document(&doc2)))
-            .await.unwrap();
+            .await
+            .unwrap();
 
         // Build at snapshot_ts=7, should only see doc1
-        let builder =
-            IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
+        let builder = IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
         let count = builder.build(7, None).await.unwrap();
         assert_eq!(count, 1);
     }
@@ -192,11 +198,11 @@ mod tests {
         let doc = serde_json::json!({"name": "Alice"});
         primary
             .insert_version(&doc_id(1), 5, Some(&encode_document(&doc)))
-            .await.unwrap();
+            .await
+            .unwrap();
         primary.insert_version(&doc_id(1), 8, None).await.unwrap(); // tombstone
 
-        let builder =
-            IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
+        let builder = IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
         let count = builder.build(10, None).await.unwrap();
         assert_eq!(count, 0);
     }
@@ -208,7 +214,8 @@ mod tests {
             let doc = serde_json::json!({"name": format!("user_{i}")});
             primary
                 .insert_version(&doc_id(i), 5, Some(&encode_document(&doc)))
-                .await.unwrap();
+                .await
+                .unwrap();
         }
 
         let (tx, mut rx) = tokio::sync::watch::channel(BuildProgress {
@@ -217,8 +224,7 @@ mod tests {
             elapsed_ms: 0,
         });
 
-        let builder =
-            IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
+        let builder = IndexBuilder::new(primary, secondary, vec![FieldPath::single("name")]);
         let count = builder.build(10, Some(tx)).await.unwrap();
         assert_eq!(count, 5);
         // rx should have the final state or at least initial

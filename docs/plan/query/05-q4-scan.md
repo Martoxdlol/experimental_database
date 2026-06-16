@@ -248,7 +248,7 @@ The `query_id` is used for subscription granularity (which queries were invalida
 
 ### Read set size limits (DESIGN.md section 5.6.5)
 
-The stream tracks `scanned_docs` and `scanned_bytes` via `ScanStats`. However, L4 does **not** enforce the read set size limits (`max_intervals`, `max_scanned_bytes`, `max_scanned_docs`). These limits are transaction-scoped (accumulated across multiple queries), so they are enforced by L6 which inspects stats after consuming the stream and aborts the transaction with `read_limit_exceeded` if any limit is exceeded.
+The stream tracks `scanned_docs` and `scanned_bytes` via `ScanStats`. However, L4 does **not** enforce the transaction resource limits (`max_intervals`, `max_operations`, `max_scanned_bytes`, `max_scanned_docs`). These limits are transaction-scoped, so they are enforced by L6 which inspects stats and charges operation work after consuming the stream, aborting the transaction with `read_limit_exceeded` if any limit is exceeded.
 
 ### Limit-aware interval tightening
 

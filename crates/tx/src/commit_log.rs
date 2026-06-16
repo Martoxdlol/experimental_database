@@ -19,6 +19,7 @@ pub const PRIMARY_INDEX_SENTINEL: IndexId = IndexId(0);
 /// Stores both old and new keys so that OCC can detect:
 /// - **Modifications** to documents within the read set (`old_key` overlap)
 /// - **Phantoms** entering the read set (`new_key` overlap)
+#[derive(Clone)]
 pub struct IndexKeyWrite {
     /// Which document was mutated.
     pub doc_id: DocId,
@@ -109,9 +110,7 @@ impl CommitLog {
     /// beyond `visible_ts`. This is critical because the writer may have
     /// validated subsequent commits against now-invalid entries.
     pub fn remove_after(&mut self, threshold: Ts) {
-        let cutoff = self
-            .entries
-            .partition_point(|e| e.commit_ts <= threshold);
+        let cutoff = self.entries.partition_point(|e| e.commit_ts <= threshold);
         self.entries.truncate(cutoff);
     }
 

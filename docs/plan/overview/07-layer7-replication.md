@@ -148,6 +148,7 @@ enum PeerMessage {
     WalRecord { lsn: Lsn, data: Vec<u8> },
     WalAck { lsn: Lsn },
     RequestCatchup { from_lsn: Lsn },  // replica asks primary for WAL from this point
+    RequestSnapshot { from_lsn: Lsn }, // replica asks primary to skip directly to Tier 3
     SnapshotBegin,                      // full snapshot transfer follows
     SnapshotData { chunk: Vec<u8> },
     SnapshotEnd,
@@ -157,7 +158,8 @@ enum PeerMessage {
 - **Heartbeat**: Sent by both sides at `heartbeat_interval`. Carries replication progress.
 - **WalRecord**: Primary → replica. A committed WAL record that the replica must apply and acknowledge.
 - **WalAck**: Replica → primary. Confirms that a WAL record has been durably applied.
-- **RequestCatchup**: Replica → primary. After handshake, if the replica is behind, it requests WAL records starting from `from_lsn`. The primary responds with a stream of `WalRecord` messages.
+- **RequestCatchup**: Replica → primary. After handshake, if the replica is behind and the primary's advertised retained WAL floor covers the replica's progress, it requests WAL records starting from `from_lsn`. The primary responds with a stream of `WalRecord` messages.
+- **RequestSnapshot**: Replica → primary. If the primary handshake already proves `from_lsn` is older than the retained WAL floor, the replica skips the doomed WAL request and asks for Tier 3 snapshot reconstruction directly.
 - **SnapshotBegin/Data/End**: Primary → replica. Used for Tier 3 recovery when incremental catch-up is not possible. The primary streams a consistent snapshot as a sequence of chunks.
 
 #### Struct Design
@@ -223,6 +225,63 @@ This enables **Tier 1 recovery**: a replica that was offline for less than `wal_
 The `wal_retention_size` constraint (default 1GB) provides a secondary bound: even if the time-based retention would keep more, WAL is capped at this size. Conversely, if WAL is small, the time-based retention still applies.
 
 **Single-node mode**: Without replication (single-node deployment), WAL retention defaults to 0 — segments are truncated immediately after checkpoint to save disk space. The retention parameters in `ClusterConfig` only apply when replication is active.
+
+Current implementation note: L2 exposes an optional
+`replication_retention_lsn` checkpoint bound. L5's `ReplicationHook` exposes
+the same optional bound, and `PrimaryReplicator` reports the cluster's
+`min_replica_lsn()` so successful primary commits publish replica lag into L2
+before checkpoint reclamation. L2/L6 database config now also supports optional
+retained-size and retained-age caps that can force old WAL reclamation despite
+replica lag. L7 now exposes a recovery-tier selector and emits
+`CatchupUnavailable { requested_lsn, oldest_retained_lsn }` when a replica asks
+for WAL older than the retained window. `PeerMesh` can route that gap into
+quorum-checked snapshot streaming when the primary has an installed
+`SnapshotSource`. Peer handshakes now also advertise the sender's oldest
+retained WAL LSN; storage-backed primary catch-up sources report the live L2
+retained floor at handshake time. Replica attach uses that floor to choose
+between `RequestCatchup` and an immediate `RequestSnapshot`, avoiding an
+impossible retained-WAL request when the primary has already reclaimed the
+needed range. The server config now has `replication` entries that first reject
+duplicate database names and mixed primary/replica role sets before any
+managed-registry mutation, then start one mesh per configured database, install
+primary/replica database bridges, advertise a replica's durable
+`replication_applied_lsn` in startup handshakes, read the durable file-header
+generation for existing local state, persist the configured generation for
+fresh local state, and record the local startup recovery-tier selection.
+Coverage now explicitly proves this for existing primary data as well as
+existing replica data, so a configured generation cannot silently replace an
+intact local generation. Configured replica startup also probes durable local
+state before open and reports Tier 2 `LocalRecoveryThenCatchup` when
+non-checkpoint WAL/DWB work must be recovered locally before normal retained-WAL
+catch-up. Configured replicas with no usable local database force Tier 3
+snapshot reconstruction on primary attach; when an existing local replica
+database fails startup integrity/open, the server quarantines that directory
+instead of overwriting it and leaves the live registry empty until a snapshot is
+installed. Configured server coverage now
+exercises a three-node topology where a primary commits with one live replica
+while another replica is offline, and the all-online three-node path where one
+primary commit fans out to both replicas while the primary records each
+replica's durable applied-LSN progress independently. Fresh and existing
+replica snapshot fallback coverage also closes and reopens the replica
+`SystemDatabase`, proving the
+snapshot-installed registry entry and subsequent live WAL data survive
+managed-registry restart. Fresh
+multi-database replica coverage now forces two configured databases through
+snapshot fallback together, verifies their restored collection catalogs remain
+isolated, applies subsequent live WAL to both, and proves both registry entries
+survive restart. Server snapshot sinks also discard abandoned partial streams
+when a later
+`SnapshotBegin` arrives, so an interrupted Tier 3 transfer can be retried
+without leaving the database permanently stuck in an in-progress state.
+Mesh-backed promoted system database DDL now also covers primary refusal
+semantics: a replica-promoted drop that hits a live primary-side database
+handle returns `database_in_use`, leaves the primary registry intact, and can be
+retried successfully once the handle is released. Promotion-client coverage now
+also verifies a live local role transition from replica to primary prevents
+later write promotion with a role-specific error before contacting the primary
+handler. The remaining L7 policy work is richer recovery orchestration beyond
+the current configured Tier 1, Tier 2 startup detection, and Tier 3 attach
+decisions.
 
 ### `primary_server.rs` — Primary Replication Server
 
@@ -309,6 +368,40 @@ The replica receives `WalRecord` messages through the mesh's `handle_peer` loop.
 3. Invalidates local subscriptions.
 4. Sends a `WalAck` back to the primary through the same connection.
 
+Current implementation note: L6 exposes `Database::apply_replicated_wal` as the
+durable TxCommit apply primitive for steps 1-2 and local visibility
+advancement. The server layer now wraps that method in `DatabaseWalApplier` and
+has real TCP mesh coverage from primary commit through replica database apply
+and acknowledgement. L2/L6 also persist and expose the highest primary-source
+applied LSN so restart handshakes can advertise durable replica progress. The
+server startup now wires that persisted progress into replica handshakes for a
+configured managed database. Fresh configured replicas can register a restored
+snapshot in the managed registry and then apply live WAL. L5/L6 now serialize
+document `ReadSet`/`WriteSet` promotion payloads, and the server installs a
+primary-side promotion handler that submits decoded payloads through the real
+database commit path. L8 replica sessions now route document write commits
+through a mesh-backed `PromotionClient` when configured as replicas, and
+collection/index management writes promote primary-owned DDL intents over the
+same mesh path so primary-assigned metadata is returned to the replica. The
+same mesh path also carries system database create/drop DDL to the primary;
+server coverage verifies a configured replica can create and drop a database
+through the live mesh-backed promoter. Existing multi-database replica coverage
+now also replaces two stale local databases from independent primary snapshots,
+keeps their catalogs isolated, applies subsequent live WAL to both restored
+handles, and proves both replacement registry entries survive restart. The
+remaining work is richer system-catalog recovery orchestration beyond current
+per-database and multi-database snapshot registration/replacement, plus broader
+remote multi-node coverage.
+Retained-WAL
+`RequestCatchup` streaming, explicit `CatchupUnavailable` gap signaling,
+replica attach-triggered catch-up, progress-based primary WAL retention,
+optional retained-size/age WAL caps, pure recovery-tier selection, opaque
+promotion transport, and quorum-checked snapshot chunk transport with
+injectable sinks are wired. L2/L6 also provide checkpointed snapshot
+export/restore primitives, and the server layer bridges them to mesh
+source/sink adapters. `PeerMesh` now falls back from an unavailable catch-up
+range to snapshot streaming when a primary snapshot source is installed.
+
 #### Replica Fencing
 
 The replica continuously monitors `cluster.has_quorum()`. When quorum is lost (the replica cannot reach a majority of the cluster within `replica_fence_timeout`, default 2s), it sets `fenced = true` and stops accepting new read transactions. Existing in-flight reads are allowed to complete, but no new `begin_read()` calls are accepted.
@@ -316,6 +409,13 @@ The replica continuously monitors `cluster.has_quorum()`. When quorum is lost (t
 This is critical for linearizability: a partitioned replica must not serve reads from stale data while the primary (on the other side of the partition) may be committing new writes that the replica has not received. See the Timeout Hierarchy section below for why this works.
 
 When quorum is restored, the replica unfences and resumes normal operation after catching up on any missed WAL records.
+
+Current implementation note: configured replica servers install an L8
+`ReplicaReadGate` backed by each database's `PeerMesh`. New readonly
+`Begin` requests on replica sessions call `cluster.has_quorum()` through that
+gate and return `quorum_lost` when majority is unavailable. The transport
+configuration carries the gate through TCP, TLS, QUIC, WebSocket, and secure
+WebSocket session setup. Existing in-flight reads still complete.
 
 ### `promotion.rs` — Transaction Promotion
 
@@ -342,6 +442,29 @@ pub enum PromotionResult {
     Conflict { error: ConflictError },
 }
 ```
+
+Current implementation note: L7 now provides the mesh transport foundation for
+promotion with `PromotionClient`, `PromotionHandler`, `PromotionRequest`, and
+`PromotionResponse`. The transport carries an encoded transaction payload and
+returns `Success { commit_ts }`, an opaque conflict payload, or an opaque
+primary response payload for management operations. It rejects promotion when
+the replica lacks quorum and requires an existing mesh connection to a primary.
+L5/L6 now provide a versioned document `ReadSet`/`WriteSet` payload codec plus
+`Database::commit_promoted_transaction`, and the server primary mesh installs a
+database-backed promotion handler. L8 replica sessions now expose a wire-level
+`TransactionPromoter` abstraction; configured replica servers install a
+mesh-backed implementation and route document write commits through
+`PromotionClient` instead of committing locally. The promotion request carries
+subscription mode, primary conflicts return Subscribe retry metadata, replica
+sessions materialize those retry transactions locally, and promoted Subscribe
+success registers a local subscription handle. Replica collection/index
+management writes promote DDL intent envelopes to the primary, which executes
+the normal management transaction path and returns the primary wire response.
+Replica create/drop database requests use the same opaque promotion path for
+system catalog DDL; configured server coverage verifies those requests traverse
+the live mesh and mutate the primary `SystemDatabase`. Remaining work is
+broader remote multi-node E2E coverage and richer system-catalog snapshot
+reconstruction semantics.
 
 ### `snapshot.rs` — Snapshot Transfer (Tier 3 Recovery)
 
@@ -373,6 +496,35 @@ impl SnapshotReceiver {
     pub async fn receive_snapshot(&self, source_node: NodeId) -> Result<()>;
 }
 ```
+
+Current implementation note: L7 now has the mesh transport foundation for
+snapshot streaming. `SnapshotSender` verifies quorum, finds the target peer
+connection, and sends `SnapshotBegin`, zero or more `SnapshotData` chunks, and
+`SnapshotEnd` over that connection. `PeerMesh` installs an injectable
+`SnapshotSink` on receivers; the default sink rejects snapshot messages so
+callers cannot silently discard a reconstruction stream. L2/L6 now expose a
+checkpointed snapshot image that can be chunked, restored into a fresh durable
+database path, and continue WAL appends from the snapshot checkpoint LSN. The
+server layer now installs database-backed source/sink adapters and verifies a
+real snapshot can stream over loopback TCP mesh traffic into a restored database
+with a queryable Ready secondary index. `PeerMesh` routes retained-WAL gap
+signals into this path when a primary snapshot source is installed, and
+configured replicas without a usable local database can force snapshot
+reconstruction immediately on primary attach. Server sink coverage verifies both
+plain path restore and managed-registry install can restart cleanly after an
+abandoned partial stream; it also verifies replacement failure caused by a live
+external database handle restores the previous WAL-applier handle and leaves old
+data intact. Fresh multi-database configured coverage verifies independent
+snapshot registration, catalog isolation, subsequent live WAL apply, and
+registry restart survival for two databases recovering together. Existing
+multi-database configured coverage verifies independent snapshot replacement
+of stale local databases, catalog isolation, subsequent live WAL apply, and
+registry restart survival for both replacements. Mesh-backed promoted system
+database DDL coverage verifies create/drop routing plus `database_in_use`
+refusal propagation and retry for primary-side live handles. The remaining work
+is richer system-catalog reconstruction orchestration, beyond the current
+per-database and multi-database registry registration/replacement restart
+coverage, and broader operator policy selection.
 
 ### `recovery_tiers.rs` — Recovery Tier Selection
 
@@ -409,18 +561,24 @@ The selection logic incorporates the handshake's `generation` and `applied_lsn`:
   - **Tier 1** is viable when `local_state.applied_lsn >= primary_oldest_retained_lsn`. The replica's applied_lsn falls within the primary's retained WAL window, so incremental catch-up via `RequestCatchup { from_lsn }` is sufficient.
   - **Tier 2** applies when the local data file exists and is valid but the WAL needs replay. After local recovery, the node attempts Tier 1 catch-up.
 - **New generation** (fresh replacement):
-  - **Tier 1** is still attempted first if the primary has retained enough WAL (i.e., `from_lsn: 0` or the earliest LSN falls within retention). This allows a fresh node to bootstrap from WAL alone without a full snapshot.
+  - Local state from a previous generation is not trusted as a catch-up base.
+  - **Tier 1** is still attempted first only if the primary has retained full history from LSN 0. This allows a fresh node to bootstrap from WAL alone without a full snapshot.
   - **Tier 3** (full snapshot) is the fallback when WAL retention is insufficient to cover the entire history needed.
 
 The WAL retention policy (see above) directly determines Tier 1 viability: as long as the primary retains WAL back to the replica's `applied_lsn`, incremental catch-up works.
 
-## FileHeader Generation Field
+## FileHeader Replication Fields
 
-The `generation` value must survive node restarts. It is stored in L2's `FileHeader`:
+The `generation` and `replication_applied_lsn` values must survive node
+restarts. They are stored in L2's `FileHeader`:
 
 - **Existing data file on startup**: Read the generation from `FileHeader`. This is the node's current generation — it has intact local state.
 - **No data file (fresh start)**: `generation = 1`. This is a brand-new node.
 - **Fresh replacement of an existing node**: The operator must set `generation = old_generation + 1` to signal to the cluster that this is a new instance of the same `NodeId`, not a reconnection. In practice, if no data file exists for a known `NodeId`, the node defaults to `generation = 1` and the cluster treats any generation mismatch as a new instance.
+- **Replica restart**: Read `replication_applied_lsn` from `FileHeader` and
+  advertise it in the mesh handshake/heartbeat as the highest primary-source
+  WAL LSN durably applied locally. The value is monotonic and is advanced when
+  L6 finishes applying a replicated TxCommit.
 
 The cluster uses `(NodeId, Generation)` as a composite identity. If a peer connects with the same `NodeId` but a different `Generation` than previously seen, the cluster knows the node was replaced and adjusts recovery tier selection accordingly.
 

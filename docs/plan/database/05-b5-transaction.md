@@ -500,8 +500,12 @@ tx.query("users", "by_age", [gte("age", 18)], None, Asc, Some(10))
   │
   ├── 7. build_merge_view(CollectionId(5)) → MergeView { inserts, deletes, replaces }
   │
-  ├── 8. L4::merge_with_writes(stream, merge_view, sort_fields, range, filter, dir, limit)
-  │       → Vec<ScanRow>  (merged, sorted, limit-capped)
+  ├── 8. If limit is present:
+  │       incrementally merge the committed stream with pre-sorted write-set rows
+  │       until the first N ordered rows are known.
+  │     Otherwise:
+  │       L4::merge_with_writes(stream, merge_view, sort_fields, range, filter, dir, None)
+  │       → Vec<ScanRow>  (merged, sorted)
   │
   ├── 9. check_read_limits()
   │

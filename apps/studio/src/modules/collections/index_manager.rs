@@ -14,13 +14,15 @@ pub fn IndexManager(collection: String) -> Element {
         let engine = engine.clone();
         let coll = coll.clone();
         async move {
-            let Some(engine) = engine else { return Vec::new() };
+            let Some(engine) = engine else {
+                return Vec::new();
+            };
             engine.l6.list_indexes(&coll).await.unwrap_or_default()
         }
     });
 
-    let mut new_name = use_signal(|| String::new());
-    let mut new_fields = use_signal(|| String::new());
+    let mut new_name = use_signal(String::new);
+    let mut new_fields = use_signal(String::new);
 
     let indexes = indexes.read();
     let indexes = indexes.as_deref().unwrap_or(&[]);

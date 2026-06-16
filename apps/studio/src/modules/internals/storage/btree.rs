@@ -20,9 +20,7 @@ pub fn BTreeModule() -> Element {
     let collections = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db_for_catalog.clone();
-        async move {
-            db.list_collections().await.ok()
-        }
+        async move { db.list_collections().await.ok() }
     });
 
     // Load file header (async)
@@ -30,9 +28,7 @@ pub fn BTreeModule() -> Element {
     let file_header = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db_for_fh.clone();
-        async move {
-            Some(db.read_file_header().await)
-        }
+        async move { Some(db.read_file_header().await) }
     });
 
     rsx! {
@@ -159,9 +155,7 @@ fn BTreeView(root_page: u32, write_enabled: bool) -> Element {
     let node = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db.clone();
-        async move {
-            db.read_btree_node(root_page).await.ok()
-        }
+        async move { db.read_btree_node(root_page).await.ok() }
     });
 
     match node.read().as_ref() {
@@ -355,9 +349,16 @@ fn InsertKvForm(root_page: u32) -> Element {
 
 fn hex_short(data: &[u8]) -> String {
     if data.len() <= 16 {
-        data.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+        data.iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     } else {
-        let head: String = data[..8].iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ");
+        let head: String = data[..8]
+            .iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         format!("{head}... ({} bytes)", data.len())
     }
 }

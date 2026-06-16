@@ -60,6 +60,20 @@ pub struct CatalogCache {
     next_index_id: AtomicU64,
 }
 
+impl Clone for CatalogCache {
+    fn clone(&self) -> Self {
+        Self {
+            name_to_collection: self.name_to_collection.clone(),
+            collections: self.collections.clone(),
+            indexes: self.indexes.clone(),
+            index_name_to_id: self.index_name_to_id.clone(),
+            collection_indexes: self.collection_indexes.clone(),
+            next_collection_id: AtomicU64::new(self.next_collection_id()),
+            next_index_id: AtomicU64::new(self.next_index_id()),
+        }
+    }
+}
+
 impl CatalogCache {
     /// Create an empty catalog cache.
     pub fn new(next_collection_id: u64, next_index_id: u64) -> Self {
@@ -106,11 +120,7 @@ impl CatalogCache {
     }
 
     /// Look up an index by (collection_id, name).
-    pub fn get_index_by_name(
-        &self,
-        collection_id: CollectionId,
-        name: &str,
-    ) -> Option<&IndexMeta> {
+    pub fn get_index_by_name(&self, collection_id: CollectionId, name: &str) -> Option<&IndexMeta> {
         self.index_name_to_id
             .get(&(collection_id, name.to_string()))
             .and_then(|id| self.indexes.get(id))
@@ -127,6 +137,11 @@ impl CatalogCache {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// List all indexes across all collections.
+    pub fn list_all_indexes(&self) -> Vec<IndexMeta> {
+        self.indexes.values().cloned().collect()
     }
 
     /// List all indexes for a collection that are in Ready state.
@@ -184,8 +199,7 @@ impl CatalogCache {
         if let Some(idx_ids) = self.collection_indexes.remove(&id) {
             for idx_id in idx_ids {
                 if let Some(idx_meta) = self.indexes.remove(&idx_id) {
-                    self.index_name_to_id
-                        .remove(&(id, idx_meta.name));
+                    self.index_name_to_id.remove(&(id, idx_meta.name));
                 }
             }
         }
@@ -194,13 +208,23 @@ impl CatalogCache {
 
     /// Add an index to the cache.
     pub fn add_index(&mut self, meta: IndexMeta) {
+        if let Some(old_meta) = self.indexes.insert(meta.index_id, meta.clone()) {
+            self.index_name_to_id
+                .remove(&(old_meta.collection_id, old_meta.name));
+            if let Some(ids) = self.collection_indexes.get_mut(&old_meta.collection_id) {
+                ids.retain(|&idx_id| idx_id != meta.index_id);
+            }
+        }
+
         self.index_name_to_id
             .insert((meta.collection_id, meta.name.clone()), meta.index_id);
-        self.collection_indexes
+        let ids = self
+            .collection_indexes
             .entry(meta.collection_id)
-            .or_default()
-            .push(meta.index_id);
-        self.indexes.insert(meta.index_id, meta);
+            .or_default();
+        if !ids.contains(&meta.index_id) {
+            ids.push(meta.index_id);
+        }
     }
 
     /// Remove an index from the cache. Returns the removed metadata, if any.
@@ -223,8 +247,7 @@ impl CatalogCache {
 
     /// Update the next_collection_id if the given value is higher.
     pub fn ensure_collection_id_at_least(&self, id: u64) {
-        self.next_collection_id
-            .fetch_max(id, Ordering::AcqRel);
+        self.next_collection_id.fetch_max(id, Ordering::AcqRel);
     }
 
     /// Update the next_index_id if the given value is higher.
@@ -255,10 +278,7 @@ mod tests {
             index_id: IndexId(id),
             collection_id: CollectionId(coll_id),
             name: name.to_string(),
-            field_paths: fields
-                .iter()
-                .map(|f| FieldPath::single(f))
-                .collect(),
+            field_paths: fields.iter().map(|f| FieldPath::single(f)).collect(),
             root_page: id as u32 * 20,
             state: IndexState::Ready,
         }
@@ -325,6 +345,23 @@ mod tests {
 
         let indexes = cache.list_indexes(CollectionId(1));
         assert_eq!(indexes.len(), 2);
+    }
+
+    #[test]
+    fn list_all_indexes() {
+        let mut cache = CatalogCache::new(1, 1);
+        cache.add_collection(make_collection(1, "users"));
+        cache.add_collection(make_collection(2, "orders"));
+        cache.add_index(make_index(1, 1, "email_idx", &["email"]));
+        cache.add_index(make_index(2, 1, "name_idx", &["name"]));
+        cache.add_index(make_index(3, 2, "total_idx", &["total"]));
+
+        let mut indexes = cache.list_all_indexes();
+        indexes.sort_by_key(|idx| idx.index_id.0);
+        assert_eq!(indexes.len(), 3);
+        assert_eq!(indexes[0].name, "email_idx");
+        assert_eq!(indexes[1].name, "name_idx");
+        assert_eq!(indexes[2].name, "total_idx");
     }
 
     #[test]
@@ -419,10 +456,7 @@ mod tests {
         updated.doc_count = 42;
         cache.add_collection(updated);
 
-        assert_eq!(
-            cache.get_collection(CollectionId(1)).unwrap().doc_count,
-            42
-        );
+        assert_eq!(cache.get_collection(CollectionId(1)).unwrap().doc_count, 42);
     }
 
     #[test]

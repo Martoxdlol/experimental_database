@@ -85,25 +85,25 @@ impl PageType {
 #[repr(C)]
 pub struct PageHeader {
     /// Page identifier.
-    pub page_id: U32<LittleEndian>,         // 4 bytes, offset 0
+    pub page_id: U32<LittleEndian>, // 4 bytes, offset 0
     /// Discriminant indicating the page's role.
-    pub page_type: u8,                       // 1 byte,  offset 4
+    pub page_type: u8, // 1 byte,  offset 4
     /// Bit flags (reserved, page-type specific).
-    pub flags: u8,                           // 1 byte,  offset 5
+    pub flags: u8, // 1 byte,  offset 5
     /// Number of slots in the directory (including tombstones).
-    pub num_slots: U16<LittleEndian>,        // 2 bytes, offset 6
+    pub num_slots: U16<LittleEndian>, // 2 bytes, offset 6
     /// Byte offset where the slot directory ends (next free byte for a new slot entry).
     pub free_space_start: U16<LittleEndian>, // 2 bytes, offset 8
     /// Byte offset where the cell data region begins (grows downward).
-    pub free_space_end: U16<LittleEndian>,   // 2 bytes, offset 10
+    pub free_space_end: U16<LittleEndian>, // 2 bytes, offset 10
     /// Previous page pointer (leaf sibling) or generic pointer (internal).
-    pub prev_or_ptr: U32<LittleEndian>,      // 4 bytes, offset 12
+    pub prev_or_ptr: U32<LittleEndian>, // 4 bytes, offset 12
     /// Reserved for future use.
-    pub _reserved: U32<LittleEndian>,        // 4 bytes, offset 16
+    pub _reserved: U32<LittleEndian>, // 4 bytes, offset 16
     /// CRC-32C checksum of the page (computed with this field zeroed).
-    pub checksum: U32<LittleEndian>,         // 4 bytes, offset 20
+    pub checksum: U32<LittleEndian>, // 4 bytes, offset 20
     /// Log sequence number of the last WAL record that modified this page.
-    pub lsn: U64<LittleEndian>,             // 8 bytes, offset 24
+    pub lsn: U64<LittleEndian>, // 8 bytes, offset 24
 }
 
 // Compile-time assertion that PageHeader is exactly 32 bytes.
@@ -207,7 +207,8 @@ impl<'a> SlottedPage<'a> {
 
     /// Read the page header (copies 32 bytes out of the buffer).
     pub fn header(&self) -> PageHeader {
-        *PageHeader::ref_from_bytes(&self.buf[..PAGE_HEADER_SIZE]).expect("buf validated in from_buf")
+        *PageHeader::ref_from_bytes(&self.buf[..PAGE_HEADER_SIZE])
+            .expect("buf validated in from_buf")
     }
 
     /// Write a page header into the buffer.
@@ -223,8 +224,7 @@ impl<'a> SlottedPage<'a> {
     /// Return the page type. Panics if the stored byte is invalid.
     #[deprecated(note = "use page_type_checked() for safe error handling")]
     pub fn page_type(&self) -> PageType {
-        PageType::from_u8(self.header().page_type)
-            .expect("invalid page type byte in header")
+        PageType::from_u8(self.header().page_type).expect("invalid page type byte in header")
     }
 
     /// Return the page type, or `None` if the stored byte is invalid.
@@ -286,10 +286,8 @@ impl<'a> SlottedPage<'a> {
             h.num_slots.get()
         );
         let dir_offset = PAGE_HEADER_SIZE + (slot as usize) * SLOT_ENTRY_SIZE;
-        let offset =
-            u16::from_le_bytes([self.buf[dir_offset], self.buf[dir_offset + 1]]);
-        let length =
-            u16::from_le_bytes([self.buf[dir_offset + 2], self.buf[dir_offset + 3]]);
+        let offset = u16::from_le_bytes([self.buf[dir_offset], self.buf[dir_offset + 1]]);
+        let length = u16::from_le_bytes([self.buf[dir_offset + 2], self.buf[dir_offset + 3]]);
         SlotEntry { offset, length }
     }
 
@@ -397,8 +395,7 @@ impl<'a> SlottedPage<'a> {
             );
             self.compact();
             let h = self.header();
-            let contiguous =
-                h.free_space_end.get() as usize - h.free_space_start.get() as usize;
+            let contiguous = h.free_space_end.get() as usize - h.free_space_start.get() as usize;
             if contiguous < needed {
                 // Restore the slot entry before returning error — but the old data is
                 // gone (compaction may have moved things). Return error; the caller
@@ -575,7 +572,8 @@ impl<'a> SlottedPageRef<'a> {
 
     /// Read the page header.
     pub fn header(&self) -> PageHeader {
-        *PageHeader::ref_from_bytes(&self.buf[..PAGE_HEADER_SIZE]).expect("buf validated in from_buf")
+        *PageHeader::ref_from_bytes(&self.buf[..PAGE_HEADER_SIZE])
+            .expect("buf validated in from_buf")
     }
 
     /// Return the page identifier.
@@ -586,8 +584,7 @@ impl<'a> SlottedPageRef<'a> {
     /// Return the page type. Panics if the stored byte is invalid.
     #[deprecated(note = "use page_type_checked() for safe error handling")]
     pub fn page_type(&self) -> PageType {
-        PageType::from_u8(self.header().page_type)
-            .expect("invalid page type byte in header")
+        PageType::from_u8(self.header().page_type).expect("invalid page type byte in header")
     }
 
     /// Return the page type, or `None` if the stored byte is invalid.
@@ -613,8 +610,8 @@ impl<'a> SlottedPageRef<'a> {
         self.header().num_slots.get()
     }
 
-    /// Read slot data. Returns an empty slice for deleted (tombstone) slots.
-    pub fn slot_data(&self, slot: u16) -> &[u8] {
+    /// Read a slot directory entry.
+    pub fn slot_entry(&self, slot: u16) -> SlotEntry {
         let h = self.header();
         assert!(
             slot < h.num_slots.get(),
@@ -623,14 +620,18 @@ impl<'a> SlottedPageRef<'a> {
             h.num_slots.get()
         );
         let dir_offset = PAGE_HEADER_SIZE + (slot as usize) * SLOT_ENTRY_SIZE;
-        let offset =
-            u16::from_le_bytes([self.buf[dir_offset], self.buf[dir_offset + 1]]);
-        let length =
-            u16::from_le_bytes([self.buf[dir_offset + 2], self.buf[dir_offset + 3]]);
-        if length == 0 {
+        let offset = u16::from_le_bytes([self.buf[dir_offset], self.buf[dir_offset + 1]]);
+        let length = u16::from_le_bytes([self.buf[dir_offset + 2], self.buf[dir_offset + 3]]);
+        SlotEntry { offset, length }
+    }
+
+    /// Read slot data. Returns an empty slice for deleted (tombstone) slots.
+    pub fn slot_data(&self, slot: u16) -> &[u8] {
+        let entry = self.slot_entry(slot);
+        if entry.length == 0 {
             return &[];
         }
-        &self.buf[offset as usize..(offset as usize + length as usize)]
+        &self.buf[entry.offset as usize..(entry.offset as usize + entry.length as usize)]
     }
 
     /// Return the log sequence number.
@@ -734,14 +735,9 @@ mod tests {
 
         let record = [0xABu8; 32];
         let mut count = 0u16;
-        loop {
-            match page.insert_slot(&record) {
-                Ok(idx) => {
-                    assert_eq!(idx, count);
-                    count += 1;
-                }
-                Err(_) => break,
-            }
+        while let Ok(idx) = page.insert_slot(&record) {
+            assert_eq!(idx, count);
+            count += 1;
         }
 
         // Verify all inserted records are readable.
@@ -922,11 +918,8 @@ mod tests {
         let mut count = 0u16;
         // Use a record size that will eventually exhaust free space.
         let record = [0x42u8; 10];
-        loop {
-            match page.insert_slot(&record) {
-                Ok(_) => count += 1,
-                Err(_) => break,
-            }
+        while page.insert_slot(&record).is_ok() {
+            count += 1;
         }
         assert!(count > 0);
 
@@ -996,11 +989,7 @@ mod tests {
         let invalid_bytes: &[u8] = &[0x00, 0x08, 0x10, 0xFF];
         for &b in invalid_bytes {
             let result = std::panic::catch_unwind(|| PageType::from_u8(b));
-            assert!(
-                result.is_ok(),
-                "from_u8({:#04x}) should not panic",
-                b,
-            );
+            assert!(result.is_ok(), "from_u8({:#04x}) should not panic", b,);
         }
     }
 

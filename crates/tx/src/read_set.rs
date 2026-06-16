@@ -282,14 +282,15 @@ impl ReadSet {
             let mut merged: Vec<ReadInterval> = Vec::new();
             for interval in intervals.drain(..) {
                 if let Some(last) = merged.last_mut()
-                    && bounds_overlap_or_adjacent(&last.lower, &last.upper, &interval.lower) {
-                        // Merge: take wider bounds
-                        last.upper = bound_max_upper(&last.upper, &interval.upper);
-                        last.query_id = last.query_id.min(interval.query_id);
-                        last.limit_boundary =
-                            merge_limit_boundaries(&last.limit_boundary, &interval.limit_boundary);
-                        continue;
-                    }
+                    && bounds_overlap_or_adjacent(&last.lower, &last.upper, &interval.lower)
+                {
+                    // Merge: take wider bounds
+                    last.upper = bound_max_upper(&last.upper, &interval.upper);
+                    last.query_id = last.query_id.min(interval.query_id);
+                    last.limit_boundary =
+                        merge_limit_boundaries(&last.limit_boundary, &interval.limit_boundary);
+                    continue;
+                }
                 merged.push(interval);
             }
             *intervals = merged;
@@ -304,8 +305,9 @@ impl ReadSet {
     /// the read set is handed to the subscription registry.
     pub fn extend_for_deltas(&mut self, deltas: &[IndexDelta]) {
         for delta in deltas {
-            if let Some(intervals) =
-                self.intervals.get_mut(&(delta.collection_id, delta.index_id))
+            if let Some(intervals) = self
+                .intervals
+                .get_mut(&(delta.collection_id, delta.index_id))
             {
                 for interval in intervals.iter_mut() {
                     interval.apply_delta(delta.old_key.as_deref(), delta.new_key.as_deref());
@@ -725,9 +727,11 @@ mod tests {
         );
         let carried = rs.split_before(1);
         assert_eq!(carried.interval_count(), 1);
-        assert!(carried
-            .intervals
-            .contains_key(&(CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX)));
+        assert!(
+            carried
+                .intervals
+                .contains_key(&(CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX))
+        );
     }
 
     #[test]

@@ -5,9 +5,7 @@
 
 use std::sync::Arc;
 
-use exdb::{
-    Database, DatabaseConfig, TransactionOptions, TransactionResult,
-};
+use exdb::{Database, DatabaseConfig, TransactionOptions, TransactionResult};
 use serde_json::json;
 
 // ─── Helpers ───
@@ -114,7 +112,10 @@ async fn two_writers_same_key_serialized() {
     let mut tx = db.begin(TransactionOptions::readonly()).unwrap();
     let doc = tx.get("users", &id).await.unwrap().unwrap();
     let v = doc["v"].as_u64().unwrap();
-    assert!(v == 1 || v == 2, "final value must be from one of the writers");
+    assert!(
+        v == 1 || v == 2,
+        "final value must be from one of the writers"
+    );
     tx.rollback();
     db.close().await.unwrap();
 }
@@ -164,6 +165,38 @@ async fn snapshot_isolation_read_consistency() {
     assert_eq!(second_read["v"], 1);
 
     tx1.rollback();
+    db.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn primary_get_conflicts_when_read_document_changes_before_commit() {
+    let db = open_test_db().await;
+    create_collection(&db, "users").await;
+
+    let mut seed = db.begin(TransactionOptions::default()).unwrap();
+    let id = seed.insert("users", json!({"v": 1})).await.unwrap();
+    assert_success(seed.commit().await.unwrap());
+
+    let mut reader_writer = db.begin(TransactionOptions::default()).unwrap();
+    let doc = reader_writer.get("users", &id).await.unwrap().unwrap();
+    assert_eq!(doc["v"], 1);
+
+    let mut writer = db.begin(TransactionOptions::default()).unwrap();
+    writer.replace("users", &id, json!({"v": 2})).await.unwrap();
+    assert_success(writer.commit().await.unwrap());
+
+    reader_writer
+        .insert("users", json!({"v": "unrelated"}))
+        .await
+        .unwrap();
+    match reader_writer.commit().await.unwrap() {
+        TransactionResult::Conflict { error, .. } => {
+            assert_eq!(error.affected_query_ids, vec![0]);
+        }
+        TransactionResult::Success { .. } => panic!("expected stale primary read to conflict"),
+        TransactionResult::QuorumLost => panic!("unexpected quorum lost"),
+    }
+
     db.close().await.unwrap();
 }
 

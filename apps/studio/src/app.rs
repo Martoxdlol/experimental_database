@@ -9,9 +9,7 @@ use crate::modules::{
         console::ConsoleModule,
         docstore::{DocumentsModule, KeyToolsModule, SecondaryIndexModule, VacuumModule},
         query::{FilterTestModule, QueryScanModule, RangeToolsModule},
-        storage::{
-            BTreeModule, CatalogModule, FreeListModule, HeapModule, PagesModule, WalModule,
-        },
+        storage::{BTreeModule, CatalogModule, FreeListModule, HeapModule, PagesModule, WalModule},
     },
     query_workbench::QueryWorkbenchModule,
     subscriptions::SubscriptionsModule,

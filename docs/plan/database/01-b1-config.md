@@ -27,6 +27,11 @@ pub struct DatabaseConfig {
     /// Default: 256 MB.
     pub memory_budget: usize,
 
+    /// Optional maximum retained disk usage in bytes.
+    /// Includes page-store bytes plus retained WAL bytes during normal writes.
+    /// Default: None (unlimited).
+    pub max_disk_usage_bytes: Option<u64>,
+
     /// Maximum document size in bytes (binary-encoded).
     /// Documents exceeding this are rejected at insert/replace/patch.
     /// Default: 16 MB (DESIGN.md 1.5).
@@ -75,6 +80,11 @@ pub struct TransactionConfig {
     /// Default: 4,096.
     pub max_intervals: usize,
 
+    /// Maximum coarse work units across public transaction operations and
+    /// scanned index rows.
+    /// Default: 100,000.
+    pub max_operations: usize,
+
     /// Maximum total bytes read from index + primary B-trees.
     /// Default: 64 MB.
     pub max_scanned_bytes: usize,
@@ -89,6 +99,7 @@ impl Default for DatabaseConfig {
         Self {
             page_size: 8192,
             memory_budget: 256 * 1024 * 1024,
+            max_disk_usage_bytes: None,
             max_doc_size: 16 * 1024 * 1024,
             external_threshold: 8192 / 4,
             wal_segment_size: 64 * 1024 * 1024,
@@ -106,12 +117,38 @@ impl Default for TransactionConfig {
             idle_timeout: Duration::from_secs(30),
             max_lifetime: Duration::from_secs(300),
             max_intervals: 4096,
+            max_operations: 100_000,
             max_scanned_bytes: 64 * 1024 * 1024,
             max_scanned_docs: 100_000,
         }
     }
 }
 ```
+
+## Validation
+
+`DatabaseConfig::validate()` rejects unusable storage settings before a
+database is opened, restored from snapshot, or persisted in the system
+registry. Validation covers the storage engine constraints (`page_size`,
+`memory_budget`, `max_disk_usage_bytes`, WAL retention size) plus database
+level limits such as nonzero document size, external-storage threshold, WAL
+segment size, checkpoint threshold, checkpoint interval, and vacuum interval.
+
+`TransactionConfig::validate()` rejects zero timeout/work-accounting values
+for `idle_timeout`, `max_lifetime`, `max_intervals`, and `max_operations`.
+`max_operations` also accounts for bounded internal work such as secondary
+scan rows, pending write-set merge rows, pending create-index validation, and
+per-index document validation during writes, plus cascade-index metadata work
+during collection drops, committed catalog result rows, and pending
+catalog-overlay work during list operations, collection resolution, and DDL
+duplicate checks.
+Zero `max_scanned_bytes` and `max_scanned_docs` remain valid as restrictive
+limits that allow a deployment to forbid scans.
+
+L8 and `exdb-server` call the same validation when parsing JSON
+`default_database_config` or create-database overrides, so invalid resource
+settings fail as configuration/client errors before partial database metadata
+is persisted.
 
 ## Tests
 

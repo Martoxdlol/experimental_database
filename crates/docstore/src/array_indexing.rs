@@ -49,9 +49,12 @@ pub fn compute_index_entries(
         }
         Some(arr_idx) => {
             let array_values = &field_values[arr_idx];
-            if array_values.is_empty() || (array_values.len() == 1 && matches!(array_values[0], Scalar::Undefined)) {
+            if array_values.is_empty()
+                || (array_values.len() == 1 && matches!(array_values[0], Scalar::Undefined))
+            {
                 // Empty array after undefined fallback — produce one entry with undefined
-                let scalars: Vec<Scalar> = field_values.into_iter().map(|mut v| v.remove(0)).collect();
+                let scalars: Vec<Scalar> =
+                    field_values.into_iter().map(|mut v| v.remove(0)).collect();
                 return Ok(vec![encode_key_prefix(&scalars)]);
             }
 

@@ -67,7 +67,7 @@ As specified in `05-b5-transaction.md`.
 | 60 | `query_records_interval_even_on_empty_result` | ReadInterval recorded even when 0 rows returned | OCC must detect phantom inserts into empty ranges |
 | 61 | `create_collection_name_validation` | Names with null bytes, empty string, very long names → error | Null bytes break catalog B-tree key encoding |
 | 62 | `create_index_duplicate_fields` | `create_index("users", "idx", [age, age])` → error or allowed? | Define and test the behavior |
-| 63 | `query_with_limit_zero` | `limit = Some(0)` → empty result, no ReadInterval | Edge case — is this valid? |
+| 63 | `query_with_limit_zero_returns_empty_without_data_interval` | `limit = Some(0)` → empty result, no data ReadInterval; contrasted with nonzero limit under `max_scanned_docs = 0` | Edge case — zero limit must not scan or create phantom conflicts |
 | 64 | `write_set_ordering_deterministic` | Multiple inserts to same collection → consistent ordering in MergeView | Non-deterministic ordering → non-deterministic LimitBoundary → OCC flakiness |
 | 65 | `transaction_check_timeout_updates_last_activity` | Successful operation updates `last_activity` | Prevents false timeout on active transactions |
 
@@ -163,9 +163,9 @@ These test the `catalog_recovery.rs` module. Each test creates a storage engine,
 | 5 | `multiple_txcommits_replayed_in_order` | 3 TxCommits → all mutations applied, recovered_ts = highest | Sequential replay |
 | 6 | `replace_replayed` | TxCommit with Replace → updated doc in B-tree | Update recovery |
 | 7 | `delete_replayed` | TxCommit with Delete → tombstone in B-tree | Delete recovery |
-| 8 | `index_delta_replayed` | TxCommit with index deltas → entries in secondary B-tree | Index recovery |
+| 8 | `ready_secondary_index_rebuilt_after_replay` | TxCommit restores primary versions, then Ready secondary index rebuild produces queryable entries | Index recovery |
 | 9 | `index_ready_replayed` | IndexReady record → index state = Ready | State transition recovery |
-| 10 | `vacuum_replayed` | Vacuum record → old entries removed | Vacuum recovery |
+| 10 | `vacuum_record_is_informational_during_replay` | Vacuum record is accepted without mutating recovered state | Forward-compatible vacuum record handling |
 
 ### Ordering and Atomicity Tests
 
@@ -280,9 +280,9 @@ async fn reopen_test_db(dir: &Path) -> Database {
 
 | # | Test | Scenario | Validates |
 |---|------|----------|-----------|
-| 29 | `secondary_index_entries_survive_crash` | Create index, insert doc (with indexed field), commit, crash → index query returns doc | Index delta recovery |
-| 30 | `secondary_index_delete_survives_crash` | Insert, commit, delete, commit, crash → index query returns empty | Index delta removal recovery |
-| 31 | `secondary_index_replace_survives_crash` | Insert age=20, commit, replace age=30, commit, crash → query age=30 returns doc | Index delta update recovery |
+| 29 | `secondary_index_entries_survive_crash` | Create index, insert doc (with indexed field), commit, crash → index query returns doc | Ready index rebuild after WAL replay |
+| 30 | `secondary_index_delete_survives_crash` | Insert, commit, delete, commit, crash → index query returns empty | Ready index rebuild excludes deleted docs |
+| 31 | `secondary_index_replace_survives_crash` | Insert age=20, commit, replace age=30, commit, crash → query age=30 returns doc | Ready index rebuild uses latest visible version |
 | 32 | `compound_index_survives_crash` | Create index on [city, zip], insert doc, commit, crash → compound query works | Multi-field index recovery |
 | 33 | `array_index_entries_survive_crash` | Insert doc with tags=["a","b","c"], commit, crash → each tag queryable | Multi-entry expansion recovery |
 
@@ -305,7 +305,7 @@ async fn reopen_test_db(dir: &Path) -> Database {
 | 41 | `rollback_vacuum_removes_unreplicated_collection` | CreateCollection committed but not visible → collection gone after reopen | DDL rollback |
 | 42 | `rollback_vacuum_preserves_replicated_commits` | Commits at ts=5 (visible), ts=10 (not visible), crash → ts=5 data present, ts=10 data gone | Selective rollback |
 | 43 | `rollback_vacuum_handles_multiple_unreplicated_txs` | 3 commits after last VisibleTs, crash → all 3 rolled back | Multi-tx rollback |
-| 44 | `rollback_vacuum_writes_wal_record` | Rollback occurs, second crash, reopen → rollback not repeated | Rollback idempotency |
+| 44 | `rollback_vacuum_idempotent_after_second_reopen` | Rollback occurs, second crash/reopen remains stable without a persisted rollback summary | Rollback idempotency |
 
 ### Repeated Crash Tests
 
@@ -369,7 +369,9 @@ async fn reopen_test_db(dir: &Path) -> Database {
 | 5 | `deeply_nested_document` | 10 levels deep JSON → insert/get roundtrip |
 | 6 | `max_size_document` | 16MB document → insert, get, replace, delete |
 | 7 | `max_read_intervals_reached` | Query until max_intervals → ReadLimitExceeded |
-| 8 | `max_scanned_docs_reached` | Scan until max_scanned_docs → ReadLimitExceeded |
+| 8 | `max_operations_reached_by_repeated_transaction_operations` | Repeated operation after max_operations → ReadLimitExceeded |
+| 9 | `max_operations_counts_secondary_scan_work` | Secondary scan work after max_operations → ReadLimitExceeded |
+| 10 | `max_scanned_docs_reached` | Scan until max_scanned_docs → ReadLimitExceeded |
 | 9 | `transaction_idle_timeout` | Begin tx, sleep past idle_timeout, try operation → TransactionTimeout |
 | 10 | `transaction_max_lifetime` | Begin tx, perform operations past max_lifetime → TransactionTimeout |
 | 11 | `1000_docs_durability` | Insert 1000, checkpoint, crash, reopen → all 1000 present |
@@ -506,7 +508,7 @@ Before L6 is considered complete, ALL of the following must pass:
 - [ ] Phantom insert detection via OCC is tested (with and without LimitBoundary)
 - [ ] Subscription invalidation fires correctly under concurrent writes
 - [ ] Active transaction count reaches zero after all txns complete
-- [ ] Resource limits (max_intervals, max_scanned_docs) are enforced
+- [ ] Resource limits (max_intervals, max_operations, max_scanned_docs) are enforced
 - [ ] Transaction timeout is enforced
 - [ ] Graceful shutdown waits for active transactions
 

@@ -1,6 +1,6 @@
+use dioxus::desktop::tao::window::Icon;
 use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
-use dioxus::desktop::tao::window::Icon;
 
 mod app;
 mod components;
@@ -10,13 +10,12 @@ mod state;
 mod theme;
 
 fn main() {
-    let mut cfg = Config::new().with_window(
-        WindowBuilder::new().with_title("exdb studio"),
-    );
+    let mut cfg = Config::new().with_window(WindowBuilder::new().with_title("exdb studio"));
     if let Ok(icon) = make_icon() {
         cfg = cfg.with_icon(icon);
     }
-    cfg = cfg.with_custom_head(r#"<script>
+    cfg = cfg.with_custom_head(
+        r#"<script>
 new MutationObserver(()=>{
 document.querySelectorAll('input,textarea').forEach(el=>{
 el.setAttribute('autocorrect','off');
@@ -25,10 +24,10 @@ el.setAttribute('autocomplete','off');
 el.setAttribute('spellcheck','false');
 });
 }).observe(document.body||document.documentElement,{childList:true,subtree:true});
-</script>"#.into());
-    LaunchBuilder::desktop()
-        .with_cfg(cfg)
-        .launch(app::App);
+</script>"#
+            .into(),
+    );
+    LaunchBuilder::desktop().with_cfg(cfg).launch(app::App);
 }
 
 /// Generate a 32x32 RGBA app icon: a blue database cylinder.

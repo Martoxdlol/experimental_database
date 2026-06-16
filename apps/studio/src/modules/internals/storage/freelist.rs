@@ -15,9 +15,7 @@ pub fn FreeListModule() -> Element {
     let free_list = use_resource(move || {
         let _rev = *state.revision.read();
         let db = db.clone();
-        async move {
-            db.walk_free_list().await.ok()
-        }
+        async move { db.walk_free_list().await.ok() }
     });
 
     rsx! {

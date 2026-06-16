@@ -25,9 +25,10 @@ impl CatalogEntityType {
         match val {
             0x01 => Ok(CatalogEntityType::Collection),
             0x02 => Ok(CatalogEntityType::Index),
-            _ => Err(crate::error::StorageError::Corruption(
-                format!("unknown catalog entity type: 0x{:02x}", val),
-            )
+            _ => Err(crate::error::StorageError::Corruption(format!(
+                "unknown catalog entity type: 0x{:02x}",
+                val
+            ))
             .into()),
         }
     }
@@ -50,9 +51,10 @@ impl CatalogIndexState {
             0x01 => Ok(CatalogIndexState::Building),
             0x02 => Ok(CatalogIndexState::Ready),
             0x03 => Ok(CatalogIndexState::Dropping),
-            _ => Err(crate::error::StorageError::Corruption(
-                format!("unknown catalog index state: 0x{:02x}", val),
-            )
+            _ => Err(crate::error::StorageError::Corruption(format!(
+                "unknown catalog index state: 0x{:02x}",
+                val
+            ))
             .into()),
         }
     }
@@ -81,9 +83,10 @@ impl IndexType {
             0x02 => Ok(IndexType::Gin),
             0x03 => Ok(IndexType::FullText),
             0x04 => Ok(IndexType::Vector),
-            _ => Err(crate::error::StorageError::Corruption(
-                format!("unknown index type: 0x{:02x}", val),
-            )
+            _ => Err(crate::error::StorageError::Corruption(format!(
+                "unknown index type: 0x{:02x}",
+                val
+            ))
             .into()),
         }
     }
@@ -142,6 +145,18 @@ pub fn make_catalog_name_key(entity_type: CatalogEntityType, name: &str) -> Vec<
     key
 }
 
+/// Build a secondary catalog key for index-name lookup scoped to a collection:
+/// entity_type[1] || collection_id[8] (big-endian) || name_bytes[var] || 0x00.
+pub fn make_catalog_index_name_key(collection_id: u64, name: &str) -> Vec<u8> {
+    let name_bytes = name.as_bytes();
+    let mut key = Vec::with_capacity(1 + 8 + name_bytes.len() + 1);
+    key.push(CatalogEntityType::Index as u8);
+    key.extend_from_slice(&collection_id.to_be_bytes());
+    key.extend_from_slice(name_bytes);
+    key.push(0x00);
+    key
+}
+
 // ─── Serialization ───
 
 /// Serialize a CollectionEntry to bytes (for B-tree value).
@@ -178,10 +193,10 @@ pub fn deserialize_collection(data: &[u8]) -> io::Result<CollectionEntry> {
     offset += 2;
 
     if data.len() < offset + name_len + 4 + 8 {
-        return Err(
-            crate::error::StorageError::Corruption("collection entry truncated at name".into())
-                .into(),
-        );
+        return Err(crate::error::StorageError::Corruption(
+            "collection entry truncated at name".into(),
+        )
+        .into());
     }
 
     let name = String::from_utf8(data[offset..offset + name_len].to_vec()).map_err(|_| {
@@ -251,9 +266,7 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
     // Minimum: 8 (index_id) + 8 (collection_id) + 1 (index_type) + 2 (name_len)
     //        + 1 (field_count) + 4 (root_page) + 1 (state) + 1 (aux_count) + 2 (config_len) = 28
     if data.len() < 28 {
-        return Err(
-            crate::error::StorageError::Corruption("index entry too short".into()).into(),
-        );
+        return Err(crate::error::StorageError::Corruption("index entry too short".into()).into());
     }
 
     let mut offset = 0;
@@ -284,12 +297,10 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
     offset += name_len;
 
     if offset >= data.len() {
-        return Err(
-            crate::error::StorageError::Corruption(
-                "index entry truncated at field_count".into(),
-            )
-            .into(),
-        );
+        return Err(crate::error::StorageError::Corruption(
+            "index entry truncated at field_count".into(),
+        )
+        .into());
     }
 
     let field_count = data[offset] as usize;
@@ -298,12 +309,10 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
     let mut field_paths = Vec::with_capacity(field_count);
     for _ in 0..field_count {
         if offset >= data.len() {
-            return Err(
-                crate::error::StorageError::Corruption(
-                    "index entry truncated at segment_count".into(),
-                )
-                .into(),
-            );
+            return Err(crate::error::StorageError::Corruption(
+                "index entry truncated at segment_count".into(),
+            )
+            .into());
         }
         let segment_count = data[offset] as usize;
         offset += 1;
@@ -311,23 +320,19 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
         let mut segments = Vec::with_capacity(segment_count);
         for _ in 0..segment_count {
             if offset + 2 > data.len() {
-                return Err(
-                    crate::error::StorageError::Corruption(
-                        "index entry truncated at seg_len".into(),
-                    )
-                    .into(),
-                );
+                return Err(crate::error::StorageError::Corruption(
+                    "index entry truncated at seg_len".into(),
+                )
+                .into());
             }
             let seg_len = crate::util::read_u16_le(data, offset)? as usize;
             offset += 2;
 
             if offset + seg_len > data.len() {
-                return Err(
-                    crate::error::StorageError::Corruption(
-                        "index entry truncated at segment data".into(),
-                    )
-                    .into(),
-                );
+                return Err(crate::error::StorageError::Corruption(
+                    "index entry truncated at segment data".into(),
+                )
+                .into());
             }
             let segment =
                 String::from_utf8(data[offset..offset + seg_len].to_vec()).map_err(|_| {
@@ -342,12 +347,10 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
     }
 
     if offset + 4 + 1 > data.len() {
-        return Err(
-            crate::error::StorageError::Corruption(
-                "index entry truncated at root_page/state".into(),
-            )
-            .into(),
-        );
+        return Err(crate::error::StorageError::Corruption(
+            "index entry truncated at root_page/state".into(),
+        )
+        .into());
     }
 
     let root_page = crate::util::read_u32_le(data, offset)?;
@@ -357,23 +360,19 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
     offset += 1;
 
     if offset >= data.len() {
-        return Err(
-            crate::error::StorageError::Corruption(
-                "index entry truncated at aux_count".into(),
-            )
-            .into(),
-        );
+        return Err(crate::error::StorageError::Corruption(
+            "index entry truncated at aux_count".into(),
+        )
+        .into());
     }
     let aux_count = data[offset] as usize;
     offset += 1;
 
     if offset + aux_count * 4 > data.len() {
-        return Err(
-            crate::error::StorageError::Corruption(
-                "index entry truncated at aux_root_pages".into(),
-            )
-            .into(),
-        );
+        return Err(crate::error::StorageError::Corruption(
+            "index entry truncated at aux_root_pages".into(),
+        )
+        .into());
     }
     let mut aux_root_pages = Vec::with_capacity(aux_count);
     for _ in 0..aux_count {
@@ -383,23 +382,19 @@ pub fn deserialize_index(data: &[u8]) -> io::Result<IndexEntry> {
     }
 
     if offset + 2 > data.len() {
-        return Err(
-            crate::error::StorageError::Corruption(
-                "index entry truncated at config_len".into(),
-            )
-            .into(),
-        );
+        return Err(crate::error::StorageError::Corruption(
+            "index entry truncated at config_len".into(),
+        )
+        .into());
     }
     let config_len = crate::util::read_u16_le(data, offset)? as usize;
     offset += 2;
 
     if offset + config_len > data.len() {
-        return Err(
-            crate::error::StorageError::Corruption(
-                "index entry truncated at config".into(),
-            )
-            .into(),
-        );
+        return Err(crate::error::StorageError::Corruption(
+            "index entry truncated at config".into(),
+        )
+        .into());
     }
     let config = data[offset..offset + config_len].to_vec();
 
@@ -447,6 +442,14 @@ pub fn collection_name_scan_prefix() -> [u8; 1] {
 /// Scan prefix for all index names in the name B-tree.
 pub fn index_name_scan_prefix() -> [u8; 1] {
     [0x02]
+}
+
+/// Scan prefix for all index names in one collection.
+pub fn index_name_collection_scan_prefix(collection_id: u64) -> [u8; 9] {
+    let mut prefix = [0u8; 9];
+    prefix[0] = CatalogEntityType::Index as u8;
+    prefix[1..9].copy_from_slice(&collection_id.to_be_bytes());
+    prefix
 }
 
 #[cfg(test)]
@@ -522,6 +525,24 @@ mod tests {
         assert_ne!(keys, sorted_keys);
     }
 
+    #[test]
+    fn index_name_key_is_scoped_by_collection() {
+        let key1 = make_catalog_index_name_key(1, "email_idx");
+        let key2 = make_catalog_index_name_key(2, "email_idx");
+        let key3 = make_catalog_index_name_key(2, "name_idx");
+
+        assert_eq!(key1[0], CatalogEntityType::Index as u8);
+        assert_eq!(u64::from_be_bytes(key1[1..9].try_into().unwrap()), 1);
+        assert_eq!(&key1[9..key1.len() - 1], b"email_idx");
+        assert_eq!(*key1.last().unwrap(), 0x00);
+        assert_ne!(key1, key2);
+
+        let prefix = index_name_collection_scan_prefix(2);
+        assert!(key2.starts_with(&prefix));
+        assert!(key3.starts_with(&prefix));
+        assert!(!key1.starts_with(&prefix));
+    }
+
     // ─── Test 3: Collection serialize/deserialize ───
     // Roundtrip a CollectionEntry through serialize + deserialize.
     #[test]
@@ -549,7 +570,11 @@ mod tests {
             name: "user_email_idx".to_string(),
             field_paths: vec![
                 vec!["user".to_string(), "email".to_string()],
-                vec!["profile".to_string(), "name".to_string(), "first".to_string()],
+                vec![
+                    "profile".to_string(),
+                    "name".to_string(),
+                    "first".to_string(),
+                ],
             ],
             root_page: 200,
             state: CatalogIndexState::Ready,
@@ -582,7 +607,10 @@ mod tests {
         let col_key = make_catalog_id_key(CatalogEntityType::Collection, 999);
         let idx_key = make_catalog_id_key(CatalogEntityType::Index, 1);
 
-        assert!(col_key < idx_key, "collection keys (0x01) should sort before index keys (0x02)");
+        assert!(
+            col_key < idx_key,
+            "collection keys (0x01) should sort before index keys (0x02)"
+        );
     }
 
     // ─── Test 7: Dual B-tree insert + lookup ───
@@ -610,10 +638,17 @@ mod tests {
         // Insert into Name B-tree.
         let name_key = make_catalog_name_key(CatalogEntityType::Collection, &entry.name);
         let name_value = serialize_name_value(entry.collection_id);
-        name_btree.insert(&name_key, &name_value, &mut fl).await.unwrap();
+        name_btree
+            .insert(&name_key, &name_value, &mut fl)
+            .await
+            .unwrap();
 
         // Look up by ID.
-        let found_value = id_btree.get(&id_key).await.unwrap().expect("should find by ID");
+        let found_value = id_btree
+            .get(&id_key)
+            .await
+            .unwrap()
+            .expect("should find by ID");
         let found_entry = deserialize_collection(&found_value).unwrap();
         assert_eq!(found_entry, entry);
 
@@ -672,9 +707,9 @@ mod tests {
         let upper_prefix = index_id_scan_prefix();
         let upper = Bound::Excluded(upper_prefix.as_slice());
 
-        let results = collect_scan(
-            id_btree.scan(lower, upper, ScanDirection::Forward),
-        ).await.unwrap();
+        let results = collect_scan(id_btree.scan(lower, upper, ScanDirection::Forward))
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 5);
 
@@ -731,9 +766,9 @@ mod tests {
         let upper_byte: [u8; 1] = [0x03];
         let upper = Bound::Excluded(upper_byte.as_slice());
 
-        let results = collect_scan(
-            id_btree.scan(lower, upper, ScanDirection::Forward),
-        ).await.unwrap();
+        let results = collect_scan(id_btree.scan(lower, upper, ScanDirection::Forward))
+            .await
+            .unwrap();
 
         assert_eq!(results.len(), 3);
 

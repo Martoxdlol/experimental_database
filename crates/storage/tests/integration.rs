@@ -11,6 +11,7 @@
 //! - Custom backends
 
 use std::collections::BTreeMap;
+use std::io::{Seek, Write};
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -24,6 +25,7 @@ use exdb_storage::catalog_btree::{
 };
 use exdb_storage::engine::{StorageConfig, StorageEngine};
 use exdb_storage::heap::HeapRef;
+use exdb_storage::page::{PageType, SlottedPage};
 use exdb_storage::recovery::{NoOpHandler, WalRecordHandler};
 use exdb_storage::vacuum::VacuumEntry;
 use exdb_storage::wal::WalRecord;
@@ -73,7 +75,9 @@ async fn test_full_lifecycle_1000_entries() {
 
     let root_page;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
 
         let handle = engine.create_btree().await.unwrap();
 
@@ -81,7 +85,10 @@ async fn test_full_lifecycle_1000_entries() {
         for i in 0u32..1000 {
             let key = format!("key-{:06}", i);
             let value = format!("value-{:06}", i);
-            handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
+            handle
+                .insert(key.as_bytes(), value.as_bytes())
+                .await
+                .unwrap();
         }
 
         // Save root page AFTER inserts (root may change due to splits).
@@ -94,7 +101,9 @@ async fn test_full_lifecycle_1000_entries() {
 
     // Reopen and verify all 1000 entries.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
 
         let handle = engine.open_btree(root_page);
         for i in 0u32..1000 {
@@ -190,7 +199,10 @@ async fn test_custom_backend() {
 
     let handle = engine.create_btree().await.unwrap();
     handle.insert(b"custom", b"backend").await.unwrap();
-    assert_eq!(handle.get(b"custom").await.unwrap(), Some(b"backend".to_vec()));
+    assert_eq!(
+        handle.get(b"custom").await.unwrap(),
+        Some(b"backend".to_vec())
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -205,7 +217,9 @@ async fn test_crash_recovery_end_to_end() {
     // Phase 1: Open, checkpoint once (so file structure is valid), then append
     // more WAL records AFTER the checkpoint, and simulate crash.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
 
         // First checkpoint to establish a valid on-disk state.
         engine.checkpoint().await.unwrap();
@@ -227,7 +241,9 @@ async fn test_crash_recovery_end_to_end() {
     // Phase 2: Reopen with a collecting handler to verify WAL replay.
     {
         let mut handler = CollectingHandler::new();
-        let engine = StorageEngine::open(&path, small_config(), &mut handler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut handler)
+            .await
+            .unwrap();
 
         // The handler should have seen the post-checkpoint WAL records replayed.
         assert!(
@@ -257,8 +273,12 @@ async fn test_multiple_engines_isolation() {
     let path1 = tmp.path().join("db1");
     let path2 = tmp.path().join("db2");
 
-    let engine1 = StorageEngine::open(&path1, small_config(), &mut NoOpHandler).await.unwrap();
-    let engine2 = StorageEngine::open(&path2, small_config(), &mut NoOpHandler).await.unwrap();
+    let engine1 = StorageEngine::open(&path1, small_config(), &mut NoOpHandler)
+        .await
+        .unwrap();
+    let engine2 = StorageEngine::open(&path2, small_config(), &mut NoOpHandler)
+        .await
+        .unwrap();
 
     let bt1 = engine1.create_btree().await.unwrap();
     let bt2 = engine2.create_btree().await.unwrap();
@@ -287,7 +307,9 @@ async fn test_catalog_btree_persistence() {
     let path = tmp.path().join("catalog_db");
 
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let fh = engine.file_header().await;
         let catalog_root = fh.catalog_root_page.get();
         let name_root = fh.catalog_name_root_page.get();
@@ -340,7 +362,7 @@ async fn test_catalog_btree_persistence() {
         catalog.insert(&idx_key, &idx_val).await.unwrap();
 
         let idx_name_key =
-            catalog_btree::make_catalog_name_key(CatalogEntityType::Index, &idx1.name);
+            catalog_btree::make_catalog_index_name_key(idx1.collection_id, &idx1.name);
         let idx_name_val = catalog_btree::serialize_name_value(idx1.index_id);
         name_idx.insert(&idx_name_key, &idx_name_val).await.unwrap();
 
@@ -350,7 +372,9 @@ async fn test_catalog_btree_persistence() {
 
     // Reopen and verify catalog entries.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let fh = engine.file_header().await;
         let catalog = engine.open_btree(fh.catalog_root_page.get());
         let name_idx = engine.open_btree(fh.catalog_name_root_page.get());
@@ -452,7 +476,10 @@ async fn test_vacuum_through_engine() {
     for i in 0u32..50 {
         let key = format!("vac-{:04}", i);
         let value = format!("val-{:04}", i);
-        handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
+        handle
+            .insert(key.as_bytes(), value.as_bytes())
+            .await
+            .unwrap();
     }
 
     // Vacuum some entries.
@@ -596,7 +623,8 @@ async fn test_btree_delete_and_reinsert() {
     // Total scan should show 100 odd + 25 re-inserted = 125 entries.
     let count = handle
         .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-        .fold(0usize, |acc, _| acc + 1).await;
+        .fold(0usize, |acc, _| acc + 1)
+        .await;
     assert_eq!(count, 125);
 }
 
@@ -664,7 +692,9 @@ async fn test_checkpoint_recovery_roundtrip() {
     let root1;
     let root2;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
 
         // Create two btrees with data.
         let bt1 = engine.create_btree().await.unwrap();
@@ -712,7 +742,9 @@ async fn test_checkpoint_recovery_roundtrip() {
 
     // Reopen and verify all data (pre- and post-first-checkpoint).
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
 
         let bt1 = engine.open_btree(root1);
         let bt2 = engine.open_btree(root2);
@@ -774,7 +806,8 @@ async fn test_btree_update_existing_keys() {
     // Total count should still be 50 (not 100).
     let count = handle
         .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-        .fold(0usize, |acc, _| acc + 1).await;
+        .fold(0usize, |acc, _| acc + 1)
+        .await;
     assert_eq!(count, 50);
 }
 
@@ -790,7 +823,9 @@ async fn test_file_header_persistence() {
     let path = tmp.path().join("header_db");
 
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
 
         engine
             .update_file_header(|fh| {
@@ -807,7 +842,9 @@ async fn test_file_header_persistence() {
     }
 
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let fh = engine.file_header().await;
 
         assert_eq!(fh.visible_ts.get(), 99999);
@@ -864,7 +901,10 @@ async fn test_heap_btree_reference_pattern() {
 
         // Store in heap, put heap ref in btree.
         let href = engine.heap_store(&large_value).await.unwrap();
-        handle.insert(key.as_bytes(), &href.to_bytes()).await.unwrap();
+        handle
+            .insert(key.as_bytes(), &href.to_bytes())
+            .await
+            .unwrap();
 
         expected.insert(key.into_bytes(), large_value);
     }
@@ -889,14 +929,19 @@ async fn test_reopen_preserves_complex_btree() {
 
     let root;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.create_btree().await.unwrap();
 
         // Insert 500 entries.
         for i in 0u32..500 {
             let key = format!("cplx-{:06}", i);
             let value = format!("data-{}", i);
-            handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
+            handle
+                .insert(key.as_bytes(), value.as_bytes())
+                .await
+                .unwrap();
         }
 
         // Delete every 3rd entry.
@@ -920,7 +965,9 @@ async fn test_reopen_preserves_complex_btree() {
 
     // Reopen and verify.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.open_btree(root);
 
         for i in 0u32..500 {
@@ -1043,7 +1090,10 @@ async fn test_many_btrees() {
         for i in 0u32..50 {
             let key = format!("t{}-k{}", t, i);
             let value = format!("t{}-v{}", t, i);
-            handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
+            handle
+                .insert(key.as_bytes(), value.as_bytes())
+                .await
+                .unwrap();
         }
     }
 
@@ -1051,7 +1101,8 @@ async fn test_many_btrees() {
     for (t, handle) in handles.iter().enumerate() {
         let count = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .fold(0usize, |acc, _| acc + 1).await;
+            .fold(0usize, |acc, _| acc + 1)
+            .await;
         assert_eq!(count, 50, "tree {} should have 50 entries", t);
 
         let key = format!("t{}-k{}", t, 25);
@@ -1075,7 +1126,9 @@ async fn test_no_checkpoint_data_lost() {
     let root_page;
     // Phase 1: create btree, checkpoint so root page exists on disk.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.create_btree().await.unwrap();
         root_page = handle.root_page();
         engine.checkpoint().await.unwrap();
@@ -1084,7 +1137,9 @@ async fn test_no_checkpoint_data_lost() {
 
     // Phase 2: reopen, insert data, do NOT checkpoint — simulate crash.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.open_btree(root_page);
 
         for i in 0u32..50 {
@@ -1101,7 +1156,9 @@ async fn test_no_checkpoint_data_lost() {
     // be in the btree pages (they were never flushed to disk).
     {
         let mut handler = CollectingHandler::new();
-        let engine = StorageEngine::open(&path, small_config(), &mut handler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut handler)
+            .await
+            .unwrap();
 
         let handle = engine.open_btree(root_page);
         let entries: Vec<_> = handle
@@ -1132,7 +1189,9 @@ async fn test_multiple_reopen_cycles() {
     let mut root;
     // Cycle 1: create btree, insert 0..100
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.create_btree().await.unwrap();
 
         for i in 0u32..100 {
@@ -1146,7 +1205,9 @@ async fn test_multiple_reopen_cycles() {
 
     // Cycle 2: reopen, insert 100..200, update some from cycle 1
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.open_btree(root);
 
         for i in 100u32..200 {
@@ -1167,7 +1228,9 @@ async fn test_multiple_reopen_cycles() {
 
     // Cycle 3: reopen, delete some, insert 200..250
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.open_btree(root);
 
         // Delete 50..60.
@@ -1188,7 +1251,9 @@ async fn test_multiple_reopen_cycles() {
 
     // Final verify: reopen and check all data.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.open_btree(root);
 
         // 0..10 should be "updated".
@@ -1255,7 +1320,8 @@ async fn test_multiple_reopen_cycles() {
         // Total: 10 + 40 + 0 + 40 + 100 + 50 = 240.
         let count = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .fold(0usize, |acc, _| acc + 1).await;
+            .fold(0usize, |acc, _| acc + 1)
+            .await;
         assert_eq!(count, 240);
 
         engine.close().await.unwrap();
@@ -1275,7 +1341,9 @@ async fn test_heap_persistence_file_backed() {
     let btree_root;
 
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.create_btree().await.unwrap();
 
         // Store blobs of varying sizes: small, medium, and large (overflow).
@@ -1299,7 +1367,9 @@ async fn test_heap_persistence_file_backed() {
 
     // Reopen and verify all blobs.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.open_btree(btree_root);
 
         for (idx, (expected_href_bytes, expected_data)) in refs_and_data.iter().enumerate() {
@@ -1343,7 +1413,9 @@ async fn test_page_size_mismatch_on_reopen() {
             memory_budget: 4096 * 64,
             ..Default::default()
         };
-        let engine = StorageEngine::open(&path, config, &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, config, &mut NoOpHandler)
+            .await
+            .unwrap();
         engine.checkpoint().await.unwrap();
         engine.close().await.unwrap();
     }
@@ -1372,7 +1444,9 @@ async fn test_free_list_persistence() {
     let freed_pages;
     let page_count_before_close;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
 
         // Allocate several pages via btree inserts to grow the file.
         let handle = engine.create_btree().await.unwrap();
@@ -1388,6 +1462,10 @@ async fn test_free_list_persistence() {
             let mut fl = engine.free_list().lock().await;
             for _ in 0..5 {
                 let page_id = fl.allocate().await.unwrap();
+                {
+                    let mut guard = engine.buffer_pool().new_page(page_id).unwrap();
+                    SlottedPage::init(guard.data_mut(), page_id, PageType::Heap);
+                }
                 pages_to_free.push(page_id);
             }
             // Now free them back.
@@ -1409,7 +1487,9 @@ async fn test_free_list_persistence() {
 
     // Reopen and verify free list was restored.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
 
         // Free list head should be non-zero (restored from file header).
         let free_head = engine.free_list().lock().await.head();
@@ -1476,7 +1556,7 @@ async fn test_truncated_wal_frame_recovery() {
         let payload_len = 100u32;
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&[0x01]);
-        hasher.update(&vec![0xAB; 100]);
+        hasher.update(&[0xAB; 100]);
         let crc = hasher.finalize();
 
         let mut partial_frame = Vec::new();
@@ -1531,7 +1611,9 @@ async fn test_multiple_crash_recovery_cycles() {
 
     // Session 1: create, insert, checkpoint, then insert more WITHOUT checkpoint → crash.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.create_btree().await.unwrap();
 
         for i in 0u32..50 {
@@ -1553,7 +1635,9 @@ async fn test_multiple_crash_recovery_cycles() {
     // Recovery 1.
     {
         let mut handler = CollectingHandler::new();
-        let engine = StorageEngine::open(&path, small_config(), &mut handler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut handler)
+            .await
+            .unwrap();
 
         assert!(
             !handler.records.is_empty(),
@@ -1589,7 +1673,9 @@ async fn test_multiple_crash_recovery_cycles() {
     // Recovery 2.
     {
         let mut handler = CollectingHandler::new();
-        let engine = StorageEngine::open(&path, small_config(), &mut handler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut handler)
+            .await
+            .unwrap();
 
         assert!(
             !handler.records.is_empty(),
@@ -1622,7 +1708,7 @@ async fn test_multiple_crash_recovery_cycles() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Test 38: Corrupt file header on reopen
+// Test 38: Corrupt primary file header is recovered from shadow
 // ═══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -1632,7 +1718,9 @@ async fn test_corrupt_file_header_reopen() {
 
     // Create a valid database.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         engine.checkpoint().await.unwrap();
         engine.close().await.unwrap();
     }
@@ -1652,18 +1740,244 @@ async fn test_corrupt_file_header_reopen() {
         file.sync_data().unwrap();
     }
 
-    // Reopen should fail with a clear error.
+    // Reopen should restore page 0 from the trailing shadow header.
+    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+        .await
+        .unwrap();
+    let fh = engine.file_header().await;
+    assert_eq!(fh.magic.get(), 0x45584442);
+    let report = engine.check_integrity().await.unwrap();
+    assert!(
+        report.is_ok(),
+        "restored header should pass integrity: {:?}",
+        report.issues
+    );
+    engine.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_corrupt_file_header_and_shadow_reopen_fails() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("corrupt_hdr_shadow_db");
+
+    {
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
+        engine.checkpoint().await.unwrap();
+        engine.close().await.unwrap();
+    }
+
+    {
+        use std::io::{Seek, Write};
+        let data_path = path.join("data.db");
+        let page_size = small_config().page_size as u64;
+        let page_count = std::fs::metadata(&data_path).unwrap().len() / page_size;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&data_path)
+            .unwrap();
+
+        file.seek(std::io::SeekFrom::Start(32)).unwrap();
+        file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+
+        let shadow_magic_offset = (page_count - 1) * page_size + 32;
+        file.seek(std::io::SeekFrom::Start(shadow_magic_offset))
+            .unwrap();
+        file.write_all(&[0xBA, 0xAD, 0xF0, 0x0D]).unwrap();
+        file.sync_data().unwrap();
+    }
+
     let result = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await;
     assert!(
         result.is_err(),
-        "corrupt file header should cause open to fail"
+        "corrupt primary and shadow headers should cause open to fail"
     );
     let err = result.err().expect("should be an error");
     assert!(
-        err.to_string().contains("magic") || err.to_string().contains("mismatch"),
-        "error should mention magic/mismatch: {}",
+        err.to_string().contains("primary file header")
+            || err.to_string().contains("shadow header"),
+        "error should mention primary/shadow header recovery: {}",
         err
     );
+}
+
+#[tokio::test]
+async fn test_repair_integrity_rewrites_stale_file_header_shadow() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("repair_hdr_shadow_db");
+
+    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+        .await
+        .unwrap();
+    engine.checkpoint().await.unwrap();
+
+    engine
+        .update_file_header(|fh| {
+            fh._reserved[0] = fh._reserved[0].wrapping_add(1);
+        })
+        .await
+        .unwrap();
+
+    let before = engine.check_integrity().await.unwrap();
+    assert!(
+        before
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("file-header shadow")),
+        "expected stale shadow warning before repair: {:?}",
+        before.issues
+    );
+
+    let repair = engine.repair_integrity().await.unwrap();
+    assert!(repair.repaired(), "expected a header-shadow repair");
+    assert!(
+        repair.is_clean(),
+        "expected repair to leave clean storage, remaining issues: {:?}",
+        repair.remaining_issues
+    );
+
+    let after = engine.check_integrity().await.unwrap();
+    assert!(
+        after.is_ok(),
+        "repaired header shadow should pass integrity: {:?}",
+        after.issues
+    );
+    engine.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_repair_integrity_refreshes_stale_file_header_metadata() {
+    use zerocopy::byteorder::{U32, U64};
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("repair_hdr_metadata_db");
+
+    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+        .await
+        .unwrap();
+    let handle = engine.create_btree().await.unwrap();
+    handle.insert(b"alice", b"engineer").await.unwrap();
+    engine.checkpoint().await.unwrap();
+
+    let live_page_count = engine.file_header().await.page_count.get();
+    assert!(live_page_count > 1);
+    engine
+        .update_file_header(|fh| {
+            fh.page_count = U64::new(live_page_count - 1);
+            fh.free_list_head = U32::new(123_456);
+        })
+        .await
+        .unwrap();
+
+    let before = engine.check_integrity().await.unwrap();
+    assert!(
+        before
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("file header page_count")),
+        "expected stale page_count warning before repair: {:?}",
+        before.issues
+    );
+    assert!(
+        before
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("file header free_list_head")),
+        "expected stale free_list_head warning before repair: {:?}",
+        before.issues
+    );
+
+    let repair = engine.repair_integrity().await.unwrap();
+    assert!(
+        repair.repairs.iter().any(|repair| repair
+            .message
+            .contains("refreshed durable file header page_count/free_list_head")),
+        "expected file-header metadata repair action: {:?}",
+        repair.repairs
+    );
+    assert!(
+        repair.is_clean(),
+        "expected repair to leave clean storage, remaining issues: {:?}",
+        repair.remaining_issues
+    );
+
+    let after = engine.check_integrity().await.unwrap();
+    assert!(
+        after.is_ok(),
+        "repaired file-header metadata should pass integrity: {:?}",
+        after.issues
+    );
+    engine.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_repair_integrity_truncates_trailing_data_file_bytes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let path = tmp.path().join("repair_trailing_data_db");
+    let page_size = small_config().page_size as u64;
+
+    {
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
+        let handle = engine.create_btree().await.unwrap();
+        handle.insert(b"alice", b"engineer").await.unwrap();
+        engine.checkpoint().await.unwrap();
+        engine.close().await.unwrap();
+    }
+
+    let data_path = path.join("data.db");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&data_path)
+            .unwrap();
+        let len = file.metadata().unwrap().len();
+        assert_eq!(len % page_size, 0);
+        file.seek(std::io::SeekFrom::Start(len)).unwrap();
+        file.write_all(&[0xA5]).unwrap();
+        file.sync_data().unwrap();
+    }
+
+    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+        .await
+        .unwrap();
+    let before = engine.check_integrity().await.unwrap();
+    assert!(
+        before
+            .issues
+            .iter()
+            .any(|issue| issue.message.contains("data file size")),
+        "expected trailing data-file bytes to be reported before repair: {:?}",
+        before.issues
+    );
+
+    let repair = engine.repair_integrity().await.unwrap();
+    assert!(
+        repair.repairs.iter().any(|repair| repair
+            .message
+            .contains("truncated 1 trailing data-file byte")),
+        "expected trailing-byte truncation repair: {:?}",
+        repair.repairs
+    );
+    assert!(
+        repair.is_clean(),
+        "expected repair to leave clean storage, remaining issues: {:?}",
+        repair.remaining_issues
+    );
+
+    let after = engine.check_integrity().await.unwrap();
+    assert!(
+        after.is_ok(),
+        "repaired data-file size should pass integrity: {:?}",
+        after.issues
+    );
+    engine.close().await.unwrap();
+
+    let len = std::fs::metadata(&data_path).unwrap().len();
+    assert_eq!(len % page_size, 0, "repair should restore page alignment");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1678,7 +1992,9 @@ async fn test_empty_database_reopen() {
     let catalog_root;
     let catalog_name_root;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let fh = engine.file_header().await;
         catalog_root = fh.catalog_root_page.get();
         catalog_name_root = fh.catalog_name_root_page.get();
@@ -1690,7 +2006,9 @@ async fn test_empty_database_reopen() {
 
     // Reopen and verify empty state.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let fh = engine.file_header().await;
 
         assert_eq!(fh.catalog_root_page.get(), catalog_root);
@@ -1732,13 +2050,18 @@ async fn test_vacuum_persistence_file_backed() {
 
     let root;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.create_btree().await.unwrap();
 
         for i in 0u32..100 {
             let key = format!("vp-{:04}", i);
             let value = format!("val-{}", i);
-            handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
+            handle
+                .insert(key.as_bytes(), value.as_bytes())
+                .await
+                .unwrap();
         }
         root = handle.root_page();
 
@@ -1758,7 +2081,9 @@ async fn test_vacuum_persistence_file_backed() {
 
     // Reopen and verify vacuum results persisted.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.open_btree(root);
 
         for i in 0u32..40 {
@@ -1783,7 +2108,8 @@ async fn test_vacuum_persistence_file_backed() {
 
         let count = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .fold(0usize, |acc, _| acc + 1).await;
+            .fold(0usize, |acc, _| acc + 1)
+            .await;
         assert_eq!(count, 60);
 
         engine.close().await.unwrap();
@@ -1912,7 +2238,9 @@ async fn test_buffer_pool_extreme_pressure() {
         ..Default::default()
     };
 
-    let engine = StorageEngine::open(&path, config, &mut NoOpHandler).await.unwrap();
+    let engine = StorageEngine::open(&path, config, &mut NoOpHandler)
+        .await
+        .unwrap();
 
     // Create 3 btrees — forces heavy eviction with only 8 frames.
     let mut handles = Vec::new();
@@ -1924,7 +2252,10 @@ async fn test_buffer_pool_extreme_pressure() {
         for i in 0u32..100 {
             let key = format!("t{}-k{:04}", t, i);
             let value = format!("t{}-v{:04}", t, i);
-            handle.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
+            handle
+                .insert(key.as_bytes(), value.as_bytes())
+                .await
+                .unwrap();
         }
     }
 
@@ -1943,7 +2274,8 @@ async fn test_buffer_pool_extreme_pressure() {
         }
         let count = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .fold(0usize, |acc, _| acc + 1).await;
+            .fold(0usize, |acc, _| acc + 1)
+            .await;
         assert_eq!(count, 100, "tree {} should have 100 entries", t);
     }
 
@@ -1953,12 +2285,15 @@ async fn test_buffer_pool_extreme_pressure() {
     engine.close().await.unwrap();
     drop(handles);
 
-    let engine2 = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+    let engine2 = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+        .await
+        .unwrap();
     for (t, &root) in roots.iter().enumerate() {
         let handle = engine2.open_btree(root);
         let count = handle
             .scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward)
-            .fold(0usize, |acc, _| acc + 1).await;
+            .fold(0usize, |acc, _| acc + 1)
+            .await;
         assert_eq!(
             count, 100,
             "tree {} should have 100 entries after reopen",
@@ -1977,7 +2312,9 @@ async fn test_double_close() {
     let tmp = tempfile::TempDir::new().unwrap();
     let path = tmp.path().join("double_close_db");
 
-    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+        .await
+        .unwrap();
     let handle = engine.create_btree().await.unwrap();
     let root = handle.root_page();
     handle.insert(b"key", b"value").await.unwrap();
@@ -1992,7 +2329,9 @@ async fn test_double_close() {
     drop(result);
 
     // Reopen and verify data is intact.
-    let engine2 = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+    let engine2 = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+        .await
+        .unwrap();
     let handle2 = engine2.open_btree(root);
     assert_eq!(
         handle2.get(b"key").await.unwrap(),
@@ -2014,11 +2353,15 @@ async fn test_reopen_fresh_db_without_checkpoint() {
     let path = tmp.path().join("fresh_no_ckpt");
 
     {
-        let _engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let _engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         // Drop without checkpoint or close.
     }
 
-    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+    let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+        .await
+        .unwrap();
     // Verify the catalog roots are valid by creating a btree (touches the free list + catalog).
     let handle = engine.create_btree().await.unwrap();
     handle.insert(b"k", b"v").await.unwrap();
@@ -2039,7 +2382,9 @@ async fn test_heap_store_after_reopen() {
 
     let btree_root;
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.create_btree().await.unwrap();
         btree_root = handle.root_page();
 
@@ -2054,7 +2399,9 @@ async fn test_heap_store_after_reopen() {
 
     // Reopen — free space map is empty.
     {
-        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler).await.unwrap();
+        let engine = StorageEngine::open(&path, small_config(), &mut NoOpHandler)
+            .await
+            .unwrap();
         let handle = engine.open_btree(btree_root);
 
         // Old blob is still loadable.

@@ -183,9 +183,17 @@ fn NavItem(
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
     let class = if disabled {
-        if nested { "nav-item nested disabled" } else { "nav-item disabled" }
+        if nested {
+            "nav-item nested disabled"
+        } else {
+            "nav-item disabled"
+        }
     } else if active {
-        if nested { "nav-item nested active" } else { "nav-item active" }
+        if nested {
+            "nav-item nested active"
+        } else {
+            "nav-item active"
+        }
     } else if nested {
         "nav-item nested"
     } else {

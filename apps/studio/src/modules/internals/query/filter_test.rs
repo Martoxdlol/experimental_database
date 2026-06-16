@@ -6,8 +6,10 @@ use super::scan::parse_filter;
 
 #[component]
 pub fn FilterTestModule() -> Element {
-    let mut doc_json: Signal<String> = use_signal(|| r#"{"name": "alice", "age": 30, "active": true}"#.to_string());
-    let mut filter_json: Signal<String> = use_signal(|| r#"{"And": [{"Gte": ["age", 18]}, {"Eq": ["active", true]}]}"#.to_string());
+    let mut doc_json: Signal<String> =
+        use_signal(|| r#"{"name": "alice", "age": 30, "active": true}"#.to_string());
+    let mut filter_json: Signal<String> =
+        use_signal(|| r#"{"And": [{"Gte": ["age", 18]}, {"Eq": ["active", true]}]}"#.to_string());
     let mut result: Signal<Option<Result<bool, String>>> = use_signal(|| None);
 
     rsx! {
@@ -109,8 +111,8 @@ Type-strict: int64(5) != float64(5.0)"#
 }
 
 fn evaluate_filter(doc_json: &str, filter_json: &str) -> Result<bool, String> {
-    let doc: serde_json::Value = serde_json::from_str(doc_json)
-        .map_err(|e| format!("Invalid document JSON: {e}"))?;
+    let doc: serde_json::Value =
+        serde_json::from_str(doc_json).map_err(|e| format!("Invalid document JSON: {e}"))?;
     let filter = parse_filter(filter_json)?;
     Ok(filter_matches(&doc, &filter))
 }

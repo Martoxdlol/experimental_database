@@ -143,25 +143,27 @@ impl StorageHandle {
     }
 
     pub async fn update_file_header_field(&self, field: &str, value: u64) -> io::Result<()> {
-        use zerocopy::byteorder::LittleEndian;
         use zerocopy::U32;
         use zerocopy::U64;
-        self.engine.update_file_header(|fh| match field {
-            "page_count" => fh.page_count = U64::<LittleEndian>::new(value),
-            "free_list_head" => fh.free_list_head = U32::<LittleEndian>::new(value as u32),
-            "catalog_root_page" => {
-                fh.catalog_root_page = U32::<LittleEndian>::new(value as u32)
-            }
-            "catalog_name_root_page" => {
-                fh.catalog_name_root_page = U32::<LittleEndian>::new(value as u32)
-            }
-            "checkpoint_lsn" => fh.checkpoint_lsn = U64::<LittleEndian>::new(value),
-            "visible_ts" => fh.visible_ts = U64::<LittleEndian>::new(value),
-            "generation" => fh.generation = U64::<LittleEndian>::new(value),
-            "next_collection_id" => fh.next_collection_id = U64::<LittleEndian>::new(value),
-            "next_index_id" => fh.next_index_id = U64::<LittleEndian>::new(value),
-            _ => {}
-        }).await
+        use zerocopy::byteorder::LittleEndian;
+        self.engine
+            .update_file_header(|fh| match field {
+                "page_count" => fh.page_count = U64::<LittleEndian>::new(value),
+                "free_list_head" => fh.free_list_head = U32::<LittleEndian>::new(value as u32),
+                "catalog_root_page" => {
+                    fh.catalog_root_page = U32::<LittleEndian>::new(value as u32)
+                }
+                "catalog_name_root_page" => {
+                    fh.catalog_name_root_page = U32::<LittleEndian>::new(value as u32)
+                }
+                "checkpoint_lsn" => fh.checkpoint_lsn = U64::<LittleEndian>::new(value),
+                "visible_ts" => fh.visible_ts = U64::<LittleEndian>::new(value),
+                "generation" => fh.generation = U64::<LittleEndian>::new(value),
+                "next_collection_id" => fh.next_collection_id = U64::<LittleEndian>::new(value),
+                "next_index_id" => fh.next_index_id = U64::<LittleEndian>::new(value),
+                _ => {}
+            })
+            .await
     }
 
     // ─── Page Access ───
@@ -231,14 +233,22 @@ impl StorageHandle {
     // ─── Page Write ───
 
     pub async fn init_page(&self, page_id: u32, page_type: PageType) -> io::Result<()> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
+        let mut guard = self
+            .engine
+            .buffer_pool()
+            .fetch_page_exclusive(page_id)
+            .await?;
         let buf = guard.data_mut();
         SlottedPage::init(buf, page_id, page_type);
         Ok(())
     }
 
     pub async fn insert_slot(&self, page_id: u32, data: &[u8]) -> io::Result<u16> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
+        let mut guard = self
+            .engine
+            .buffer_pool()
+            .fetch_page_exclusive(page_id)
+            .await?;
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.insert_slot(data)
@@ -246,7 +256,11 @@ impl StorageHandle {
     }
 
     pub async fn update_slot(&self, page_id: u32, slot: u16, data: &[u8]) -> io::Result<()> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
+        let mut guard = self
+            .engine
+            .buffer_pool()
+            .fetch_page_exclusive(page_id)
+            .await?;
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.update_slot(slot, data)
@@ -254,7 +268,11 @@ impl StorageHandle {
     }
 
     pub async fn delete_slot(&self, page_id: u32, slot: u16) -> io::Result<()> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
+        let mut guard = self
+            .engine
+            .buffer_pool()
+            .fetch_page_exclusive(page_id)
+            .await?;
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.delete_slot(slot);
@@ -262,7 +280,11 @@ impl StorageHandle {
     }
 
     pub async fn compact_page(&self, page_id: u32) -> io::Result<()> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
+        let mut guard = self
+            .engine
+            .buffer_pool()
+            .fetch_page_exclusive(page_id)
+            .await?;
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.compact();
@@ -270,7 +292,11 @@ impl StorageHandle {
     }
 
     pub async fn stamp_checksum(&self, page_id: u32) -> io::Result<()> {
-        let mut guard = self.engine.buffer_pool().fetch_page_exclusive(page_id).await?;
+        let mut guard = self
+            .engine
+            .buffer_pool()
+            .fetch_page_exclusive(page_id)
+            .await?;
         let buf = guard.data_mut();
         let mut page = SlottedPage::from_buf(buf)?;
         page.stamp_checksum();
@@ -352,8 +378,12 @@ impl StorageHandle {
                     if data.len() >= 2 + key_len + 4 {
                         let key = data[2..2 + key_len].to_vec();
                         let child_bytes = &data[2 + key_len..2 + key_len + 4];
-                        let child =
-                            u32::from_le_bytes([child_bytes[0], child_bytes[1], child_bytes[2], child_bytes[3]]);
+                        let child = u32::from_le_bytes([
+                            child_bytes[0],
+                            child_bytes[1],
+                            child_bytes[2],
+                            child_bytes[3],
+                        ]);
                         entries.push(BTreeEntryInfo {
                             key,
                             value: child_bytes.to_vec(),
@@ -482,7 +512,9 @@ impl StorageHandle {
             let (_key, value) = entry?;
             if let Ok(ce) = catalog_btree::deserialize_collection(&value) {
                 // Now find indexes for this collection
-                let indexes = self.list_indexes_for(catalog_root, ce.collection_id).await?;
+                let indexes = self
+                    .list_indexes_for(catalog_root, ce.collection_id)
+                    .await?;
                 collections.push(CollectionInfo {
                     id: ce.collection_id,
                     name: ce.name,
@@ -496,7 +528,11 @@ impl StorageHandle {
         Ok(collections)
     }
 
-    async fn list_indexes_for(&self, catalog_root: u32, collection_id: u64) -> io::Result<Vec<IndexInfo>> {
+    async fn list_indexes_for(
+        &self,
+        catalog_root: u32,
+        collection_id: u64,
+    ) -> io::Result<Vec<IndexInfo>> {
         let tree = self.engine.open_btree(catalog_root);
         let mut indexes = Vec::new();
 
@@ -514,19 +550,20 @@ impl StorageHandle {
         while let Some(entry) = scanner.next().await {
             let (_, value) = entry?;
             if let Ok(ie) = catalog_btree::deserialize_index(&value)
-                && ie.collection_id == collection_id {
-                    indexes.push(IndexInfo {
-                        id: ie.index_id,
-                        name: ie.name,
-                        root_page: ie.root_page,
-                        status: match ie.state {
-                            CatalogIndexState::Ready => "Ready".to_string(),
-                            CatalogIndexState::Building => "Building".to_string(),
-                            CatalogIndexState::Dropping => "Dropping".to_string(),
-                        },
-                        field_paths: ie.field_paths,
-                    });
-                }
+                && ie.collection_id == collection_id
+            {
+                indexes.push(IndexInfo {
+                    id: ie.index_id,
+                    name: ie.name,
+                    root_page: ie.root_page,
+                    status: match ie.state {
+                        CatalogIndexState::Ready => "Ready".to_string(),
+                        CatalogIndexState::Building => "Building".to_string(),
+                        CatalogIndexState::Dropping => "Dropping".to_string(),
+                    },
+                    field_paths: ie.field_paths,
+                });
+            }
         }
 
         Ok(indexes)
@@ -543,18 +580,21 @@ impl StorageHandle {
         if catalog_root == 0 {
             let tree = self.engine.create_btree().await?;
             catalog_root = tree.root_page();
-            self.update_file_header_field("catalog_root_page", catalog_root as u64).await?;
+            self.update_file_header_field("catalog_root_page", catalog_root as u64)
+                .await?;
         }
         if name_root == 0 {
             let tree = self.engine.create_btree().await?;
             name_root = tree.root_page();
-            self.update_file_header_field("catalog_name_root_page", name_root as u64).await?;
+            self.update_file_header_field("catalog_name_root_page", name_root as u64)
+                .await?;
         }
 
         // Allocate IDs
         let fh = self.engine.file_header().await;
         let col_id = fh.next_collection_id.get();
-        self.update_file_header_field("next_collection_id", col_id + 1).await?;
+        self.update_file_header_field("next_collection_id", col_id + 1)
+            .await?;
 
         // Create data B-tree for the collection
         let data_tree = self.engine.create_btree().await?;
@@ -597,13 +637,15 @@ impl StorageHandle {
         }
 
         // Delete from by-id
-        let id_key = catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, collection_id);
+        let id_key =
+            catalog_btree::make_catalog_id_key(CatalogEntityType::Collection, collection_id);
         let tree = self.engine.open_btree(catalog_root);
         tree.delete(&id_key).await?;
 
         // Delete from by-name
         if name_root != 0 {
-            let name_key = catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, name);
+            let name_key =
+                catalog_btree::make_catalog_name_key(CatalogEntityType::Collection, name);
             let name_tree = self.engine.open_btree(name_root);
             name_tree.delete(&name_key).await?;
         }
@@ -624,7 +666,8 @@ impl StorageHandle {
         }
 
         let idx_id = fh.next_index_id.get();
-        self.update_file_header_field("next_index_id", idx_id + 1).await?;
+        self.update_file_header_field("next_index_id", idx_id + 1)
+            .await?;
 
         let idx_tree = self.engine.create_btree().await?;
         let root_page = idx_tree.root_page();
@@ -718,8 +761,8 @@ impl StorageHandle {
         root_page: u32,
         doc_id_hex: &str,
     ) -> io::Result<Vec<VersionInfo>> {
-        let doc_id_bytes = parse_hex(doc_id_hex)
-            .ok_or_else(|| io::Error::other("invalid hex doc_id"))?;
+        let doc_id_bytes =
+            parse_hex(doc_id_hex).ok_or_else(|| io::Error::other("invalid hex doc_id"))?;
         if doc_id_bytes.len() != 16 {
             return Err(io::Error::other("doc_id must be 16 bytes (32 hex chars)"));
         }
@@ -755,13 +798,13 @@ impl StorageHandle {
             if key.len() < 24 {
                 continue;
             }
-            let (_, ts) = key_encoding::parse_primary_key(&key)
-                .map_err(io::Error::other)?;
+            let (_, ts) = key_encoding::parse_primary_key(&key).map_err(io::Error::other)?;
             let flags = CellFlags::from_byte(value[0]);
             let body_preview = if flags.tombstone {
                 "(tombstone)".to_string()
             } else if flags.external && value.len() >= 5 {
-                let body_len = u32::from_le_bytes(value[1..5].try_into().expect("bounds checked above"));
+                let body_len =
+                    u32::from_le_bytes(value[1..5].try_into().expect("bounds checked above"));
                 format!("(external, {} bytes)", body_len)
             } else if flags.external {
                 "(external, corrupt cell)".to_string()
@@ -798,8 +841,7 @@ impl StorageHandle {
         read_ts: u64,
         limit: usize,
     ) -> io::Result<Vec<SecondaryHit>> {
-        let scalars = parse_scalar_array(scalars_json)
-            .map_err(io::Error::other)?;
+        let scalars = parse_scalar_array(scalars_json).map_err(io::Error::other)?;
 
         let primary = Arc::new(self.make_primary_index(primary_root));
         let sec_btree = self.engine.open_btree(sec_root);
@@ -907,7 +949,8 @@ impl StorageHandle {
         for col in &collections {
             // Count raw B-tree entries
             let btree = self.engine.open_btree(col.data_root_page);
-            let mut scanner = btree.scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward);
+            let mut scanner =
+                btree.scan(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward);
             let mut total_raw: u64 = 0;
             let mut tombstone_count: u64 = 0;
             while let Some(entry) = scanner.next().await {
@@ -924,7 +967,11 @@ impl StorageHandle {
             // Count visible docs via MVCC scan
             let fh = self.engine.file_header().await;
             let visible_ts = fh.visible_ts.get();
-            let read_ts = if visible_ts == 0 { u64::MAX } else { visible_ts };
+            let read_ts = if visible_ts == 0 {
+                u64::MAX
+            } else {
+                visible_ts
+            };
             let primary = self.make_primary_index(col.data_root_page);
             let mut mvcc_scanner = primary.scan_at_ts(read_ts, ScanDirection::Forward);
             let mut visible: u64 = 0;
@@ -1094,14 +1141,11 @@ fn decode_cell(bytes: &[u8]) -> Result<String, String> {
     } else {
         let preview = if bytes.len() > 5 {
             let body = &bytes[5..];
-            decode_body_json(body)
-                .unwrap_or_else(|| format!("{} bytes", body.len()))
+            decode_body_json(body).unwrap_or_else(|| format!("{} bytes", body.len()))
         } else {
             "(empty)".into()
         };
-        Ok(format!(
-            "Inline\nbody_len: {body_len}\npreview:  {preview}"
-        ))
+        Ok(format!("Inline\nbody_len: {body_len}\npreview:  {preview}"))
     }
 }
 

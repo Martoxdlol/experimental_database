@@ -149,16 +149,25 @@ impl<'db> Transaction<'db> {
     // --- Read Operations (always available) ---
 
     pub fn get(&mut self, collection: &str, doc_id: &DocId) -> Result<Option<Document>>;
+    pub fn get_bson(&mut self, collection: &str, doc_id: &DocId)
+        -> Result<Option<bson::Document>>;
     pub fn query(&mut self, collection: &str, index: &str,
                  range: &[RangeExpr], filter: Option<&Filter>,
                  order: Option<ScanDirection>, limit: Option<usize>)
         -> Result<Vec<Document>>;
+    pub fn query_bson(&mut self, collection: &str, index: &str,
+                      range: &[RangeExpr], filter: Option<&Filter>,
+                      order: Option<ScanDirection>, limit: Option<usize>)
+        -> Result<Vec<bson::Document>>;
 
     // --- Write Operations (error if readonly) ---
 
     pub fn insert(&mut self, collection: &str, body: serde_json::Value) -> Result<DocId>;
+    pub fn insert_bson(&mut self, collection: &str, body: bson::Document) -> Result<DocId>;
     pub fn replace(&mut self, collection: &str, doc_id: &DocId,
                    body: serde_json::Value) -> Result<()>;
+    pub fn replace_bson(&mut self, collection: &str, doc_id: &DocId,
+                        body: bson::Document) -> Result<()>;
     pub fn patch(&mut self, collection: &str, doc_id: &DocId,
                  patch: serde_json::Value) -> Result<()>;
     pub fn delete(&mut self, collection: &str, doc_id: &DocId) -> Result<()>;
@@ -250,7 +259,7 @@ L6 is responsible for assembling `ReadInterval` entries and recording them in th
 6. Build a `MergeView` from `write_set` mutations for this collection (decompose pending inserts/deletes/replaces for read-your-own-writes).
 7. Call `merge_with_writes(stream, merge_view, limit)` → merged, ordered, limit-capped result stream.
 8. Drain the merged stream, collecting `Vec<ScanRow>` and tracking the last returned row.
-9. Check read set size limits (`TransactionConfig`: `max_intervals`, `max_scanned_bytes`, `max_scanned_docs`). If any limit exceeded → abort transaction with `read_limit_exceeded`.
+9. Check resource limits (`TransactionConfig`: `max_intervals`, `max_operations`, `max_scanned_bytes`, `max_scanned_docs`). If any limit exceeded → abort transaction with `read_limit_exceeded`.
    > **Note:** `ScanStats` are tracked inside L4's stream but not currently accessible after type erasure (`QueryScanStream = Pin<Box<dyn Stream>>`). Until that is resolved (e.g., by returning `ScanStats` alongside the stream from `execute_scan`), L6 can count returned documents itself for `max_scanned_docs`. `max_scanned_bytes` requires L4 to expose the stat. `max_intervals` is checked against `read_set.interval_count()` after recording the interval.
 10. Compute `LimitBoundary` (if applicable):
     - If `limit` is `Some(N)` AND exactly `N` rows were returned:
@@ -269,7 +278,15 @@ L6 is responsible for assembling `ReadInterval` entries and recording them in th
 **Notes:**
 - Steps 2–5 for `get()` are async (primary index I/O); `query()` is also async for the same reason. The `Transaction` methods are therefore `async fn` in the actual implementation even if the plan shows them as `fn` for brevity.
 - For `TableScan` (`index = "_created_at"`), `encode_sort_key` produces the `_created_at` secondary key: `type_tag[1] || encoded_timestamp[var] || doc_id[16] || inv_ts[8]`.
-- `merge_with_writes` (L4 Q5) fully materializes the result — the `limit` passed to it is the same `limit` from the query, so the stream stops after N rows.
+- For limited queries, L6 can merge the committed secondary stream with the
+  pre-sorted write-set rows incrementally and stop once the first N ordered
+  rows are known. For unbounded queries, `merge_with_writes` (L4 Q5) may still
+  fully materialize the merged result.
+- Pending insert/replace rows use the same array-expanded secondary key
+  generation as committed index writes before they are merged. This keeps
+  read-your-writes query behavior consistent for scalar indexes and
+  array-indexed fields in both the incremental limited path and the full
+  unbounded merge path.
 - **LimitBoundary reflects write_set state at query time.** Each call to `query()` builds a fresh `MergeView` from the current write_set. If the write_set has changed between two calls to `query()` with the same range (e.g., op1 reads [K0,K99] limit=1 → K2; op2 deletes K2; op3 reads [K0,K99] limit=1 → K4), op3's `merge_with_writes` excludes the deleted K2, so op3's result is K4 and its `LimitBoundary` is `Upper(K4)` — distinct from op1's `Upper(K2)`. This is what makes OCC correct for op3: if a concurrent tx inserts K3 (K2 < K3 < K4), op1's interval does not conflict (K3 > K2) but op3's interval does (K3 ≤ K4), correctly causing TX1 to abort and retry.
 
 ### SubscriptionHandle
@@ -509,6 +526,7 @@ pub struct TransactionConfig {
     pub idle_timeout: Duration,
     pub max_lifetime: Duration,
     pub max_intervals: usize,
+    pub max_operations: usize,
     pub max_scanned_bytes: usize,
     pub max_scanned_docs: usize,
 }
@@ -605,6 +623,14 @@ tx.commit().await?;
 ```
 
 Note: Hold state is preserved across restart via `visible_ts` in the FileHeader. If the database shuts down while in hold state (quorum lost during commit), the persisted `visible_ts` will be behind the committed ts. On next startup, the rollback vacuum step (step 4) detects this gap and cleans up the un-replicated entries.
+
+Current implementation note: L6 exposes `Database::export_snapshot` and
+`Database::restore_snapshot` over L2's checkpointed `StorageSnapshot`. Export
+forces a checkpointed page-store image; restore writes that image to a fresh
+durable path and initializes the WAL at the snapshot checkpoint LSN so future
+commits continue with monotonic WAL offsets. Durability coverage restores a
+database with a Ready secondary index, reads through that index, commits new
+data on the restored copy, and verifies the new commit survives reopen.
 
 ## Transactional DDL
 

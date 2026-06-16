@@ -8,3 +8,10 @@ exdb = { workspace = true }
 exdb-wire = { workspace = true }
 exdb-replication = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

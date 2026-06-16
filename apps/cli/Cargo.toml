@@ -5,5 +5,11 @@ edition.workspace = true
 
 [dependencies]
 exdb = { workspace = true }
+exdb-storage = { workspace = true }
 exdb-wire = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

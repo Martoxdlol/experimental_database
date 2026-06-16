@@ -1,4 +1,4 @@
-pub mod storage;
+pub mod console;
 pub mod docstore;
 pub mod query;
-pub mod console;
+pub mod storage;

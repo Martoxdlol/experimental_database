@@ -27,8 +27,8 @@
 //! (channel-based) and sync subscription operations.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use exdb_core::encoding::encode_document;
 use exdb_core::field_path::FieldPath;
@@ -38,7 +38,7 @@ use exdb_storage::wal::{Lsn, WAL_RECORD_TX_COMMIT, WAL_RECORD_VISIBLE_TS};
 use parking_lot::RwLock;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::commit_log::{CommitLog, CommitLogEntry, IndexKeyWrite};
+use crate::commit_log::{CommitLog, CommitLogEntry, IndexKeyWrite, PRIMARY_INDEX_SENTINEL};
 use crate::occ::{self, ConflictError};
 use crate::read_set::ReadSet;
 use crate::subscriptions::{
@@ -46,11 +46,11 @@ use crate::subscriptions::{
 };
 use crate::timestamp::TsAllocator;
 use crate::write_set::{
-    compute_index_deltas, CatalogMutation, CatalogMutationHandler, IndexDelta, IndexResolver,
-    MutationOp, WriteSet,
+    CatalogMutation, CatalogMutationHandler, IndexDelta, IndexResolver, MutationOp, WriteSet,
+    compute_index_deltas,
 };
 
-use exdb_docstore::{PrimaryIndex, SecondaryIndex};
+use exdb_docstore::{PrimaryIndex, SecondaryIndex, make_primary_key};
 
 /// Request submitted to the commit coordinator via [`CommitHandle::commit`].
 pub struct CommitRequest {
@@ -121,6 +121,14 @@ pub trait ReplicationHook: Send + Sync {
     /// Replicate a WAL record and wait for quorum acknowledgement.
     async fn replicate_and_wait(&self, lsn: Lsn, record: &[u8]) -> Result<(), String>;
 
+    /// Oldest WAL LSN that replication may still need for lagging replicas.
+    ///
+    /// `None` means the hook has no replication-driven retention requirement,
+    /// which is the correct single-node behavior.
+    fn replication_retention_lsn(&self) -> Option<Lsn> {
+        None
+    }
+
     /// Check if replication quorum is available.
     fn has_quorum(&self) -> bool {
         true
@@ -149,6 +157,7 @@ struct ReplicationEntry {
     wal_payload: Vec<u8>,
     read_set: ReadSet,
     index_deltas: Vec<IndexDelta>,
+    index_writes: BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>>,
     subscription: SubscriptionMode,
     session_id: u64,
     tx_id: TxId,
@@ -304,9 +313,12 @@ impl CommitCoordinator {
         if !is_read_only || req.subscription != SubscriptionMode::None {
             let commit_log = self.commit_log.read();
             let commit_ts_candidate = self.ts_allocator.latest() + 1;
-            if let Err(conflict) =
-                occ::validate(&req.read_set, &commit_log, req.begin_ts, commit_ts_candidate)
-            {
+            if let Err(conflict) = occ::validate(
+                &req.read_set,
+                &commit_log,
+                req.begin_ts,
+                commit_ts_candidate,
+            ) {
                 let retry = if req.subscription == SubscriptionMode::Subscribe {
                     Some(ConflictRetry {
                         new_tx_id: self.next_tx_id.fetch_add(1, Ordering::AcqRel),
@@ -344,6 +356,7 @@ impl CommitCoordinator {
         let mut wal_payload = Vec::new();
         let mut lsn: Lsn = 0;
         let mut index_deltas = Vec::new();
+        let mut write_set = req.write_set;
 
         if !is_read_only {
             // ── Step 3a: Pre-allocate B-tree pages for catalog mutations ──
@@ -353,7 +366,6 @@ impl CommitCoordinator {
             //
             // If crash after allocation but before WAL write: allocated pages
             // are orphaned (harmless — reclaimed by vacuum or ignored).
-            let mut write_set = req.write_set;
             for cat_mut in &mut write_set.catalog_mutations {
                 match cat_mut {
                     CatalogMutation::CreateCollection {
@@ -361,11 +373,7 @@ impl CommitCoordinator {
                         created_at_root_page,
                         ..
                     } => {
-                        let (p, c) = match self
-                            .catalog_handler
-                            .allocate_collection_pages()
-                            .await
-                        {
+                        let (p, c) = match self.catalog_handler.allocate_collection_pages().await {
                             Ok(pages) => pages,
                             Err(e) => {
                                 tracing::error!(
@@ -378,9 +386,7 @@ impl CommitCoordinator {
                         *primary_root_page = p;
                         *created_at_root_page = c;
                     }
-                    CatalogMutation::CreateIndex {
-                        root_page, ..
-                    } => {
+                    CatalogMutation::CreateIndex { root_page, .. } => {
                         let rp = match self.catalog_handler.allocate_index_page().await {
                             Ok(page) => page,
                             Err(e) => {
@@ -434,9 +440,7 @@ impl CommitCoordinator {
                             )
                             .await
                     }
-                    CatalogMutation::DropCollection {
-                        collection_id, ..
-                    } => {
+                    CatalogMutation::DropCollection { collection_id, .. } => {
                         self.catalog_handler
                             .apply_drop_collection(*collection_id)
                             .await
@@ -459,15 +463,11 @@ impl CommitCoordinator {
                             .await
                     }
                     CatalogMutation::DropIndex { index_id, .. } => {
-                        self.catalog_handler
-                            .apply_drop_index(*index_id)
-                            .await
+                        self.catalog_handler.apply_drop_index(*index_id).await
                     }
                 };
                 if let Err(e) = result {
-                    tracing::error!(
-                        "catalog mutation failed for commit_ts={commit_ts}: {e}"
-                    );
+                    tracing::error!("catalog mutation failed for commit_ts={commit_ts}: {e}");
                     let _ = response_tx.send(CommitResult::QuorumLost);
                     return Err(());
                 }
@@ -483,10 +483,7 @@ impl CommitCoordinator {
             // Apply primary index mutations
             for (&(coll_id, doc_id), entry) in &write_set.mutations {
                 if let Some(primary) = primaries.get(&coll_id) {
-                    let body_bytes = entry
-                        .body
-                        .as_ref()
-                        .map(encode_document);
+                    let body_bytes = entry.body.as_ref().map(encode_document);
                     if let Err(e) = primary
                         .insert_version(&doc_id, commit_ts, body_bytes.as_deref())
                         .await
@@ -517,40 +514,40 @@ impl CommitCoordinator {
                 }
             }
 
-            // Apply secondary index mutations
+            // Apply secondary index additions. Old secondary entries remain
+            // live for retained MVCC versions and are reclaimed by vacuum.
+            // The old_key side of each delta still participates in
+            // OCC/subscription overlap checks via the commit log.
             for delta in &index_deltas {
-                if let Some(secondary) = secondaries.get(&delta.index_id) {
-                    if let Some(old_key) = &delta.old_key
-                        && let Err(e) = secondary.remove_entry(old_key).await {
-                            tracing::error!("secondary index remove failed: {e}");
-                            let _ = response_tx.send(CommitResult::QuorumLost);
-                            return Err(());
-                        }
-                    if let Some(new_key) = &delta.new_key
-                        && let Err(e) = secondary.insert_entry(new_key).await {
-                            tracing::error!("secondary index insert failed: {e}");
-                            let _ = response_tx.send(CommitResult::QuorumLost);
-                            return Err(());
-                        }
+                if let Some(secondary) = secondaries.get(&delta.index_id)
+                    && let Some(new_key) = &delta.new_key
+                    && let Err(e) = secondary.insert_entry(new_key).await
+                {
+                    tracing::error!("secondary index insert failed: {e}");
+                    let _ = response_tx.send(CommitResult::QuorumLost);
+                    return Err(());
                 }
             }
 
             // ── Step 5: Append to Commit Log ──
+            let index_writes = build_index_writes(&write_set, commit_ts, &index_deltas);
             let log_entry = build_commit_log_entry(
                 commit_ts,
-                &index_deltas,
+                index_writes.clone(),
                 &write_set.catalog_mutations,
             );
             self.commit_log.write().append(log_entry);
         }
 
         // ── Enqueue to Replication Task ──
+        let index_writes = build_index_writes(&write_set, commit_ts, &index_deltas);
         let entry = ReplicationEntry {
             commit_ts,
             lsn,
             wal_payload,
             read_set: req.read_set,
             index_deltas,
+            index_writes,
             subscription: req.subscription,
             session_id: req.session_id,
             tx_id: req.tx_id,
@@ -558,9 +555,7 @@ impl CommitCoordinator {
         };
 
         if self.replication_tx.send(entry).await.is_err() {
-            tracing::error!(
-                "replication task dropped, cannot complete commit {commit_ts}"
-            );
+            tracing::error!("replication task dropped, cannot complete commit {commit_ts}");
         }
 
         Ok(())
@@ -593,14 +588,13 @@ impl ReplicationRunner {
                 .await
             {
                 let _ = entry.response_tx.send(CommitResult::QuorumLost);
-                tracing::error!(
-                    "replication failed at commit_ts={}: {msg}",
-                    entry.commit_ts
-                );
+                tracing::error!("replication failed at commit_ts={}: {msg}", entry.commit_ts);
                 let visible = self.visible_ts.load(Ordering::Acquire);
                 self.commit_log.write().remove_after(visible);
                 return false;
             }
+            self.storage
+                .set_replication_retention_lsn(self.replication.replication_retention_lsn());
 
             // ── Step 7: WAL visible_ts Record ──
             if let Err(e) = self
@@ -618,18 +612,21 @@ impl ReplicationRunner {
 
             // Persist visible_ts in FileHeader so it survives checkpoint + reopen
             let commit_ts = entry.commit_ts;
-            if let Err(e) = self.storage.update_file_header(|fh| {
-                fh.visible_ts.set(commit_ts);
-            }).await {
+            if let Err(e) = self
+                .storage
+                .update_file_header(|fh| {
+                    fh.visible_ts.set(commit_ts);
+                })
+                .await
+            {
                 tracing::error!("failed to persist visible_ts to file header: {e}");
             }
         }
 
         // ── Step 9: Subscription Invalidation Check ──
-        let index_writes = build_index_writes(&entry.index_deltas);
         let invalidation_events = {
             let mut subs = self.subscriptions.write();
-            subs.check_invalidation(entry.commit_ts, &index_writes, || {
+            subs.check_invalidation(entry.commit_ts, &entry.index_writes, || {
                 self.next_tx_id.fetch_add(1, Ordering::AcqRel)
             })
         };
@@ -696,6 +693,17 @@ impl CommitHandle {
         self.visible_ts.load(Ordering::Acquire)
     }
 
+    /// Advance the local visible timestamp after an externally applied commit.
+    ///
+    /// Replica apply uses this after it has durably written the primary commit
+    /// and local `VisibleTs` record. The update is monotonic and also advances
+    /// the timestamp allocator so any future local allocation stays above the
+    /// externally supplied commit timestamp.
+    pub fn advance_visible_ts(&self, ts: Ts) {
+        self.visible_ts.fetch_max(ts, Ordering::AcqRel);
+        self.ts_allocator.advance_to(ts);
+    }
+
     /// Allocate a new [`TxId`].
     pub fn allocate_tx_id(&self) -> TxId {
         self.next_tx_id.fetch_add(1, Ordering::AcqRel)
@@ -719,21 +727,9 @@ impl CommitHandle {
 /// on the pseudo-collections so that OCC can detect DDL conflicts.
 fn build_commit_log_entry(
     commit_ts: Ts,
-    index_deltas: &[IndexDelta],
+    mut index_writes: BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>>,
     catalog_mutations: &[CatalogMutation],
 ) -> CommitLogEntry {
-    let mut index_writes: BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>> = BTreeMap::new();
-    for delta in index_deltas {
-        index_writes
-            .entry((delta.collection_id, delta.index_id))
-            .or_default()
-            .push(IndexKeyWrite {
-                doc_id: delta.doc_id,
-                old_key: delta.old_key.clone(),
-                new_key: delta.new_key.clone(),
-            });
-    }
-
     // Encode catalog mutations as writes on pseudo-collections so OCC
     // detects conflicts between concurrent DDL operations.
     use crate::read_set::{
@@ -809,9 +805,30 @@ fn build_commit_log_entry(
 
 /// Extract index writes from deltas for subscription invalidation check.
 fn build_index_writes(
+    write_set: &WriteSet,
+    commit_ts: Ts,
     index_deltas: &[IndexDelta],
 ) -> BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>> {
     let mut map: BTreeMap<(CollectionId, IndexId), Vec<IndexKeyWrite>> = BTreeMap::new();
+    for (&(collection_id, doc_id), entry) in &write_set.mutations {
+        let previous_key = entry
+            .previous_ts
+            .map(|previous_ts| make_primary_key(&doc_id, previous_ts).to_vec());
+        let commit_key = make_primary_key(&doc_id, commit_ts).to_vec();
+        let (old_key, new_key) = match entry.op {
+            MutationOp::Insert => (None, Some(commit_key)),
+            MutationOp::Replace => (previous_key, Some(commit_key)),
+            MutationOp::Delete => (previous_key, None),
+        };
+        map.entry((collection_id, PRIMARY_INDEX_SENTINEL))
+            .or_default()
+            .push(IndexKeyWrite {
+                doc_id,
+                old_key,
+                new_key,
+            });
+    }
+
     for delta in index_deltas {
         map.entry((delta.collection_id, delta.index_id))
             .or_default()
@@ -830,12 +847,13 @@ fn build_index_writes(
 ///
 /// Version history:
 /// - V1 (initial): no root pages in CreateCollection/CreateIndex, no drop metadata
-/// - V2 (current): includes root page IDs, full drop metadata for rollback
-pub const WAL_PAYLOAD_VERSION: u8 = 2;
+/// - V2: includes root page IDs, full drop metadata for rollback, JSON bodies
+/// - V3 (current): stores document bodies as BSON
+pub const WAL_PAYLOAD_VERSION: u8 = 3;
 
 /// Serialize commit data into the binary WAL payload format.
 ///
-/// Format (version 2):
+/// Format (version 3):
 /// ```text
 /// version:        u8
 /// commit_ts:      u64 (LE)
@@ -845,7 +863,7 @@ pub const WAL_PAYLOAD_VERSION: u8 = 2;
 ///     doc_id:        [u8; 16]
 ///     op_tag:        u8  (0x01=Insert, 0x02=Replace, 0x03=Delete)
 ///     body_len:      u32 (LE)  (0 for Delete)
-///     body:          [u8; body_len]  (JSON bytes)
+///     body:          [u8; body_len]  (BSON document bytes)
 /// catalog_count:  u32 (LE)
 /// for each catalog mutation:
 ///     type_tag:   u8  (0x01=CreateCollection, ...)
@@ -889,9 +907,9 @@ fn serialize_wal_payload(commit_ts: Ts, write_set: &WriteSet) -> Vec<u8> {
         });
         match &entry.body {
             Some(body) => {
-                let json_bytes = serde_json::to_vec(body).expect("JSON serialization");
-                buf.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(&json_bytes);
+                let bson_bytes = encode_document(body);
+                buf.extend_from_slice(&(bson_bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&bson_bytes);
             }
             None => {
                 buf.extend_from_slice(&0u32.to_le_bytes());
@@ -992,26 +1010,39 @@ fn serialize_field_paths(buf: &mut Vec<u8>, field_paths: &[FieldPath]) {
 ///
 /// Returns `(commit_ts, mutations, catalog_mutations_bytes)`.
 ///
-/// Handles version 1 (legacy, no version byte — starts with commit_ts directly)
-/// and version 2 (current, starts with version byte).
+/// Handles version 1 (legacy, no version byte — starts with commit_ts directly),
+/// version 2 (explicit version byte, JSON bodies), and version 3 (current, BSON
+/// bodies). Explicit versions greater than [`WAL_PAYLOAD_VERSION`] are rejected
+/// rather than guessed as legacy data.
 #[allow(clippy::type_complexity)]
 pub fn deserialize_wal_payload(
     data: &[u8],
-) -> Result<(u8, Ts, Vec<(CollectionId, DocId, u8, Option<Vec<u8>>)>, Vec<u8>), String> {
+) -> Result<
+    (
+        u8,
+        Ts,
+        Vec<(CollectionId, DocId, u8, Option<Vec<u8>>)>,
+        Vec<u8>,
+    ),
+    String,
+> {
     if data.is_empty() {
         return Err("WAL payload empty".into());
     }
 
-    // Version detection: V2 starts with version byte (0x02).
-    // V1 (legacy) starts with commit_ts (u64 LE) — first byte is the low byte
-    // of commit_ts, which will be a small number but never exactly 0x02 for
-    // typical timestamps. For safety, we check: if first byte == WAL_PAYLOAD_VERSION
-    // AND total length is consistent with V2 format, treat as V2.
-    let (version, offset_start) = if data[0] == WAL_PAYLOAD_VERSION {
-        (WAL_PAYLOAD_VERSION, 1usize)
-    } else {
-        // Legacy V1: no version byte, commit_ts starts at offset 0
-        (1u8, 0usize)
+    // Version detection: V2+ starts with an explicit version byte. V1 legacy
+    // records were unversioned and started with commit_ts. Because future
+    // explicit versions would otherwise be ambiguous with V1 commit_ts low
+    // bytes, only 0/1 remain in the best-effort legacy namespace.
+    let (version, offset_start) = match data[0] {
+        0 | 1 => (1u8, 0usize),
+        2..=WAL_PAYLOAD_VERSION => (data[0], 1usize),
+        version => {
+            return Err(format!(
+                "unsupported WAL payload version: current {}, got {}",
+                WAL_PAYLOAD_VERSION, version
+            ));
+        }
     };
 
     let min_len = offset_start + 12; // commit_ts(8) + mutation_count(4)
@@ -1047,8 +1078,13 @@ pub fn deserialize_wal_payload(
             if offset + body_len > data.len() {
                 return Err("truncated body".into());
             }
-            let b = data[offset..offset + body_len].to_vec();
+            let mut b = data[offset..offset + body_len].to_vec();
             offset += body_len;
+            if version < WAL_PAYLOAD_VERSION {
+                let doc: serde_json::Value = serde_json::from_slice(&b)
+                    .map_err(|e| format!("legacy JSON WAL body decode error: {e}"))?;
+                b = encode_document(&doc);
+            }
             Some(b)
         } else {
             None
@@ -1068,6 +1104,7 @@ mod tests {
     use crate::read_set::ReadInterval;
     use crate::subscriptions::SubscriptionMode;
     use crate::write_set::DroppedIndexMeta;
+    use exdb_core::encoding::decode_document;
     use exdb_core::field_path::FieldPath;
     use exdb_storage::engine::StorageConfig;
     use serde_json::json;
@@ -1081,10 +1118,20 @@ mod tests {
         }
     }
 
-    /// Create an in-memory test setup with coordinator, runner, and handle.
-    async fn setup() -> (CommitCoordinator, ReplicationRunner, CommitHandle) {
-        let storage =
-            Arc::new(StorageEngine::open_in_memory(StorageConfig::default()).await.unwrap());
+    /// Create an in-memory test setup with coordinator, runner, handle, and storage.
+    async fn setup_with_replication(
+        replication: Box<dyn ReplicationHook>,
+    ) -> (
+        CommitCoordinator,
+        ReplicationRunner,
+        CommitHandle,
+        Arc<StorageEngine>,
+    ) {
+        let storage = Arc::new(
+            StorageEngine::open_in_memory(StorageConfig::default())
+                .await
+                .unwrap(),
+        );
         let primaries = Arc::new(RwLock::new(HashMap::new()));
         let secondaries = Arc::new(RwLock::new(HashMap::new()));
         let resolver: Arc<dyn IndexResolver> = Arc::new(EmptyResolver);
@@ -1092,23 +1139,31 @@ mod tests {
         let catalog_handler: Arc<dyn CatalogMutationHandler> =
             Arc::new(crate::write_set::NoOpCatalogHandler);
 
-        CommitCoordinator::new(
+        let (coordinator, runner, handle) = CommitCoordinator::new(
             0,
             0,
-            storage,
+            Arc::clone(&storage),
             primaries,
             secondaries,
-            Box::new(NoReplication),
+            replication,
             resolver,
             catalog_handler,
             256,
             256,
-        )
+        );
+        (coordinator, runner, handle, storage)
     }
 
     /// Run coordinator and runner as background tasks, return handle.
     async fn spawn_system() -> CommitHandle {
-        let (mut coord, mut runner, handle) = setup().await;
+        let (handle, _) = spawn_system_with_replication(Box::new(NoReplication)).await;
+        handle
+    }
+
+    async fn spawn_system_with_replication(
+        replication: Box<dyn ReplicationHook>,
+    ) -> (CommitHandle, Arc<StorageEngine>) {
+        let (mut coord, mut runner, handle, storage) = setup_with_replication(replication).await;
 
         // Spawn runner on normal tokio task (it's Send)
         tokio::spawn(async move {
@@ -1131,7 +1186,22 @@ mod tests {
         // Small yield to let tasks start
         tokio::task::yield_now().await;
 
-        handle
+        (handle, storage)
+    }
+
+    struct RetentionReplication {
+        retention_lsn: Option<Lsn>,
+    }
+
+    #[async_trait::async_trait]
+    impl ReplicationHook for RetentionReplication {
+        async fn replicate_and_wait(&self, _lsn: Lsn, _record: &[u8]) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn replication_retention_lsn(&self) -> Option<Lsn> {
+            self.retention_lsn
+        }
     }
 
     #[tokio::test]
@@ -1150,7 +1220,11 @@ mod tests {
             .await;
 
         match result {
-            CommitResult::Success { commit_ts, subscription_id, event_rx } => {
+            CommitResult::Success {
+                commit_ts,
+                subscription_id,
+                event_rx,
+            } => {
                 assert_eq!(commit_ts, 0); // begin_ts returned for read-only
                 assert!(subscription_id.is_none());
                 assert!(event_rx.is_none());
@@ -1183,6 +1257,32 @@ mod tests {
             }
             _ => panic!("expected success"),
         }
+    }
+
+    #[tokio::test]
+    async fn commit_updates_replication_retention_lsn_after_ack() {
+        let (handle, storage) = spawn_system_with_replication(Box::new(RetentionReplication {
+            retention_lsn: Some(7),
+        }))
+        .await;
+        assert_eq!(storage.replication_retention_lsn(), None);
+
+        let mut ws = WriteSet::new();
+        ws.insert(CollectionId(10), DocId([1; 16]), json!({"x": 1}));
+
+        let result = handle
+            .commit(CommitRequest {
+                tx_id: 1,
+                begin_ts: 0,
+                read_set: ReadSet::new(),
+                write_set: ws,
+                subscription: SubscriptionMode::None,
+                session_id: 1,
+            })
+            .await;
+
+        assert!(matches!(result, CommitResult::Success { .. }));
+        assert_eq!(storage.replication_retention_lsn(), Some(7));
     }
 
     #[tokio::test]
@@ -1271,10 +1371,9 @@ mod tests {
             .await;
         assert!(matches!(r1, CommitResult::Success { .. }));
 
-        // TX2: started at ts=0, reads the same range, tries to commit
-        // But we need actual index deltas in the commit log for OCC to find conflicts.
-        // Since EmptyResolver returns no indexes, there are no index_writes in commit log.
-        // This test validates the flow; real OCC tests are in occ.rs.
+        // TX2: started at ts=0, reads the primary key space, tries to commit.
+        // Primary writes are always present in the commit log even when the
+        // collection has no secondary indexes, so OCC must catch the stale read.
         let mut rs2 = ReadSet::new();
         rs2.add_interval(
             CollectionId(10),
@@ -1300,9 +1399,13 @@ mod tests {
             })
             .await;
 
-        // With EmptyResolver there are no index writes → no OCC conflict
-        // This verifies the flow works end-to-end
-        assert!(matches!(r2, CommitResult::Success { .. }));
+        match r2 {
+            CommitResult::Conflict { error, .. } => {
+                assert_eq!(error.affected_query_ids, vec![0]);
+            }
+            CommitResult::Success { .. } => panic!("expected OCC conflict"),
+            CommitResult::QuorumLost => panic!("unexpected quorum lost"),
+        }
     }
 
     #[tokio::test]
@@ -1484,27 +1587,58 @@ mod tests {
             },
         ];
 
-        let entry = build_commit_log_entry(5, &deltas, &[]);
+        let entry =
+            build_commit_log_entry(5, build_index_writes(&WriteSet::new(), 5, &deltas), &[]);
         assert_eq!(entry.commit_ts, 5);
         assert_eq!(entry.index_writes.len(), 2); // Two (coll, idx) groups
-        assert_eq!(
-            entry.index_writes[&(CollectionId(1), IndexId(1))].len(),
-            2
-        );
-        assert_eq!(
-            entry.index_writes[&(CollectionId(1), IndexId(2))].len(),
-            1
-        );
+        assert_eq!(entry.index_writes[&(CollectionId(1), IndexId(1))].len(), 2);
+        assert_eq!(entry.index_writes[&(CollectionId(1), IndexId(2))].len(), 1);
     }
 
-    // ─── WAL payload V2 format tests ───
+    // ─── WAL payload current format tests ───
 
     #[test]
     fn wal_payload_version_byte() {
         let ws = WriteSet::new();
         let payload = serialize_wal_payload(1, &ws);
         assert_eq!(payload[0], WAL_PAYLOAD_VERSION);
-        assert_eq!(payload[0], 2);
+        assert_eq!(payload[0], 3);
+    }
+
+    #[test]
+    fn wal_payload_v2_json_body_converted_to_bson() {
+        let mut payload = vec![2u8];
+        payload.extend_from_slice(&10u64.to_le_bytes());
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&CollectionId(1).0.to_le_bytes());
+        payload.extend_from_slice(DocId([7; 16]).as_bytes());
+        payload.push(0x01);
+        let json_body = br#"{"name":"legacy","age":42}"#;
+        payload.extend_from_slice(&(json_body.len() as u32).to_le_bytes());
+        payload.extend_from_slice(json_body);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+
+        let (version, commit_ts, mutations, catalog) = deserialize_wal_payload(&payload).unwrap();
+
+        assert_eq!(version, 2);
+        assert_eq!(commit_ts, 10);
+        assert_eq!(catalog.len(), 4);
+        let decoded = decode_document(mutations[0].3.as_ref().unwrap()).unwrap();
+        assert_eq!(decoded, json!({"name": "legacy", "age": 42}));
+    }
+
+    #[test]
+    fn wal_payload_future_version_is_rejected() {
+        let mut payload = vec![WAL_PAYLOAD_VERSION + 1];
+        payload.extend_from_slice(&10u64.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+
+        let err = deserialize_wal_payload(&payload).unwrap_err();
+        assert!(
+            err.contains("unsupported WAL payload version"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1518,10 +1652,9 @@ mod tests {
         });
 
         let payload = serialize_wal_payload(10, &ws);
-        let (version, ts, mutations, catalog_data) =
-            deserialize_wal_payload(&payload).unwrap();
+        let (version, ts, mutations, catalog_data) = deserialize_wal_payload(&payload).unwrap();
 
-        assert_eq!(version, 2);
+        assert_eq!(version, WAL_PAYLOAD_VERSION);
         assert_eq!(ts, 10);
         assert!(mutations.is_empty());
         // Catalog data should be non-empty and parseable
@@ -1529,8 +1662,7 @@ mod tests {
 
         // Parse catalog data manually to verify root pages are present
         let mut off = 0;
-        let count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(count, 1);
 
@@ -1538,26 +1670,21 @@ mod tests {
         off += 1;
         assert_eq!(tag, 0x01); // CreateCollection
 
-        let prov_id =
-            u64::from_le_bytes(catalog_data[off..off + 8].try_into().unwrap());
+        let prov_id = u64::from_le_bytes(catalog_data[off..off + 8].try_into().unwrap());
         off += 8;
         assert_eq!(prov_id, 42);
 
-        let name_len =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap())
-                as usize;
+        let name_len = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
         let name = std::str::from_utf8(&catalog_data[off..off + name_len]).unwrap();
         off += name_len;
         assert_eq!(name, "users");
 
-        let primary_rp =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let primary_rp = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(primary_rp, 100);
 
-        let created_at_rp =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let created_at_rp = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         assert_eq!(created_at_rp, 101);
     }
 
@@ -1573,16 +1700,14 @@ mod tests {
         });
 
         let payload = serialize_wal_payload(20, &ws);
-        let (version, ts, _, catalog_data) =
-            deserialize_wal_payload(&payload).unwrap();
+        let (version, ts, _, catalog_data) = deserialize_wal_payload(&payload).unwrap();
 
-        assert_eq!(version, 2);
+        assert_eq!(version, WAL_PAYLOAD_VERSION);
         assert_eq!(ts, 20);
 
         // Parse: count(4) + tag(1) + prov_id(8) + coll_id(8) + name_len(4) + "by_email"(8) + field_paths + root_page(4)
         let mut off = 0;
-        let count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(count, 1);
 
@@ -1593,30 +1718,23 @@ mod tests {
         // Skip prov_id + coll_id + name
         off += 8; // provisional_id
         off += 8; // collection_id
-        let name_len =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap())
-                as usize;
+        let name_len = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
         off += name_len; // "by_email"
 
         // Skip field_paths: count(4) + segments_count(4) + seg_len(4) + "email"(5)
-        let fp_count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let fp_count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(fp_count, 1);
-        let seg_count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let seg_count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(seg_count, 1);
-        let seg_len =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap())
-                as usize;
+        let seg_len = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
         off += seg_len; // "email"
 
         // Now root_page
-        let root_page =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let root_page = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         assert_eq!(root_page, 200);
     }
 
@@ -1644,16 +1762,14 @@ mod tests {
         });
 
         let payload = serialize_wal_payload(30, &ws);
-        let (version, ts, _, catalog_data) =
-            deserialize_wal_payload(&payload).unwrap();
+        let (version, ts, _, catalog_data) = deserialize_wal_payload(&payload).unwrap();
 
-        assert_eq!(version, 2);
+        assert_eq!(version, WAL_PAYLOAD_VERSION);
         assert_eq!(ts, 30);
 
         // Parse catalog data
         let mut off = 0;
-        let count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(count, 1);
 
@@ -1661,36 +1777,33 @@ mod tests {
         off += 1;
         assert_eq!(tag, 0x02); // DropCollection
 
-        let coll_id =
-            u64::from_le_bytes(catalog_data[off..off + 8].try_into().unwrap());
+        let coll_id = u64::from_le_bytes(catalog_data[off..off + 8].try_into().unwrap());
         off += 8;
         assert_eq!(coll_id, 5);
 
-        let name_len =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap())
-                as usize;
+        let name_len = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
         off += name_len; // "users"
 
-        let primary_rp =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let primary_rp = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(primary_rp, 50);
 
-        let idx_count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let idx_count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(idx_count, 2);
 
         // First dropped index
-        let idx_id =
-            u64::from_le_bytes(catalog_data[off..off + 8].try_into().unwrap());
+        let idx_id = u64::from_le_bytes(catalog_data[off..off + 8].try_into().unwrap());
         off += 8;
         assert_eq!(idx_id, 20);
 
         // We won't parse every byte — just verify the data is present
         // by checking total length is reasonable
-        assert!(catalog_data.len() > off + 20, "should have more data for indexes");
+        assert!(
+            catalog_data.len() > off + 20,
+            "should have more data for indexes"
+        );
     }
 
     #[test]
@@ -1705,16 +1818,14 @@ mod tests {
         });
 
         let payload = serialize_wal_payload(40, &ws);
-        let (version, ts, _, catalog_data) =
-            deserialize_wal_payload(&payload).unwrap();
+        let (version, ts, _, catalog_data) = deserialize_wal_payload(&payload).unwrap();
 
-        assert_eq!(version, 2);
+        assert_eq!(version, WAL_PAYLOAD_VERSION);
         assert_eq!(ts, 40);
 
         // Parse: count(4) + tag(1) + index_id(8) + coll_id(8) + name + field_paths + root_page(4)
         let mut off = 0;
-        let count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(count, 1);
 
@@ -1722,44 +1833,35 @@ mod tests {
         off += 1;
         assert_eq!(tag, 0x04); // DropIndex
 
-        let idx_id =
-            u64::from_le_bytes(catalog_data[off..off + 8].try_into().unwrap());
+        let idx_id = u64::from_le_bytes(catalog_data[off..off + 8].try_into().unwrap());
         off += 8;
         assert_eq!(idx_id, 10);
 
-        let coll_id =
-            u64::from_le_bytes(catalog_data[off..off + 8].try_into().unwrap());
+        let coll_id = u64::from_le_bytes(catalog_data[off..off + 8].try_into().unwrap());
         off += 8;
         assert_eq!(coll_id, 1);
 
-        let name_len =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap())
-                as usize;
+        let name_len = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
         let name = std::str::from_utf8(&catalog_data[off..off + name_len]).unwrap();
         off += name_len;
         assert_eq!(name, "by_age");
 
         // field_paths
-        let fp_count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let fp_count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(fp_count, 1);
-        let seg_count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let seg_count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(seg_count, 1);
-        let seg_len =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap())
-                as usize;
+        let seg_len = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
         let seg = std::str::from_utf8(&catalog_data[off..off + seg_len]).unwrap();
         off += seg_len;
         assert_eq!(seg, "age");
 
         // root_page at the end
-        let root_page =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let root_page = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         assert_eq!(root_page, 77);
     }
 
@@ -1790,10 +1892,9 @@ mod tests {
         });
 
         let payload = serialize_wal_payload(50, &ws);
-        let (version, ts, mutations, catalog_data) =
-            deserialize_wal_payload(&payload).unwrap();
+        let (version, ts, mutations, catalog_data) = deserialize_wal_payload(&payload).unwrap();
 
-        assert_eq!(version, 2);
+        assert_eq!(version, WAL_PAYLOAD_VERSION);
         assert_eq!(ts, 50);
         assert_eq!(mutations.len(), 2);
         // Verify data mutations
@@ -1820,54 +1921,43 @@ mod tests {
         });
 
         let payload = serialize_wal_payload(1, &ws);
-        let (version, _, _, catalog_data) =
-            deserialize_wal_payload(&payload).unwrap();
-        assert_eq!(version, 2);
+        let (version, _, _, catalog_data) = deserialize_wal_payload(&payload).unwrap();
+        assert_eq!(version, WAL_PAYLOAD_VERSION);
 
         // Parse to verify compound field paths are serialized
         let mut off = 4; // skip count
         off += 1; // tag
         off += 8; // provisional_id
         off += 8; // collection_id
-        let name_len =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap())
-                as usize;
+        let name_len = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap()) as usize;
         off += 4 + name_len;
 
         // field_path_count = 2
-        let fp_count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let fp_count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(fp_count, 2);
 
         // First field path: ["address", "city"] → segment_count=2
-        let seg_count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let seg_count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         off += 4;
         assert_eq!(seg_count, 2);
 
         // "address"
-        let seg_len =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap())
-                as usize;
+        let seg_len = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
         let seg = std::str::from_utf8(&catalog_data[off..off + seg_len]).unwrap();
         off += seg_len;
         assert_eq!(seg, "address");
 
         // "city"
-        let seg_len =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap())
-                as usize;
+        let seg_len = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
         let seg = std::str::from_utf8(&catalog_data[off..off + seg_len]).unwrap();
         off += seg_len;
         assert_eq!(seg, "city");
 
         // Second field path: ["address", "zip"]
-        let seg_count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
-        off += 4;
+        let seg_count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         assert_eq!(seg_count, 2);
     }
 
@@ -1875,15 +1965,13 @@ mod tests {
     fn wal_payload_large_body_roundtrip() {
         let mut ws = WriteSet::new();
         let large_body: serde_json::Value =
-            serde_json::from_str(&format!("{{\"data\": \"{}\"}}", "x".repeat(100_000)))
-                .unwrap();
+            serde_json::from_str(&format!("{{\"data\": \"{}\"}}", "x".repeat(100_000))).unwrap();
         ws.insert(CollectionId(1), DocId([7; 16]), large_body);
 
         let payload = serialize_wal_payload(99, &ws);
-        let (version, ts, mutations, _) =
-            deserialize_wal_payload(&payload).unwrap();
+        let (version, ts, mutations, _) = deserialize_wal_payload(&payload).unwrap();
 
-        assert_eq!(version, 2);
+        assert_eq!(version, WAL_PAYLOAD_VERSION);
         assert_eq!(ts, 99);
         assert_eq!(mutations.len(), 1);
         assert!(mutations[0].3.as_ref().unwrap().len() > 100_000);
@@ -1896,10 +1984,9 @@ mod tests {
         ws.delete(CollectionId(1), DocId([2; 16]), 20);
 
         let payload = serialize_wal_payload(5, &ws);
-        let (version, ts, mutations, _) =
-            deserialize_wal_payload(&payload).unwrap();
+        let (version, ts, mutations, _) = deserialize_wal_payload(&payload).unwrap();
 
-        assert_eq!(version, 2);
+        assert_eq!(version, WAL_PAYLOAD_VERSION);
         assert_eq!(ts, 5);
         assert_eq!(mutations.len(), 2);
         for m in &mutations {
@@ -1911,7 +1998,7 @@ mod tests {
     #[test]
     fn wal_payload_deserialize_truncated_errors() {
         // Too short to have even a version + commit_ts
-        let result = deserialize_wal_payload(&[2, 0, 0]);
+        let result = deserialize_wal_payload(&[WAL_PAYLOAD_VERSION, 0, 0]);
         assert!(result.is_err());
     }
 
@@ -1951,10 +2038,9 @@ mod tests {
         });
 
         let payload = serialize_wal_payload(1, &ws);
-        let (version, _, _, catalog_data) =
-            deserialize_wal_payload(&payload).unwrap();
+        let (version, _, _, catalog_data) = deserialize_wal_payload(&payload).unwrap();
 
-        assert_eq!(version, 2);
+        assert_eq!(version, WAL_PAYLOAD_VERSION);
         // Verify we can at least deserialize without error
         assert!(!catalog_data.is_empty());
 
@@ -1962,9 +2048,7 @@ mod tests {
         let mut off = 4; // count
         off += 1; // tag = 0x01
         off += 8; // provisional_id
-        let name_len =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap())
-                as usize;
+        let name_len = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap()) as usize;
         off += 4;
         let name = std::str::from_utf8(&catalog_data[off..off + name_len]).unwrap();
         assert_eq!(name, "données_françaises");
@@ -1981,23 +2065,19 @@ mod tests {
         });
 
         let payload = serialize_wal_payload(1, &ws);
-        let (version, _, _, catalog_data) =
-            deserialize_wal_payload(&payload).unwrap();
+        let (version, _, _, catalog_data) = deserialize_wal_payload(&payload).unwrap();
 
-        assert_eq!(version, 2);
+        assert_eq!(version, WAL_PAYLOAD_VERSION);
 
         // Parse to verify dropped_index_count = 0
         let mut off = 4; // count
         off += 1; // tag = 0x02
         off += 8; // collection_id
-        let name_len =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap())
-                as usize;
+        let name_len = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap()) as usize;
         off += 4 + name_len;
         off += 4; // primary_root_page
 
-        let idx_count =
-            u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
+        let idx_count = u32::from_le_bytes(catalog_data[off..off + 4].try_into().unwrap());
         assert_eq!(idx_count, 0);
     }
 
@@ -2032,27 +2112,15 @@ mod tests {
         });
 
         let payload = serialize_wal_payload(1, &ws);
-        let (version, _, _, catalog_data) =
-            deserialize_wal_payload(&payload).unwrap();
+        let (version, _, _, catalog_data) = deserialize_wal_payload(&payload).unwrap();
 
-        assert_eq!(version, 2);
-        let count =
-            u32::from_le_bytes(catalog_data[0..4].try_into().unwrap());
+        assert_eq!(version, WAL_PAYLOAD_VERSION);
+        let count = u32::from_le_bytes(catalog_data[0..4].try_into().unwrap());
         assert_eq!(count, 4);
 
-        // Verify tag sequence
-        let tags: Vec<u8> = {
-            let mut off = 4;
-            let mut tags = Vec::new();
-            for _ in 0..4 {
-                tags.push(catalog_data[off]);
-                // Skip to next entry — we can't easily skip variable-length
-                // so just verify the tags are present
-                break; // Only check first tag
-            }
-            tags
-        };
-        assert_eq!(tags[0], 0x01); // CreateCollection
+        // Verify the first tag; entries are variable-length, so the full
+        // sequence is covered by round-trip deserialization assertions.
+        assert_eq!(catalog_data[4], 0x01); // CreateCollection
     }
 
     // ─── Commit coordinator step reorder tests ───
@@ -2065,8 +2133,8 @@ mod tests {
         ws.add_catalog_mutation(CatalogMutation::CreateCollection {
             name: "test".into(),
             provisional_id: CollectionId(100),
-            primary_root_page: 0,     // Will be filled by allocate_collection_pages
-            created_at_root_page: 0,  // Will be filled by allocate_collection_pages
+            primary_root_page: 0, // Will be filled by allocate_collection_pages
+            created_at_root_page: 0, // Will be filled by allocate_collection_pages
         });
 
         let result = handle

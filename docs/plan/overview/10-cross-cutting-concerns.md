@@ -36,7 +36,7 @@ All errors use `anyhow::Result` internally. L8 maps to structured error codes at
 | Data | Algorithm | When Computed | When Verified |
 |------|-----------|---------------|---------------|
 | Page data | CRC-32C | On flush to disk | Every buffer pool cache miss |
-| WAL records | CRC-32C | On write | Every read (recovery, replication) |
+| WAL records | CRC-32C | On write | Every read (recovery, replication, integrity check) |
 | File header | CRC-32C | On checkpoint | On database open |
 | DWB header | CRC-32C | On checkpoint | On recovery |
 
@@ -68,10 +68,23 @@ CRC-32C is hardware-accelerated via SSE 4.2 / ARM CRC instructions. ~1% CPU over
 | Transaction idle timeout | Per database | 30s | `tx_idle_timeout` |
 | Transaction max lifetime | Per database | 5 min | `tx_max_lifetime` |
 | Read set max intervals | Per database | 4,096 | `max_intervals` |
+| Transaction max operations | Per database | 100,000 | `max_operations` |
 | Read set max scanned bytes | Per database | 64 MB | `max_scanned_bytes` |
 | Read set max scanned docs | Per database | 100,000 | `max_scanned_docs` |
 | WAL retention for replication | Per database | 1 GB | `wal_retention_max_size` |
 | WAL retention max age | Per database | 24h | `wal_retention_max_age` |
+
+Config parsing validates resource controls before use: database configs reject
+unusable values such as memory budgets below page size or zero transaction work
+budgets, and server configs reject zero message size, request queue capacity,
+or response write timeout. Zero scan byte/doc limits remain valid restrictive
+settings.
+
+Runtime usage accounting is exposed per database through L6, L8
+`list_databases`, and the CLI server `list-databases` command. Coverage checks
+that the direct JSON transport path and CLI both preserve all usage fields,
+that reported disk/page totals are internally consistent, and that active
+transaction counts transition correctly through wire begin/rollback.
 
 ## Dependency Graph (Crate-Level)
 

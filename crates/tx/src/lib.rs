@@ -36,13 +36,14 @@
 //!   `visible_ts` → subscriptions → respond). `Send`.
 //! - **[`CommitHandle`]**: `Send + Clone` — distributed to application code.
 
-pub mod timestamp;
-pub mod read_set;
-pub mod write_set;
+pub mod commit;
 pub mod commit_log;
 pub mod occ;
+pub mod promotion;
+pub mod read_set;
 pub mod subscriptions;
-pub mod commit;
+pub mod timestamp;
+pub mod write_set;
 
 // ─── Public Facade ───
 
@@ -51,35 +52,34 @@ pub use timestamp::TsAllocator;
 
 // T2: Read set
 pub use read_set::{
-    QueryId, LimitBoundary, ReadInterval, ReadSet,
-    CATALOG_COLLECTIONS, CATALOG_INDEXES,
-    CATALOG_COLLECTIONS_NAME_IDX, CATALOG_INDEXES_NAME_IDX,
+    CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX, CATALOG_INDEXES, CATALOG_INDEXES_NAME_IDX,
+    LimitBoundary, QueryId, ReadInterval, ReadSet,
 };
 
 // T3: Write set
 pub use write_set::{
-    WriteSet, MutationOp, MutationEntry, CatalogMutation, DroppedIndexMeta,
-    IndexDelta, IndexInfo, IndexResolver, compute_index_deltas,
-    CatalogMutationHandler, NoOpCatalogHandler,
+    CatalogMutation, CatalogMutationHandler, DroppedIndexMeta, IndexDelta, IndexInfo,
+    IndexResolver, MutationEntry, MutationOp, NoOpCatalogHandler, WriteSet, compute_index_deltas,
 };
 
 // T4: Commit log
 pub use commit_log::{CommitLog, CommitLogEntry, IndexKeyWrite, PRIMARY_INDEX_SENTINEL};
 
 // T5: OCC validation
-pub use occ::{validate, ConflictError, ConflictKind};
+pub use occ::{ConflictError, ConflictKind, validate};
+
+// Transaction promotion payloads
+pub use promotion::{deserialize_promotion_payload, serialize_promotion_payload};
 
 // T6: Subscriptions
 pub use subscriptions::{
-    SubscriptionId, SubscriptionMode, SubscriptionRegistry,
-    SubscriptionMeta, SubscriptionInterval,
-    InvalidationEvent, ChainContinuation,
+    ChainContinuation, InvalidationEvent, SubscriptionId, SubscriptionInterval, SubscriptionMeta,
+    SubscriptionMode, SubscriptionRegistry,
 };
 
 // T7: Commit protocol
 pub use commit::{
-    CommitCoordinator, ReplicationRunner, CommitHandle,
-    CommitRequest, CommitResult, CommitError,
-    ConflictRetry, ReplicationHook, NoReplication,
-    deserialize_wal_payload, WAL_PAYLOAD_VERSION,
+    CommitCoordinator, CommitError, CommitHandle, CommitRequest, CommitResult, ConflictRetry,
+    NoReplication, ReplicationHook, ReplicationRunner, WAL_PAYLOAD_VERSION,
+    deserialize_wal_payload,
 };

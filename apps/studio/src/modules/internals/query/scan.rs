@@ -6,7 +6,7 @@ use exdb_core::field_path::FieldPath;
 use exdb_core::filter::{Filter, RangeExpr};
 use exdb_core::types::{CollectionId, IndexId, Scalar};
 use exdb_docstore::{PrimaryIndex, SecondaryIndex};
-use exdb_query::{resolve_access, execute_scan, AccessMethod, IndexInfo as QueryIndexInfo};
+use exdb_query::{AccessMethod, IndexInfo as QueryIndexInfo, execute_scan, resolve_access};
 use exdb_storage::btree::ScanDirection;
 use tokio_stream::StreamExt;
 
@@ -38,7 +38,8 @@ pub fn QueryScanModule() -> Element {
     #[allow(clippy::type_complexity)]
     let mut selected_collection: Signal<Option<(u64, String, u32)>> = use_signal(|| None);
     #[allow(clippy::type_complexity)]
-    let mut selected_index: Signal<Option<(u64, String, u32, Vec<Vec<String>>)>> = use_signal(|| None);
+    let mut selected_index: Signal<Option<(u64, String, u32, Vec<Vec<String>>)>> =
+        use_signal(|| None);
     let mut range_json: Signal<String> = use_signal(|| "[]".to_string());
     let mut filter_json: Signal<String> = use_signal(String::new);
     let mut direction: Signal<String> = use_signal(|| "forward".to_string());
@@ -287,23 +288,46 @@ async fn run_query(
     lim_str: &str,
     ts_str: &str,
 ) -> QueryResult {
-    let empty = QueryResult { rows: vec![], access_method: String::new(), error: None };
+    let empty = QueryResult {
+        rows: vec![],
+        access_method: String::new(),
+        error: None,
+    };
 
     let Some(db) = db else {
-        return QueryResult { error: Some("No database open".into()), ..empty };
+        return QueryResult {
+            error: Some("No database open".into()),
+            ..empty
+        };
     };
     let Some((col_id, _col_name, primary_root)) = collection else {
-        return QueryResult { error: Some("Select a collection".into()), ..empty };
+        return QueryResult {
+            error: Some("Select a collection".into()),
+            ..empty
+        };
     };
 
-    let scan_dir = if dir_str == "backward" { ScanDirection::Backward } else { ScanDirection::Forward };
+    let scan_dir = if dir_str == "backward" {
+        ScanDirection::Backward
+    } else {
+        ScanDirection::Forward
+    };
     let limit: Option<usize> = lim_str.parse().ok();
-    let read_ts: u64 = if ts_str == "max" || ts_str.is_empty() { u64::MAX } else { ts_str.parse().unwrap_or(u64::MAX) };
+    let read_ts: u64 = if ts_str == "max" || ts_str.is_empty() {
+        u64::MAX
+    } else {
+        ts_str.parse().unwrap_or(u64::MAX)
+    };
 
     // Parse range expressions
     let range_exprs = match parse_range_exprs(range_str) {
         Ok(r) => r,
-        Err(e) => return QueryResult { error: Some(format!("Range parse error: {e}")), ..empty },
+        Err(e) => {
+            return QueryResult {
+                error: Some(format!("Range parse error: {e}")),
+                ..empty
+            };
+        }
     };
 
     // Parse filter
@@ -312,27 +336,39 @@ async fn run_query(
     } else {
         match parse_filter(filter_str) {
             Ok(f) => Some(f),
-            Err(e) => return QueryResult { error: Some(format!("Filter parse error: {e}")), ..empty },
+            Err(e) => {
+                return QueryResult {
+                    error: Some(format!("Filter parse error: {e}")),
+                    ..empty
+                };
+            }
         }
     };
 
     // Build QueryIndexInfo
     let (query_index, sec_root) = if let Some((idx_id, _name, root, field_paths)) = index {
-        let fps: Vec<FieldPath> = field_paths.iter()
+        let fps: Vec<FieldPath> = field_paths
+            .iter()
             .map(|segments| FieldPath::new(segments.clone()))
             .collect();
-        (QueryIndexInfo {
-            index_id: IndexId(idx_id),
-            field_paths: fps,
-            ready: true,
-        }, Some(root))
+        (
+            QueryIndexInfo {
+                index_id: IndexId(idx_id),
+                field_paths: fps,
+                ready: true,
+            },
+            Some(root),
+        )
     } else {
         // Table scan: use a dummy _created_at index
-        (QueryIndexInfo {
-            index_id: IndexId(0),
-            field_paths: vec![FieldPath::single("_created_at")],
-            ready: true,
-        }, None)
+        (
+            QueryIndexInfo {
+                index_id: IndexId(0),
+                field_paths: vec![FieldPath::single("_created_at")],
+                ready: true,
+            },
+            None,
+        )
     };
 
     // Resolve access method
@@ -345,7 +381,12 @@ async fn run_query(
         limit,
     ) {
         Ok(m) => m,
-        Err(e) => return QueryResult { error: Some(format!("Access resolution error: {e:?}")), ..empty },
+        Err(e) => {
+            return QueryResult {
+                error: Some(format!("Access resolution error: {e:?}")),
+                ..empty
+            };
+        }
     };
 
     let access_desc = format_access_method(&method);
@@ -366,14 +407,17 @@ async fn run_query(
         secondary_indexes.insert(query_index.index_id, sec_idx);
     }
 
-    let (mut stream, _interval) = match execute_scan(&method, &primary_index, &secondary_indexes, read_ts).await {
-        Ok(s) => s,
-        Err(e) => return QueryResult {
-            access_method: access_desc,
-            error: Some(format!("Scan error: {e}")),
-            rows: vec![],
-        },
-    };
+    let (mut stream, _interval) =
+        match execute_scan(&method, &primary_index, &secondary_indexes, read_ts).await {
+            Ok(s) => s,
+            Err(e) => {
+                return QueryResult {
+                    access_method: access_desc,
+                    error: Some(format!("Scan error: {e}")),
+                    rows: vec![],
+                };
+            }
+        };
 
     let mut rows = Vec::new();
     while let Some(item) = stream.next().await {
@@ -395,7 +439,11 @@ async fn run_query(
         }
     }
 
-    QueryResult { rows, access_method: access_desc, error: None }
+    QueryResult {
+        rows,
+        access_method: access_desc,
+        error: None,
+    }
 }
 
 fn format_access_method(method: &AccessMethod) -> String {
@@ -403,16 +451,43 @@ fn format_access_method(method: &AccessMethod) -> String {
         AccessMethod::PrimaryGet { doc_id, .. } => {
             format!("PrimaryGet({})", hex_encode(doc_id.as_bytes()))
         }
-        AccessMethod::IndexScan { index_id, direction, limit, post_filter, .. } => {
-            let dir = if *direction == ScanDirection::Backward { "Backward" } else { "Forward" };
+        AccessMethod::IndexScan {
+            index_id,
+            direction,
+            limit,
+            post_filter,
+            ..
+        } => {
+            let dir = if *direction == ScanDirection::Backward {
+                "Backward"
+            } else {
+                "Forward"
+            };
             let lim = limit.map(|l| format!(", limit={l}")).unwrap_or_default();
-            let filt = if post_filter.is_some() { ", +filter" } else { "" };
+            let filt = if post_filter.is_some() {
+                ", +filter"
+            } else {
+                ""
+            };
             format!("IndexScan(idx={}, {dir}{lim}{filt})", index_id.0)
         }
-        AccessMethod::TableScan { direction, limit, post_filter, .. } => {
-            let dir = if *direction == ScanDirection::Backward { "Backward" } else { "Forward" };
+        AccessMethod::TableScan {
+            direction,
+            limit,
+            post_filter,
+            ..
+        } => {
+            let dir = if *direction == ScanDirection::Backward {
+                "Backward"
+            } else {
+                "Forward"
+            };
             let lim = limit.map(|l| format!(", limit={l}")).unwrap_or_default();
-            let filt = if post_filter.is_some() { ", +filter" } else { "" };
+            let filt = if post_filter.is_some() {
+                ", +filter"
+            } else {
+                ""
+            };
             format!("TableScan({dir}{lim}{filt})")
         }
     }
@@ -423,23 +498,29 @@ pub fn parse_range_exprs(json: &str) -> Result<Vec<RangeExpr>, String> {
     if json.is_empty() || json == "[]" {
         return Ok(vec![]);
     }
-    let arr: Vec<serde_json::Value> = serde_json::from_str(json)
-        .map_err(|e| format!("Invalid JSON: {e}"))?;
+    let arr: Vec<serde_json::Value> =
+        serde_json::from_str(json).map_err(|e| format!("Invalid JSON: {e}"))?;
 
     arr.iter().map(parse_single_range).collect()
 }
 
 fn parse_single_range(v: &serde_json::Value) -> Result<RangeExpr, String> {
-    let obj = v.as_object().ok_or("Each range expr must be a JSON object")?;
+    let obj = v
+        .as_object()
+        .ok_or("Each range expr must be a JSON object")?;
     if obj.len() != 1 {
         return Err("Range expr must have exactly one key (Eq, Gt, Gte, Lt, Lte)".into());
     }
     let (op, args) = obj.iter().next().expect("len == 1 checked above");
-    let arr = args.as_array().ok_or("Range value must be [field, value]")?;
+    let arr = args
+        .as_array()
+        .ok_or("Range value must be [field, value]")?;
     if arr.len() != 2 {
         return Err("Range value must be [field, value]".into());
     }
-    let field = arr[0].as_str().ok_or("First element must be field name string")?;
+    let field = arr[0]
+        .as_str()
+        .ok_or("First element must be field name string")?;
     let fp = parse_field_path(field);
     let scalar = json_to_scalar(&arr[1])?;
 
@@ -454,8 +535,8 @@ fn parse_single_range(v: &serde_json::Value) -> Result<RangeExpr, String> {
 }
 
 pub fn parse_filter(json: &str) -> Result<Filter, String> {
-    let v: serde_json::Value = serde_json::from_str(json)
-        .map_err(|e| format!("Invalid JSON: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("Invalid JSON: {e}"))?;
     parse_filter_value(&v)
 }
 
@@ -473,17 +554,24 @@ fn parse_filter_value(v: &serde_json::Value) -> Result<Filter, String> {
         "Lt" | "lt" => parse_comparison_filter(args, Filter::Lt),
         "Lte" | "lte" => parse_comparison_filter(args, Filter::Lte),
         "In" | "in" => {
-            let arr = args.as_array().ok_or("In value must be [field, [values]]")?;
+            let arr = args
+                .as_array()
+                .ok_or("In value must be [field, [values]]")?;
             if arr.len() != 2 {
                 return Err("In value must be [field, [values]]".into());
             }
             let field = arr[0].as_str().ok_or("First element must be field name")?;
-            let vals_arr = arr[1].as_array().ok_or("Second element must be array of values")?;
-            let scalars: Result<Vec<Scalar>, String> = vals_arr.iter().map(json_to_scalar).collect();
+            let vals_arr = arr[1]
+                .as_array()
+                .ok_or("Second element must be array of values")?;
+            let scalars: Result<Vec<Scalar>, String> =
+                vals_arr.iter().map(json_to_scalar).collect();
             Ok(Filter::In(parse_field_path(field), scalars?))
         }
         "And" | "and" => {
-            let arr = args.as_array().ok_or("And value must be array of filters")?;
+            let arr = args
+                .as_array()
+                .ok_or("And value must be array of filters")?;
             let filters: Result<Vec<Filter>, String> = arr.iter().map(parse_filter_value).collect();
             Ok(Filter::And(filters?))
         }
@@ -500,8 +588,13 @@ fn parse_filter_value(v: &serde_json::Value) -> Result<Filter, String> {
     }
 }
 
-fn parse_comparison_filter(args: &serde_json::Value, ctor: fn(FieldPath, Scalar) -> Filter) -> Result<Filter, String> {
-    let arr = args.as_array().ok_or("Comparison value must be [field, value]")?;
+fn parse_comparison_filter(
+    args: &serde_json::Value,
+    ctor: fn(FieldPath, Scalar) -> Filter,
+) -> Result<Filter, String> {
+    let arr = args
+        .as_array()
+        .ok_or("Comparison value must be [field, value]")?;
     if arr.len() != 2 {
         return Err("Comparison value must be [field, value]".into());
     }

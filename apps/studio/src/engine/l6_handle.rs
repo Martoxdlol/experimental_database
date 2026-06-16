@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use exdb::catalog_cache::{CollectionMeta, IndexMeta};
 use exdb::{
-    Database, DatabaseConfig, DatabaseError, DocId, FieldPath, Filter,
-    RangeExpr, ScanDirection, TransactionOptions, TransactionResult,
+    Database, DatabaseConfig, DatabaseError, DocId, FieldPath, Filter, RangeExpr, ScanDirection,
+    TransactionOptions, TransactionResult,
 };
 use exdb_core::encoding::decode_document;
 use exdb_docstore::PrimaryIndex;
@@ -79,7 +79,9 @@ impl L6Handle {
         limit: Option<usize>,
     ) -> Result<Vec<Value>, DatabaseError> {
         let mut tx = self.db.begin(TransactionOptions::readonly())?;
-        let docs = tx.query(collection, index, range, filter, direction, limit).await?;
+        let docs = tx
+            .query(collection, index, range, filter, direction, limit)
+            .await?;
         tx.rollback();
         Ok(docs)
     }
@@ -93,7 +95,14 @@ impl L6Handle {
     ) -> Result<Vec<Value>, DatabaseError> {
         let mut tx = self.db.begin(TransactionOptions::readonly())?;
         let docs = tx
-            .query(collection, "_created_at", &[], None, Some(direction), Some(limit))
+            .query(
+                collection,
+                "_created_at",
+                &[],
+                None,
+                Some(direction),
+                Some(limit),
+            )
             .await?;
         tx.rollback();
         Ok(docs)
@@ -107,7 +116,9 @@ impl L6Handle {
         direction: ScanDirection,
         limit: usize,
     ) -> Result<Vec<(DocId, Value)>, DatabaseError> {
-        let meta = self.db.get_collection(collection)
+        let meta = self
+            .db
+            .get_collection(collection)
             .ok_or_else(|| DatabaseError::CollectionNotFound(collection.to_string()))?;
 
         let storage = self.db.storage();
@@ -179,19 +190,13 @@ impl L6Handle {
 
     // ─── DDL ───
 
-    pub async fn create_collection(
-        &self,
-        name: &str,
-    ) -> Result<TransactionResult, DatabaseError> {
+    pub async fn create_collection(&self, name: &str) -> Result<TransactionResult, DatabaseError> {
         let mut tx = self.db.begin(TransactionOptions::default())?;
         tx.create_collection(name).await?;
         tx.commit().await
     }
 
-    pub async fn drop_collection(
-        &self,
-        name: &str,
-    ) -> Result<TransactionResult, DatabaseError> {
+    pub async fn drop_collection(&self, name: &str) -> Result<TransactionResult, DatabaseError> {
         let mut tx = self.db.begin(TransactionOptions::default())?;
         tx.drop_collection(name).await?;
         tx.commit().await

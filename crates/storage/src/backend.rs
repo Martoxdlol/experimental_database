@@ -7,8 +7,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -48,6 +49,25 @@ pub trait PageStorage: Send + Sync {
 
     /// Returns the page size this backend was configured with.
     fn page_size(&self) -> usize;
+
+    /// Physical bytes occupied by the page store, when the backend can report it.
+    ///
+    /// File-backed storage uses this for integrity diagnostics to catch partial
+    /// trailing bytes that are not represented by `page_count()`.
+    fn physical_size_bytes(&self) -> io::Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Truncate the physical page store to exactly `size` bytes, when supported.
+    ///
+    /// This is used by conservative integrity repair for durable backends that
+    /// can prove there are bytes beyond the logical page image.
+    async fn truncate_to_size_bytes(&self, _size: u64) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "page storage backend does not support physical truncation",
+        ))
+    }
 
     /// Whether this backend provides durable storage.
     fn is_durable(&self) -> bool;
@@ -97,6 +117,15 @@ pub trait WalStorage: Send + Sync {
     /// Used by retention policy to monitor WAL growth and decide when to truncate.
     fn retained_size(&self) -> u64;
 
+    /// Return a safe truncation point for enforcing a maximum retained age.
+    ///
+    /// Implementations should only return offsets that can be reclaimed without
+    /// partially deleting the active segment. Backends without segment age
+    /// metadata may return `None`.
+    fn reclamation_lsn_for_retention_age(&self, _max_age: Duration) -> Option<u64> {
+        None
+    }
+
     /// Total bytes written so far (logical end offset).
     fn size(&self) -> u64;
 
@@ -119,6 +148,7 @@ pub struct FilePageStorage {
     file: Arc<File>,
     page_size: usize,
     page_count: AtomicU64,
+    max_size_bytes: Option<u64>,
 }
 
 impl FilePageStorage {
@@ -127,6 +157,15 @@ impl FilePageStorage {
     /// Acquires an exclusive lock (non-blocking). Returns an error if another
     /// process already has the file open.
     pub fn open(path: &Path, page_size: usize) -> io::Result<Self> {
+        Self::open_with_max_size(path, page_size, None)
+    }
+
+    /// Open an existing data file with an optional maximum data-file size.
+    pub fn open_with_max_size(
+        path: &Path,
+        page_size: usize,
+        max_size_bytes: Option<u64>,
+    ) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         Self::try_lock(&file, path)?;
         let metadata = file.metadata()?;
@@ -136,6 +175,7 @@ impl FilePageStorage {
             file: Arc::new(file),
             page_size,
             page_count: AtomicU64::new(page_count),
+            max_size_bytes,
         })
     }
 
@@ -144,6 +184,15 @@ impl FilePageStorage {
     /// Acquires an exclusive lock (non-blocking). Returns an error if another
     /// process already has the file open.
     pub fn create(path: &Path, page_size: usize) -> io::Result<Self> {
+        Self::create_with_max_size(path, page_size, None)
+    }
+
+    /// Create a new data file with an optional maximum data-file size.
+    pub fn create_with_max_size(
+        path: &Path,
+        page_size: usize,
+        max_size_bytes: Option<u64>,
+    ) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -155,6 +204,7 @@ impl FilePageStorage {
             file: Arc::new(file),
             page_size,
             page_count: AtomicU64::new(0),
+            max_size_bytes,
         })
     }
 
@@ -208,7 +258,8 @@ impl PageStorage for FilePageStorage {
                 "page_id {} out of range (page_count {})",
                 page_id,
                 self.page_count.load(Ordering::Acquire)
-            )).into());
+            ))
+            .into());
         }
         let file = self.file.clone();
         let offset = page_id as u64 * self.page_size as u64;
@@ -217,7 +268,9 @@ impl PageStorage for FilePageStorage {
             let mut tmp = vec![0u8; len];
             file.read_at(&mut tmp, offset)?;
             Ok::<_, io::Error>(tmp)
-        }).await.map_err(io::Error::other)??;
+        })
+        .await
+        .map_err(io::Error::other)??;
         buf.copy_from_slice(&data);
         Ok(())
     }
@@ -228,7 +281,8 @@ impl PageStorage for FilePageStorage {
                 "page_id {} out of range (page_count {})",
                 page_id,
                 self.page_count.load(Ordering::Acquire)
-            )).into());
+            ))
+            .into());
         }
         let file = self.file.clone();
         let offset = page_id as u64 * self.page_size as u64;
@@ -236,15 +290,17 @@ impl PageStorage for FilePageStorage {
         tokio::task::spawn_blocking(move || {
             file.write_at(&data, offset)?;
             Ok::<_, io::Error>(())
-        }).await.map_err(io::Error::other)??;
+        })
+        .await
+        .map_err(io::Error::other)??;
         Ok(())
     }
 
     async fn sync(&self) -> io::Result<()> {
         let file = self.file.clone();
-        tokio::task::spawn_blocking(move || {
-            file.sync_data()
-        }).await.map_err(io::Error::other)?
+        tokio::task::spawn_blocking(move || file.sync_data())
+            .await
+            .map_err(io::Error::other)?
     }
 
     fn page_count(&self) -> u64 {
@@ -257,17 +313,67 @@ impl PageStorage for FilePageStorage {
             return Ok(());
         }
         let file = self.file.clone();
-        let new_len = new_count * self.page_size as u64;
+        let new_len = new_count
+            .checked_mul(self.page_size as u64)
+            .ok_or_else(|| {
+                crate::error::StorageError::InvalidConfig(
+                    "data file size overflow while extending page storage".into(),
+                )
+            })?;
+        if let Some(limit) = self.max_size_bytes
+            && new_len > limit
+        {
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "disk usage limit exceeded: data file would grow to {} bytes (limit {})",
+                new_len, limit
+            ))
+            .into());
+        }
         tokio::task::spawn_blocking(move || {
             file.set_len(new_len)?;
             file.sync_data()
-        }).await.map_err(io::Error::other)??;
+        })
+        .await
+        .map_err(io::Error::other)??;
         self.page_count.store(new_count, Ordering::Release);
         Ok(())
     }
 
     fn page_size(&self) -> usize {
         self.page_size
+    }
+
+    fn physical_size_bytes(&self) -> io::Result<Option<u64>> {
+        Ok(Some(self.file.metadata()?.len()))
+    }
+
+    async fn truncate_to_size_bytes(&self, size: u64) -> io::Result<()> {
+        if !size.is_multiple_of(self.page_size as u64) {
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "data file truncation size {} is not aligned to page_size {}",
+                size, self.page_size
+            ))
+            .into());
+        }
+        if let Some(limit) = self.max_size_bytes
+            && size > limit
+        {
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "disk usage limit exceeded: data file would truncate to {} bytes (limit {})",
+                size, limit
+            ))
+            .into());
+        }
+        let file = self.file.clone();
+        tokio::task::spawn_blocking(move || {
+            file.set_len(size)?;
+            file.sync_data()
+        })
+        .await
+        .map_err(io::Error::other)??;
+        self.page_count
+            .store(size / self.page_size as u64, Ordering::Release);
+        Ok(())
     }
 
     fn is_durable(&self) -> bool {
@@ -291,7 +397,8 @@ const WAL_SEGMENT_MAGIC: [u8; 4] = *b"WALS";
 ///   [8..16]  base_lsn (u64 LE)
 ///   [16..20] segment_id (u32 LE)
 ///   [20..32] reserved (zero)
-const SEGMENT_HEADER_SIZE: u64 = 32;
+pub(crate) const WAL_SEGMENT_HEADER_SIZE: u64 = 32;
+const SEGMENT_HEADER_SIZE: u64 = WAL_SEGMENT_HEADER_SIZE;
 
 /// Metadata about a single WAL segment file.
 struct SegmentInfo {
@@ -334,32 +441,36 @@ impl FileWalStorage {
             let entry = entry?;
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && name.starts_with("segment-") && name.ends_with(".wal") {
-                    let seg_id_str = &name["segment-".len()..name.len() - ".wal".len()];
-                    let segment_id: u32 = seg_id_str.parse().map_err(|_| {
-                        io::Error::from(crate::error::StorageError::Corruption(
-                            format!("bad segment name: {}", name),
-                        ))
-                    })?;
-                    let metadata = fs::metadata(&path)?;
-                    let file_size = metadata.len();
+                && name.starts_with("segment-")
+                && name.ends_with(".wal")
+            {
+                let seg_id_str = &name["segment-".len()..name.len() - ".wal".len()];
+                let segment_id: u32 = seg_id_str.parse().map_err(|_| {
+                    io::Error::from(crate::error::StorageError::Corruption(format!(
+                        "bad segment name: {}",
+                        name
+                    )))
+                })?;
+                let metadata = fs::metadata(&path)?;
+                let file_size = metadata.len();
 
-                    // Read and validate header
-                    let base_lsn = Self::read_segment_header(&path)?;
+                // Read and validate header
+                let base_lsn = Self::read_segment_header(&path)?;
 
-                    segments.push(SegmentInfo {
-                        segment_id,
-                        base_lsn,
-                        file_size,
-                        path,
-                    });
-                }
+                segments.push(SegmentInfo {
+                    segment_id,
+                    base_lsn,
+                    file_size,
+                    path,
+                });
+            }
         }
 
         if segments.is_empty() {
             return Err(crate::error::StorageError::Corruption(
-                "no WAL segments found in directory".into()
-            ).into());
+                "no WAL segments found in directory".into(),
+            )
+            .into());
         }
 
         // Sort by base_lsn
@@ -367,7 +478,10 @@ impl FileWalStorage {
 
         // Open the latest segment for appending
         let last = segments.last().expect("checked non-empty above");
-        let active_segment = OpenOptions::new().read(true).append(true).open(&last.path)?;
+        let active_segment = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&last.path)?;
         let active_segment_id = last.segment_id;
         let active_base_lsn = last.base_lsn;
 
@@ -389,10 +503,21 @@ impl FileWalStorage {
 
     /// Create a new WAL directory with an initial empty segment.
     pub fn create(dir: &Path, segment_size: usize) -> io::Result<Self> {
+        Self::create_with_base_lsn(dir, segment_size, 0)
+    }
+
+    /// Create a new WAL directory with an initial empty segment at `base_lsn`.
+    ///
+    /// Snapshot restores use this to resume future appends at the restored
+    /// checkpoint LSN instead of starting the log back at zero.
+    pub fn create_with_base_lsn(
+        dir: &Path,
+        segment_size: usize,
+        base_lsn: u64,
+    ) -> io::Result<Self> {
         fs::create_dir_all(dir)?;
 
         let segment_id = 1u32;
-        let base_lsn = 0u64;
         let path = dir.join(Self::segment_filename(segment_id));
 
         let mut file = OpenOptions::new()
@@ -424,7 +549,7 @@ impl FileWalStorage {
                 active_segment,
                 active_segment_id: segment_id,
                 active_base_lsn: base_lsn,
-                write_offset: 0,
+                write_offset: base_lsn,
                 segments,
             })),
         })
@@ -454,9 +579,11 @@ impl FileWalStorage {
         file.read_exact(&mut header)?;
 
         if header[0..4] != WAL_SEGMENT_MAGIC {
-            return Err(crate::error::StorageError::Corruption(
-                format!("corrupt WAL segment header (bad magic) in {:?}", path),
-            ).into());
+            return Err(crate::error::StorageError::Corruption(format!(
+                "corrupt WAL segment header (bad magic) in {:?}",
+                path
+            ))
+            .into());
         }
 
         let version = crate::util::read_u32_le(&header, 4)?;
@@ -464,7 +591,8 @@ impl FileWalStorage {
             return Err(crate::error::StorageError::Corruption(format!(
                 "unsupported WAL segment version {} in {:?}",
                 version, path
-            )).into());
+            ))
+            .into());
         }
 
         let base_lsn = crate::util::read_u64_le(&header, 8)?;
@@ -530,12 +658,15 @@ impl WalStorage for FileWalStorage {
 
             // Check if we need to roll over
             if let Some(seg) = inner.segments.last()
-                && seg.file_size > segment_size as u64 {
-                    Self::rollover(&mut inner, &dir)?;
-                }
+                && seg.file_size > segment_size as u64
+            {
+                Self::rollover(&mut inner, &dir)?;
+            }
 
             Ok(offset)
-        }).await.map_err(io::Error::other)?
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     async fn sync(&self) -> io::Result<()> {
@@ -543,7 +674,9 @@ impl WalStorage for FileWalStorage {
         tokio::task::spawn_blocking(move || {
             let inner = inner.lock();
             inner.active_segment.sync_data()
-        }).await.map_err(io::Error::other)?
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     async fn read_from(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
@@ -563,19 +696,18 @@ impl WalStorage for FileWalStorage {
 
             while current_offset < end_offset && total_read < buf_len {
                 // Find the segment containing current_offset via binary search.
-                let seg_idx =
-                    match inner
-                        .segments
-                        .binary_search_by_key(&current_offset, |s| s.base_lsn)
-                    {
-                        Ok(i) => i,
-                        Err(i) => {
-                            if i == 0 {
-                                break;
-                            }
-                            i - 1
+                let seg_idx = match inner
+                    .segments
+                    .binary_search_by_key(&current_offset, |s| s.base_lsn)
+                {
+                    Ok(i) => i,
+                    Err(i) => {
+                        if i == 0 {
+                            break;
                         }
-                    };
+                        i - 1
+                    }
+                };
 
                 let seg = &inner.segments[seg_idx];
 
@@ -612,7 +744,9 @@ impl WalStorage for FileWalStorage {
 
             result.truncate(total_read);
             Ok::<_, io::Error>(result)
-        }).await.map_err(io::Error::other)??;
+        })
+        .await
+        .map_err(io::Error::other)??;
 
         let n = data.len();
         buf[..n].copy_from_slice(&data);
@@ -628,6 +762,11 @@ impl WalStorage for FileWalStorage {
             let mut to_remove = Vec::new();
 
             for (i, seg) in inner.segments.iter().enumerate() {
+                if i + 1 == inner.segments.len() {
+                    // Never reclaim the active segment, even if the caller's
+                    // retention point is beyond its current end.
+                    continue;
+                }
                 let seg_end_lsn = seg.base_lsn + (seg.file_size - SEGMENT_HEADER_SIZE);
                 if seg_end_lsn <= offset {
                     to_remove.push(i);
@@ -641,7 +780,9 @@ impl WalStorage for FileWalStorage {
             }
 
             Ok(())
-        }).await.map_err(io::Error::other)?
+        })
+        .await
+        .map_err(io::Error::other)?
     }
 
     fn oldest_lsn(&self) -> Option<u64> {
@@ -652,6 +793,26 @@ impl WalStorage for FileWalStorage {
     fn retained_size(&self) -> u64 {
         let inner = self.inner.lock();
         inner.segments.iter().map(|s| s.file_size).sum()
+    }
+
+    fn reclamation_lsn_for_retention_age(&self, max_age: Duration) -> Option<u64> {
+        let cutoff = SystemTime::now()
+            .checked_sub(max_age)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let inner = self.inner.lock();
+        let mut reclaim_lsn = None;
+        for (i, seg) in inner.segments.iter().enumerate() {
+            if i + 1 == inner.segments.len() {
+                break;
+            }
+            let modified = fs::metadata(&seg.path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(SystemTime::now());
+            if modified <= cutoff {
+                reclaim_lsn = Some(seg.base_lsn + (seg.file_size - SEGMENT_HEADER_SIZE));
+            }
+        }
+        reclaim_lsn
     }
 
     fn size(&self) -> u64 {
@@ -674,14 +835,21 @@ impl WalStorage for FileWalStorage {
 pub struct MemoryPageStorage {
     pages: RwLock<Vec<Vec<u8>>>,
     page_size: usize,
+    max_size_bytes: Option<u64>,
 }
 
 impl MemoryPageStorage {
     /// Create a new in-memory page store with the given page size.
     pub fn new(page_size: usize) -> Self {
+        Self::new_with_max_size(page_size, None)
+    }
+
+    /// Create a new in-memory page store with an optional maximum byte size.
+    pub fn new_with_max_size(page_size: usize, max_size_bytes: Option<u64>) -> Self {
         Self {
             pages: RwLock::new(Vec::new()),
             page_size,
+            max_size_bytes,
         }
     }
 }
@@ -695,7 +863,8 @@ impl PageStorage for MemoryPageStorage {
                 "page_id {} out of range (page_count {})",
                 page_id,
                 pages.len()
-            )).into());
+            ))
+            .into());
         }
         buf.copy_from_slice(&pages[page_id as usize]);
         Ok(())
@@ -708,7 +877,8 @@ impl PageStorage for MemoryPageStorage {
                 "page_id {} out of range (page_count {})",
                 page_id,
                 pages.len()
-            )).into());
+            ))
+            .into());
         }
         pages[page_id as usize].copy_from_slice(buf);
         Ok(())
@@ -727,6 +897,22 @@ impl PageStorage for MemoryPageStorage {
         let current = pages.len() as u64;
         if new_count <= current {
             return Ok(());
+        }
+        let new_len = new_count
+            .checked_mul(self.page_size as u64)
+            .ok_or_else(|| {
+                crate::error::StorageError::InvalidConfig(
+                    "page storage size overflow while extending memory storage".into(),
+                )
+            })?;
+        if let Some(limit) = self.max_size_bytes
+            && new_len > limit
+        {
+            return Err(crate::error::StorageError::InvalidConfig(format!(
+                "disk usage limit exceeded: page storage would grow to {} bytes (limit {})",
+                new_len, limit
+            ))
+            .into());
         }
         for _ in current..new_count {
             pages.push(vec![0u8; self.page_size]);
@@ -1223,6 +1409,29 @@ mod tests {
             );
             assert_eq!(buf, record);
         }
+    }
+
+    #[tokio::test]
+    async fn file_wal_storage_truncate_never_removes_active_segment() {
+        let tmp = TempDir::new().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let storage = FileWalStorage::create(&wal_dir, 256).unwrap();
+
+        storage.append(b"only-active-segment").await.unwrap();
+        let logical_end = storage.size();
+        storage.truncate_before(logical_end + 1024).await.unwrap();
+
+        assert_eq!(storage.oldest_lsn(), Some(0));
+        let seg_count = {
+            let inner = storage.inner.lock();
+            inner.segments.len()
+        };
+        assert_eq!(seg_count, 1);
+
+        let mut buf = vec![0u8; b"only-active-segment".len()];
+        let n = storage.read_from(0, &mut buf).await.unwrap();
+        assert_eq!(n, b"only-active-segment".len());
+        assert_eq!(&buf, b"only-active-segment");
     }
 
     // ─── Test 10: MemoryWalStorage roundtrip ───

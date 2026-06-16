@@ -52,6 +52,14 @@ impl TsAllocator {
     pub fn allocate(&self) -> Ts {
         self.next.fetch_add(1, Ordering::AcqRel)
     }
+
+    /// Ensure future allocations are greater than or equal to `ts + 1`.
+    ///
+    /// Used by replica apply paths that learn commit timestamps from the primary
+    /// instead of allocating them locally.
+    pub fn advance_to(&self, ts: Ts) {
+        self.next.fetch_max(ts.saturating_add(1), Ordering::AcqRel);
+    }
 }
 
 #[cfg(test)]
@@ -88,6 +96,23 @@ mod tests {
         let alloc = TsAllocator::new(100);
         assert_eq!(alloc.allocate(), 101);
         assert_eq!(alloc.latest(), 101);
+    }
+
+    #[test]
+    fn advance_to_keeps_allocations_above_external_timestamp() {
+        let alloc = TsAllocator::new(10);
+        alloc.advance_to(42);
+        assert_eq!(alloc.latest(), 42);
+        assert_eq!(alloc.allocate(), 43);
+    }
+
+    #[test]
+    fn advance_to_does_not_move_backwards() {
+        let alloc = TsAllocator::new(10);
+        alloc.allocate();
+        alloc.advance_to(5);
+        assert_eq!(alloc.latest(), 11);
+        assert_eq!(alloc.allocate(), 12);
     }
 
     #[tokio::test]

@@ -155,10 +155,7 @@ mod tests {
     #[test]
     fn ne_match() {
         let doc = json!({"x": 1});
-        assert!(filter_matches(
-            &doc,
-            &Filter::Ne(fp("x"), Scalar::Int64(2))
-        ));
+        assert!(filter_matches(&doc, &Filter::Ne(fp("x"), Scalar::Int64(2))));
     }
 
     #[test]
@@ -174,10 +171,7 @@ mod tests {
     #[test]
     fn gt_lt_gte_lte() {
         let doc = json!({"x": 5});
-        assert!(filter_matches(
-            &doc,
-            &Filter::Gt(fp("x"), Scalar::Int64(3))
-        ));
+        assert!(filter_matches(&doc, &Filter::Gt(fp("x"), Scalar::Int64(3))));
         assert!(!filter_matches(
             &doc,
             &Filter::Gt(fp("x"), Scalar::Int64(5))
@@ -276,25 +270,16 @@ mod tests {
     fn missing_field() {
         let doc = json!({});
         // Missing != Null
-        assert!(!filter_matches(
-            &doc,
-            &Filter::Eq(fp("x"), Scalar::Null)
-        ));
+        assert!(!filter_matches(&doc, &Filter::Eq(fp("x"), Scalar::Null)));
         // Missing != Null → true for Ne
-        assert!(filter_matches(
-            &doc,
-            &Filter::Ne(fp("x"), Scalar::Null)
-        ));
+        assert!(filter_matches(&doc, &Filter::Ne(fp("x"), Scalar::Null)));
     }
 
     #[test]
     fn nested_field_path() {
         let doc = json!({"user": {"age": 25}});
         let path = FieldPath::new(vec!["user".into(), "age".into()]);
-        assert!(filter_matches(
-            &doc,
-            &Filter::Gte(path, Scalar::Int64(18))
-        ));
+        assert!(filter_matches(&doc, &Filter::Gte(path, Scalar::Int64(18))));
     }
 
     #[test]

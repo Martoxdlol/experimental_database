@@ -6,8 +6,8 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use futures_core::Stream;
 use tokio::sync::{mpsc, oneshot};
@@ -22,11 +22,11 @@ pub type Lsn = u64;
 // ─── Constants ───
 
 /// WAL record frame header size: 4 (payload_len) + 4 (crc32c) + 1 (record_type) = 9 bytes.
-const WAL_FRAME_HEADER_SIZE: usize = 9;
+pub const WAL_FRAME_HEADER_SIZE: usize = 9;
 
 /// Maximum WAL record payload size. Records exceeding this are treated as
 /// corrupt during iteration. 64 MB is generous for any legitimate record.
-const MAX_WAL_RECORD_SIZE: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_WAL_RECORD_SIZE: usize = 64 * 1024 * 1024;
 
 // ─── WAL Record Type Constants ───
 
@@ -108,7 +108,7 @@ enum WalWriteRequest {
 // ─── Frame encoding helpers ───
 
 /// Compute CRC-32C over `record_type || payload`.
-fn compute_crc(record_type: u8, payload: &[u8]) -> u32 {
+pub(crate) fn compute_crc(record_type: u8, payload: &[u8]) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&[record_type]);
     hasher.update(payload);
@@ -300,8 +300,9 @@ impl WalWriter {
         // Basic validation: must have at least a header.
         if raw.len() < WAL_FRAME_HEADER_SIZE {
             return Err(crate::error::StorageError::InvalidConfig(
-                "raw frame too short: must be at least 9 bytes".into()
-            ).into());
+                "raw frame too short: must be at least 9 bytes".into(),
+            )
+            .into());
         }
 
         // Validate that payload_len matches the actual data length.
@@ -313,7 +314,8 @@ impl WalWriter {
                 payload_len,
                 raw.len(),
                 WAL_FRAME_HEADER_SIZE + payload_len,
-            )).into());
+            ))
+            .into());
         }
 
         let (response_tx, response_rx) = oneshot::channel();
@@ -434,14 +436,11 @@ impl WalReader {
         let mut stream = self.read_from(start_lsn);
         let mut end_lsn = start_lsn;
         loop {
-            let item = std::future::poll_fn(|cx| {
-                Stream::poll_next(stream.as_mut(), cx)
-            }).await;
+            let item = std::future::poll_fn(|cx| Stream::poll_next(stream.as_mut(), cx)).await;
             match item {
                 Some(Ok(record)) => {
-                    end_lsn = record.lsn
-                        + WAL_FRAME_HEADER_SIZE as u64
-                        + record.payload.len() as u64;
+                    end_lsn =
+                        record.lsn + WAL_FRAME_HEADER_SIZE as u64 + record.payload.len() as u64;
                 }
                 Some(Err(e)) => return Err(e),
                 None => return Ok(end_lsn),
@@ -480,11 +479,8 @@ mod tests {
     #[tokio::test]
     async fn single_record_roundtrip() {
         let storage = mem_storage();
-        let writer = WalWriter::new(
-            storage.clone() as Arc<dyn WalStorage>,
-            WalConfig::default(),
-        )
-        .unwrap();
+        let writer =
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap();
 
         let payload = b"hello, WAL!";
         let lsn = writer.append(WAL_RECORD_TX_COMMIT, payload).await.unwrap();
@@ -507,11 +503,8 @@ mod tests {
     #[tokio::test]
     async fn multiple_records() {
         let storage = mem_storage();
-        let writer = WalWriter::new(
-            storage.clone() as Arc<dyn WalStorage>,
-            WalConfig::default(),
-        )
-        .unwrap();
+        let writer =
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap();
 
         let mut lsns = Vec::new();
         for i in 0..100u32 {
@@ -547,11 +540,8 @@ mod tests {
     async fn crc_verification() {
         // Build a storage with a good record followed by a corrupt record.
         let storage = Arc::new(MemoryWalStorage::new());
-        let writer = WalWriter::new(
-            storage.clone() as Arc<dyn WalStorage>,
-            WalConfig::default(),
-        )
-        .unwrap();
+        let writer =
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap();
 
         let lsn0 = writer
             .append(WAL_RECORD_TX_COMMIT, b"good record")
@@ -590,11 +580,7 @@ mod tests {
     async fn group_commit_batching() {
         let storage = mem_storage();
         let writer = Arc::new(
-            WalWriter::new(
-                storage.clone() as Arc<dyn WalStorage>,
-                WalConfig::default(),
-            )
-            .unwrap(),
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap(),
         );
 
         // Spawn 10 concurrent appends.
@@ -633,7 +619,10 @@ mod tests {
         let reader = WalReader::new(storage as Arc<dyn WalStorage>);
         let mut stream = reader.read_from(0);
 
-        assert!(stream.next().await.is_none(), "empty WAL should return None");
+        assert!(
+            stream.next().await.is_none(),
+            "empty WAL should return None"
+        );
     }
 
     // ─── Test 6: read_from mid-stream ───
@@ -641,11 +630,8 @@ mod tests {
     #[tokio::test]
     async fn read_from_mid_stream() {
         let storage = mem_storage();
-        let writer = WalWriter::new(
-            storage.clone() as Arc<dyn WalStorage>,
-            WalConfig::default(),
-        )
-        .unwrap();
+        let writer =
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap();
 
         let mut lsns = Vec::new();
         for i in 0..10u32 {
@@ -675,11 +661,8 @@ mod tests {
     #[tokio::test]
     async fn find_end() {
         let storage = mem_storage();
-        let writer = WalWriter::new(
-            storage.clone() as Arc<dyn WalStorage>,
-            WalConfig::default(),
-        )
-        .unwrap();
+        let writer =
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap();
 
         for i in 0..5u32 {
             let payload = format!("end-test-{}", i);
@@ -701,11 +684,8 @@ mod tests {
     #[tokio::test]
     async fn append_raw_frame() {
         let storage = mem_storage();
-        let writer = WalWriter::new(
-            storage.clone() as Arc<dyn WalStorage>,
-            WalConfig::default(),
-        )
-        .unwrap();
+        let writer =
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap();
 
         // Manually encode a frame.
         let record_type = WAL_RECORD_CREATE_COLLECTION;
@@ -732,18 +712,12 @@ mod tests {
     #[tokio::test]
     async fn large_payload() {
         let storage = mem_storage();
-        let writer = WalWriter::new(
-            storage.clone() as Arc<dyn WalStorage>,
-            WalConfig::default(),
-        )
-        .unwrap();
+        let writer =
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap();
 
         // 1 MB payload.
         let payload: Vec<u8> = (0..1_048_576u32).map(|i| (i % 256) as u8).collect();
-        let lsn = writer
-            .append(WAL_RECORD_TX_COMMIT, &payload)
-            .await
-            .unwrap();
+        let lsn = writer.append(WAL_RECORD_TX_COMMIT, &payload).await.unwrap();
         assert_eq!(lsn, 0);
 
         let reader = WalReader::new(storage.clone() as Arc<dyn WalStorage>);
@@ -761,33 +735,23 @@ mod tests {
     #[tokio::test]
     async fn current_lsn_tracking() {
         let storage = mem_storage();
-        let writer = WalWriter::new(
-            storage.clone() as Arc<dyn WalStorage>,
-            WalConfig::default(),
-        )
-        .unwrap();
+        let writer =
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap();
 
         assert_eq!(writer.current_lsn(), 0);
 
         let payload1 = b"first";
-        let lsn1 = writer
-            .append(WAL_RECORD_TX_COMMIT, payload1)
-            .await
-            .unwrap();
+        let lsn1 = writer.append(WAL_RECORD_TX_COMMIT, payload1).await.unwrap();
         assert_eq!(lsn1, 0);
         // After first record: current_lsn = 0 + 9 + 5 = 14.
         let expected_lsn = (WAL_FRAME_HEADER_SIZE + payload1.len()) as u64;
         assert_eq!(writer.current_lsn(), expected_lsn);
 
         let payload2 = b"second";
-        let lsn2 = writer
-            .append(WAL_RECORD_TX_COMMIT, payload2)
-            .await
-            .unwrap();
+        let lsn2 = writer.append(WAL_RECORD_TX_COMMIT, payload2).await.unwrap();
         assert_eq!(lsn2, expected_lsn);
         // After second record: current_lsn = 14 + 9 + 6 = 29.
-        let expected_lsn2 =
-            expected_lsn + (WAL_FRAME_HEADER_SIZE + payload2.len()) as u64;
+        let expected_lsn2 = expected_lsn + (WAL_FRAME_HEADER_SIZE + payload2.len()) as u64;
         assert_eq!(writer.current_lsn(), expected_lsn2);
     }
 
@@ -796,11 +760,8 @@ mod tests {
     #[tokio::test]
     async fn shutdown() {
         let storage = mem_storage();
-        let writer = WalWriter::new(
-            storage.clone() as Arc<dyn WalStorage>,
-            WalConfig::default(),
-        )
-        .unwrap();
+        let writer =
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap();
 
         writer
             .append(WAL_RECORD_TX_COMMIT, b"before shutdown")
@@ -820,11 +781,8 @@ mod tests {
         assert_eq!(records[0].payload, b"before shutdown");
 
         // Create a new writer and verify it resumes from the correct LSN.
-        let writer2 = WalWriter::new(
-            storage.clone() as Arc<dyn WalStorage>,
-            WalConfig::default(),
-        )
-        .unwrap();
+        let writer2 =
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap();
         let expected_lsn = (WAL_FRAME_HEADER_SIZE + b"before shutdown".len()) as u64;
         assert_eq!(writer2.current_lsn(), expected_lsn);
 
@@ -844,11 +802,8 @@ mod tests {
         // Exercises the full write/read cycle with MemoryWalStorage,
         // verifying all record types round-trip correctly.
         let storage = mem_storage();
-        let writer = WalWriter::new(
-            storage.clone() as Arc<dyn WalStorage>,
-            WalConfig::default(),
-        )
-        .unwrap();
+        let writer =
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap();
 
         let test_cases: Vec<(u8, &[u8])> = vec![
             (WAL_RECORD_TX_COMMIT, b"commit-data"),
@@ -871,8 +826,7 @@ mod tests {
         let records = collect_records(reader.read_from(0)).await.unwrap();
         assert_eq!(records.len(), test_cases.len());
 
-        for (i, (expected_type, expected_payload)) in test_cases.iter().enumerate()
-        {
+        for (i, (expected_type, expected_payload)) in test_cases.iter().enumerate() {
             assert_eq!(records[i].record_type, *expected_type);
             assert_eq!(records[i].payload, *expected_payload);
         }
@@ -926,11 +880,7 @@ mod tests {
     async fn concurrent_readers_and_writer() {
         let storage = mem_storage();
         let writer = Arc::new(
-            WalWriter::new(
-                storage.clone() as Arc<dyn WalStorage>,
-                WalConfig::default(),
-            )
-            .unwrap(),
+            WalWriter::new(storage.clone() as Arc<dyn WalStorage>, WalConfig::default()).unwrap(),
         );
 
         // Write an initial batch of records.
@@ -984,7 +934,9 @@ mod tests {
         assert_eq!(all_records.len(), 30);
 
         // Verify we can still read from the initial end point.
-        let later_records = collect_records(reader.read_from(initial_end)).await.unwrap();
+        let later_records = collect_records(reader.read_from(initial_end))
+            .await
+            .unwrap();
         assert_eq!(later_records.len(), 20);
     }
 }

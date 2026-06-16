@@ -113,8 +113,8 @@ mod tests {
     use super::*;
     use crate::commit_log::{CommitLogEntry, IndexKeyWrite};
     use crate::read_set::{
-        LimitBoundary, ReadInterval, CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX,
-        CATALOG_INDEXES, CATALOG_INDEXES_NAME_IDX,
+        CATALOG_COLLECTIONS, CATALOG_COLLECTIONS_NAME_IDX, CATALOG_INDEXES,
+        CATALOG_INDEXES_NAME_IDX, LimitBoundary, ReadInterval,
     };
     use std::ops::Bound;
 

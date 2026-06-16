@@ -333,6 +333,9 @@ impl BTreeHandle {
 - Updated via `update_file_header()` which acquires the file header lock, applies the update, and writes page 0 through the buffer pool.
 - Updated after: checkpoint (checkpoint_lsn, visible_ts), transactional catalog mutations at commit time (ID allocators), free list changes (free_list_head).
 - Catalog root pages are stable (B-tree root page IDs never change after creation), so they only need to be written once during database initialization.
+- Durable engines reserve the last physical page for `FileHeaderShadow`. The free-list allocator treats that trailing page as unavailable for ordinary B-tree/heap allocation; when the file grows, the old shadow slot becomes the new data page and a new trailing shadow page is appended.
+- During open, if page 0 fails header verification, the engine reads the trailing shadow page and restores page 0 when the shadow is valid.
+- After a successful durable checkpoint, sealed WAL segments fully covered by the checkpoint LSN are reclaimed; the active WAL segment is always retained.
 
 Both `checkpoint_lsn` and `visible_ts` are read from the FileHeader (page 0) on startup. No sidecar files are needed.
 

@@ -118,10 +118,8 @@ impl DoubleWriteBuffer {
         // Steps 1-2: Write DWB file and fsync (blocking file I/O).
         let dwb_path = self.dwb_path.clone();
         let page_size = self.page_size;
-        let pages_clone: Vec<(PageId, Vec<u8>)> = pages
-            .iter()
-            .map(|(id, data)| (*id, data.clone()))
-            .collect();
+        let pages_clone: Vec<(PageId, Vec<u8>)> =
+            pages.iter().map(|(id, data)| (*id, data.clone())).collect();
 
         tokio::task::spawn_blocking(move || -> io::Result<()> {
             let mut file = OpenOptions::new()
@@ -199,48 +197,54 @@ impl DoubleWriteBuffer {
         let parsed = {
             let dwb_path = dwb_path.clone();
             #[allow(clippy::type_complexity)]
-            tokio::task::spawn_blocking(move || -> io::Result<Option<(DwbHeader, Vec<(PageId, Vec<u8>)>)>> {
-                let mut file = File::open(&dwb_path)?;
-                let mut header_buf = [0u8; DWB_HEADER_SIZE];
+            tokio::task::spawn_blocking(
+                move || -> io::Result<Option<(DwbHeader, Vec<(PageId, Vec<u8>)>)>> {
+                    let mut file = File::open(&dwb_path)?;
+                    let mut header_buf = [0u8; DWB_HEADER_SIZE];
 
-                if file.read(&mut header_buf)? < DWB_HEADER_SIZE {
-                    // Partial header -- crash during header write. Treat as empty DWB.
-                    return Ok(None);
-                }
-
-                let header = DwbHeader::from_bytes(&header_buf);
-
-                // Verify magic.
-                if header.magic != DWB_MAGIC {
-                    return Ok(None);
-                }
-
-                // Verify checksum.
-                let expected_checksum = header.compute_checksum();
-                if header.checksum != expected_checksum {
-                    return Ok(None);
-                }
-
-                // Read all entries.
-                let entry_size = DWB_ENTRY_PREFIX_SIZE + page_size;
-                let mut entries = Vec::new();
-
-                for _i in 0..header.page_count {
-                    let mut entry_buf = vec![0u8; entry_size];
-                    let bytes_read = file.read(&mut entry_buf)?;
-
-                    if bytes_read < entry_size {
-                        // Incomplete entry -- crash during DWB write. Stop.
-                        break;
+                    if file.read(&mut header_buf)? < DWB_HEADER_SIZE {
+                        // Partial header -- crash during header write. Treat as empty DWB.
+                        return Ok(None);
                     }
 
-                    let page_id = u32::from_le_bytes(entry_buf[0..4].try_into().expect("entry_buf has at least 4 bytes"));
-                    let page_data = entry_buf[DWB_ENTRY_PREFIX_SIZE..].to_vec();
-                    entries.push((page_id, page_data));
-                }
+                    let header = DwbHeader::from_bytes(&header_buf);
 
-                Ok(Some((header, entries)))
-            })
+                    // Verify magic.
+                    if header.magic != DWB_MAGIC {
+                        return Ok(None);
+                    }
+
+                    // Verify checksum.
+                    let expected_checksum = header.compute_checksum();
+                    if header.checksum != expected_checksum {
+                        return Ok(None);
+                    }
+
+                    // Read all entries.
+                    let entry_size = DWB_ENTRY_PREFIX_SIZE + page_size;
+                    let mut entries = Vec::new();
+
+                    for _i in 0..header.page_count {
+                        let mut entry_buf = vec![0u8; entry_size];
+                        let bytes_read = file.read(&mut entry_buf)?;
+
+                        if bytes_read < entry_size {
+                            // Incomplete entry -- crash during DWB write. Stop.
+                            break;
+                        }
+
+                        let page_id = u32::from_le_bytes(
+                            entry_buf[0..4]
+                                .try_into()
+                                .expect("entry_buf has at least 4 bytes"),
+                        );
+                        let page_data = entry_buf[DWB_ENTRY_PREFIX_SIZE..].to_vec();
+                        entries.push((page_id, page_data));
+                    }
+
+                    Ok(Some((header, entries)))
+                },
+            )
             .await
             .map_err(io::Error::other)??
         };
@@ -275,19 +279,27 @@ impl DoubleWriteBuffer {
 
             // Read the same page from page_storage and verify its checksum.
             let mut storage_page = vec![0u8; self.page_size];
-            match self.page_storage.read_page(*page_id, &mut storage_page).await {
+            match self
+                .page_storage
+                .read_page(*page_id, &mut storage_page)
+                .await
+            {
                 Ok(()) => {
                     let storage_ref = SlottedPageRef::from_buf(&storage_page)?;
                     if !storage_ref.verify_checksum() {
                         // Torn write detected -- restore from DWB.
-                        self.page_storage.write_page(*page_id, dwb_page_data).await?;
+                        self.page_storage
+                            .write_page(*page_id, dwb_page_data)
+                            .await?;
                         restored += 1;
                     }
                     // If storage checksum valid, skip (scatter-write completed before crash).
                 }
                 Err(_) => {
                     // Can't read page -- restore from DWB.
-                    self.page_storage.write_page(*page_id, dwb_page_data).await?;
+                    self.page_storage
+                        .write_page(*page_id, dwb_page_data)
+                        .await?;
                     restored += 1;
                 }
             }
@@ -396,9 +408,8 @@ mod tests {
         let dwb_path = tmp.path().join("test.dwb");
 
         let _storage = make_storage_with_pages(3).await;
-        let page_data: Vec<(PageId, Vec<u8>)> = (0..3u32)
-            .map(|i| (i, make_valid_page(i)))
-            .collect();
+        let page_data: Vec<(PageId, Vec<u8>)> =
+            (0..3u32).map(|i| (i, make_valid_page(i))).collect();
 
         // Write to DWB manually (simulating the first part of write_pages).
         {
@@ -454,8 +465,7 @@ mod tests {
         }
 
         // Verify total file size.
-        let expected_size =
-            DWB_HEADER_SIZE + 3 * (DWB_ENTRY_PREFIX_SIZE + PAGE_SIZE);
+        let expected_size = DWB_HEADER_SIZE + 3 * (DWB_ENTRY_PREFIX_SIZE + PAGE_SIZE);
         let metadata = fs::metadata(&dwb_path).unwrap();
         assert_eq!(metadata.len(), expected_size as u64);
     }
@@ -471,13 +481,14 @@ mod tests {
         let storage = make_storage_with_pages(5).await;
         let dwb = DoubleWriteBuffer::new(&dwb_path, storage.clone(), PAGE_SIZE);
 
-        let pages: Vec<(PageId, Vec<u8>)> = (0..5u32)
-            .map(|i| (i, make_valid_page(i)))
-            .collect();
+        let pages: Vec<(PageId, Vec<u8>)> = (0..5u32).map(|i| (i, make_valid_page(i))).collect();
 
         dwb.write_pages(&pages).await.unwrap();
 
-        assert!(dwb.is_empty().unwrap(), "DWB should be empty after write_pages completes");
+        assert!(
+            dwb.is_empty().unwrap(),
+            "DWB should be empty after write_pages completes"
+        );
     }
 
     // ─── Test 4: recover with no DWB ───
@@ -523,9 +534,8 @@ mod tests {
         let dwb_path = tmp.path().join("torn.dwb");
 
         let storage = make_storage_with_pages(5).await;
-        let page_data: Vec<(PageId, Vec<u8>)> = (0..5u32)
-            .map(|i| (i, make_valid_page(i)))
-            .collect();
+        let page_data: Vec<(PageId, Vec<u8>)> =
+            (0..5u32).map(|i| (i, make_valid_page(i))).collect();
 
         // Simulate: write DWB file but DON'T scatter-write to page storage.
         {
@@ -564,7 +574,11 @@ mod tests {
         let restored = dwb.recover().await.unwrap();
 
         // At least page 2 should have been restored.
-        assert!(restored >= 1, "expected at least 1 page restored, got {}", restored);
+        assert!(
+            restored >= 1,
+            "expected at least 1 page restored, got {}",
+            restored
+        );
 
         // Verify page 2 is now correct.
         let mut buf = vec![0u8; PAGE_SIZE];
@@ -582,9 +596,8 @@ mod tests {
         let dwb_path = tmp.path().join("partial.dwb");
 
         let storage = make_storage_with_pages(5).await;
-        let page_data: Vec<(PageId, Vec<u8>)> = (0..5u32)
-            .map(|i| (i, make_valid_page(i)))
-            .collect();
+        let page_data: Vec<(PageId, Vec<u8>)> =
+            (0..5u32).map(|i| (i, make_valid_page(i))).collect();
 
         // Write DWB header claiming 5 entries, but only write 3 complete + partial 4th.
         {
@@ -607,9 +620,9 @@ mod tests {
             file.write_all(&header.to_bytes()).unwrap();
 
             // Write 3 complete entries.
-            for i in 0..3 {
-                file.write_all(&page_data[i].0.to_le_bytes()).unwrap();
-                file.write_all(&page_data[i].1).unwrap();
+            for (page_id, page_bytes) in page_data.iter().take(3) {
+                file.write_all(&page_id.to_le_bytes()).unwrap();
+                file.write_all(page_bytes).unwrap();
             }
 
             // Write partial 4th entry (just the page_id, no page data).
@@ -646,9 +659,8 @@ mod tests {
         let dwb_path = tmp.path().join("valid.dwb");
 
         let storage = make_storage_with_pages(5).await;
-        let page_data: Vec<(PageId, Vec<u8>)> = (0..5u32)
-            .map(|i| (i, make_valid_page(i)))
-            .collect();
+        let page_data: Vec<(PageId, Vec<u8>)> =
+            (0..5u32).map(|i| (i, make_valid_page(i))).collect();
 
         // Write DWB file.
         {
@@ -702,9 +714,7 @@ mod tests {
 
         let dwb = DoubleWriteBuffer::new(&dwb_path, storage.clone(), PAGE_SIZE);
 
-        let pages: Vec<(PageId, Vec<u8>)> = (0..1000u32)
-            .map(|i| (i, make_valid_page(i)))
-            .collect();
+        let pages: Vec<(PageId, Vec<u8>)> = (0..1000u32).map(|i| (i, make_valid_page(i))).collect();
 
         dwb.write_pages(&pages).await.unwrap();
 

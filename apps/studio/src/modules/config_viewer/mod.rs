@@ -53,6 +53,7 @@ pub fn ConfigViewerModule() -> Element {
                         tr { td { "Idle Timeout" } td { "{idle_s}s" } }
                         tr { td { "Max Lifetime" } td { "{max_life_s}s" } }
                         tr { td { "Max Intervals" } td { "{tx.max_intervals}" } }
+                        tr { td { "Max Operations" } td { "{tx.max_operations}" } }
                         tr { td { "Max Scanned Bytes" } td { "{scan_mb} MB" } }
                         tr { td { "Max Scanned Docs" } td { "{tx.max_scanned_docs}" } }
                     }
